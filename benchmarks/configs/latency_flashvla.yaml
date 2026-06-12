@@ -1,0 +1,66 @@
+# Latency Benchmark: FlashVLA (PI0.5 FlashVLA variant).
+#
+# Each call does encode + prefill + 1 denoise step on a rolling 5-slot
+# buffer (cold-start fills the first N-1=4 calls). Compare against
+# latency_baseline.yaml which runs N=10 denoise steps per call.
+#
+# Sweep dimension: number of camera views (single frame each).
+#   num_views: 1, 2, or 3   →  filters cfg.policy.input_features to the
+#                              first N ``observation.images.*`` keys
+#                              (in dataset feature order).
+# num_frames_per_view stays at 1 — only the camera count varies.
+#
+# Usage:
+#   python benchmarks/benchmark_latency.py \
+#       --config_path=benchmarks/configs/latency_flashvla.yaml \
+#       --num_views=2
+
+type: latency
+variant: flashvla
+
+# Default for the LIBERO dataset below: 2 views (image + image2).
+# Switch to a 3-camera dataset (e.g. RoboTwin) for num_views=3 sweeps.
+# CLI override: --num_views=1 / --num_views=2 / --num_views=3
+num_views: 2
+
+policy:
+  type: pi05-flashvla
+  device: cuda
+  dtype: bfloat16
+
+  # Use a checkpoint trained with the FlashVLA recipe.
+  pretrained_path: lerobot/pi05_base
+
+  compile_model: true
+
+  fuse_qkv: true
+  fuse_gate_up: true
+
+  # Single frame per view; latency sweep varies VIEW count, not history.
+  num_frames_per_view: 1
+  image_resolution: [224, 224]
+
+  # FlashVLA-specific knobs (see PI05FlashVLAConfig).
+  num_buffer_slots: 5
+  chunk_size: 10
+  cold_start_mode: current_state
+  use_action_prefix: false
+
+dataset:
+  # LIBERO has 2 image views: observation.images.image (3rd-person) +
+  # observation.images.image2 (wrist). num_views=1/2 supported; num_views=3
+  # will be capped to 2 with a warning. For 3-view sweeps switch to a
+  # 3-camera dataset (e.g. RoboTwin BBH aloha-agilex).
+  repo_id: HuggingFaceVLA/libero
+  streaming: false
+
+# FlashVLA uses streaming-style benchmark (each episode iterated
+# frame-by-frame). num_samples = number of episodes.
+num_samples: 100
+# Cap how many frames per episode to time. None = run the full episode.
+warmup_steps: 10
+batch_size: 1
+num_workers: 0
+seed: 42
+
+output_file: outputs/benchmarks/latency_flashvla.json

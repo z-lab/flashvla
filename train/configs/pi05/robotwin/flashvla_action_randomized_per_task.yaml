@@ -1,0 +1,79 @@
+# FlashVLA FlashVLA Per-Task Training — RANDOMIZED setting
+#
+# Trains pi05-flashvla on aloha-agilex_randomized_500 (500
+# episodes per task with domain randomization). NOT the official
+# leaderboard recipe — official trains on clean_50. Use this for
+# stronger generalization comparisons.
+#
+# Data: /path/to/RoboTwin-LeRobot-v3.0/<task>/aloha-agilex_randomized_500/
+
+policy:
+  type: pi05-flashvla
+  pretrained_path: lerobot/pi05_base
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  state_cond: false
+  num_buffer_slots: 5
+  chunk_size: 10
+  # PerSeg eliminates the per-batch cross-config incoherence that, combined
+  # with deep noise floor on randomized_500, drove the cascade at step 26k
+  # in the legacy per-chunk recipe.
+  timestep_sample_mode: "per-sample"
+  freeze_vision_encoder: false
+  freeze_vlm: false
+  cold_start_mode: current_state
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+dataset:
+  repo_id: robotwin_official_randomized/per_task_placeholder
+  video_backend: torchcodec
+
+output_dir: flashvla_action_randomized_per_task/per_task_placeholder
+job_name: flashvla_action_randomized
+batch_size: 16
+# Ablation 2026-05-04: per-segment time conditioning + global slot-time
+# sampling. time_mlp now processes only N=5 unique time values per sample
+# (gather/expand to per-token before adaRMS). Tests whether the cross-config
+# time-value SHARING (deterministic forward change) affects drift compared to
+# the original per-config independent Beta sampling.
+# Same broken hyperparams as PPS spike (lr=5e-5, cosine 30k, β2=0.95,
+# grad_accum=1) — only the time conditioning changes.
+grad_accum_steps: 1
+steps: 30000
+num_workers: 4
+seed: 1000
+
+use_policy_training_preset: false
+optimizer:
+  type: adamw
+  lr: 5e-5
+  # β2 reverted to 0.95 (matches original broken config for clean ablation
+  # of grad_accum_steps as the only changed variable).
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-10
+  grad_clip_norm: 1.0
+
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 2000
+  peak_lr: 5e-5
+  decay_lr: 1.25e-6
+  # Cosine completes at step 30k (matches the stable beat_block_hammer /
+  # move_can_pot trajectory: lr ~3e-6 by step 25k). Steps 30k-50k stay at
+  # decay_lr=1.25e-6 for gentle fine-tuning — still ~16k extra updates but
+  # too low-magnitude to trigger Adam-state drift.
+  num_decay_steps: 30000
+
+save_checkpoint: true
+save_freq: 2000
+
+log_freq: 50
+wandb:
+  enable: true
+  project: flashvla-robotwin-randomized
+  entity: null
+  disable_artifact: true

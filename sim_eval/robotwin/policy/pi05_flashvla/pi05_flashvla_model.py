@@ -1,0 +1,229 @@
+# Copyright 2025 FlashVLA team. All rights reserved.
+"""Server-side pi05_flashvla model wrapper for RoboTwin eval.
+
+This module is loaded ONLY in the flashvla conda env (where flashvla is
+pip-installed). The RoboTwin client env never imports it — it just holds a
+``ModelClient`` that talks to an instance of ``PI05FlashVLAModel`` running here
+over a TCP socket.
+
+Async overlap (server-side):
+    Wraps the streaming policy in an ``AsyncStreamingActionManager`` so that
+    when ``inference_overlap_steps > 0`` and the policy is compiled, the next
+    chunk inference is dispatched ``overlap_steps`` calls before the current
+    chunk runs out. The TCP client still sees one ``get_action`` call per env
+    step — the async hiding all happens inside this process while SAPIEN is
+    stepping the simulator.
+
+Protocol exposed to ``RoboTwin/script/policy_model_server.py``:
+
+    PI05FlashVLAModel.call(func_name, obs) -> result
+        Dispatcher — the server invokes ``getattr(model, cmd)(obs)`` directly,
+        but we also expose ``call`` so local-mode callers get the same API.
+
+    PI05FlashVLAModel.get_action(obs_dict) -> np.ndarray (14,) float32
+        obs_dict keys: instruction, head_rgb, left_rgb, right_rgb, state.
+
+    PI05FlashVLAModel.reset_model() -> None
+        Called between episodes by the client via
+        ``model.call(func_name='reset_model')``.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+from typing import Any
+
+import numpy as np
+import torch
+
+from lerobot.configs.policies import PreTrainedConfig
+from flashvla.policies.factory import make_pre_post_processors
+from flashvla.policies.pi05.configuration_pi05 import PI05FlashVLAConfig  # noqa: F401 — registers the "pi05-flashvla" type with PreTrainedConfig
+from flashvla.policies.pi05.modeling_pi05_flashvla import PI05FlashVLAPolicy
+
+from flashvla.async_manager import AsyncStreamingActionManager
+
+
+class PI05FlashVLAModel:
+    def __init__(
+        self,
+        policy_path: str,
+        cold_start_mode: str = "current_state",
+        device: str = "cuda",
+        inference_overlap_steps: int = 0,
+        n_action_steps: int | None = None,
+        compile_model: bool | None = None,
+    ) -> None:
+        if device.startswith("cuda") and not torch.cuda.is_available():
+            print("[pi05_flashvla] CUDA not available, falling back to CPU")
+            device = "cpu"
+        self.device = torch.device(device)
+
+        # Use PreTrainedConfig (ChoiceRegistry base) so the "type" discriminator
+        # in config.json dispatches correctly via draccus.
+        cfg = PreTrainedConfig.from_pretrained(policy_path)
+        # RoboTwin actions are absolute qpos → zero-delta cold start would
+        # send the arm to joint zero. Force current_state mode regardless of
+        # what the checkpoint was trained with.
+        cfg.cold_start_mode = cold_start_mode
+        cfg.device = str(self.device)
+        if n_action_steps is not None:
+            cfg.n_action_steps = int(n_action_steps)
+        if compile_model is not None:
+            cfg.compile_model = bool(compile_model)
+
+        self.policy = PI05FlashVLAPolicy.from_pretrained(policy_path, config=cfg)
+        self.policy.to(self.device)
+        self.policy.eval()
+
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=self.policy.config,
+            pretrained_path=policy_path,
+            preprocessor_overrides={"device_processor": {"device": str(self.device)}},
+        )
+        self.preprocessor = preprocessor
+        self.postprocessor = postprocessor
+
+        self.overlap_steps = int(inference_overlap_steps)
+        self.manager = AsyncStreamingActionManager(
+            policy=self.policy,
+            overlap_steps=self.overlap_steps,
+        )
+
+        self._current_instruction: str | None = None
+
+        print(f"[pi05_flashvla] loaded {policy_path}")
+        print(
+            f"[pi05_flashvla] cold_start_mode={cold_start_mode}, device={self.device}, "
+            f"n_action_steps={self.policy.config.n_action_steps}, "
+            f"inference_overlap_steps={self.overlap_steps}, "
+            f"compile_model={getattr(self.policy.config, 'compile_model', False)}"
+        )
+
+        # Eager warmup: run compile + CUDA-graph capture at server boot with a
+        # fabricated obs so the first real get_action call returns fast. RoboTwin's
+        # ModelClient socket has a finite timeout; lazy warmup with
+        # compile_mode='max-autotune' (this ckpt's default) can take 5-10 min
+        # and reliably blows past it.
+        self._warmed_up = False
+        self._eager_warmup()
+        self._warmed_up = True
+
+    def _eager_warmup(self) -> None:
+        """Pre-run manager.warmup with a fabricated obs.
+
+        The compiled graph is shape-parametrized: image resolution is fixed
+        by config.image_resolution; state is padded to max_state_dim; text
+        tokens are padded to the tokenizer's max_length by the preprocessor.
+        So the dummy warmup graph matches every real episode's graph as
+        long as the camera count + image size + instruction tokenization
+        behaviour line up.
+        """
+        try:
+            state_feat = self.policy.config.input_features.get("observation.state")
+            state_dim = state_feat.shape[0] if state_feat is not None else 14
+            image_res = getattr(self.policy.config, "image_resolution", None) or (224, 224)
+            H, W = (image_res, image_res) if isinstance(image_res, int) else image_res
+
+            dummy_img = np.zeros((H, W, 3), dtype=np.uint8)
+            dummy_obs = {
+                "instruction": "warmup placeholder instruction for compile",
+                "head_rgb": dummy_img,
+                "left_rgb": dummy_img,
+                "right_rgb": dummy_img,
+                "state": np.zeros(state_dim, dtype=np.float32),
+            }
+            self._current_instruction = dummy_obs["instruction"]
+            batch = self._encode_batch(dummy_obs)
+            batch = self.preprocessor(batch)
+
+            import time as _time
+            t0 = _time.perf_counter()
+            print(f"[pi05_flashvla] eager warmup: state_dim={state_dim}, image=({H},{W}) — "
+                  "compile + CUDA-graph capture, may take 30s-10min "
+                  f"(compile_mode={getattr(self.policy.config, 'compile_mode', 'default')})")
+            self.manager.warmup(batch)
+            print(f"[pi05_flashvla] eager warmup done in {_time.perf_counter()-t0:.1f}s — "
+                  "first real get_action will be fast")
+        finally:
+            # Wipe the dummy instruction so the first real get_action treats
+            # itself as new-episode-start.
+            self._current_instruction = None
+            # Belt-and-suspenders cleanup: manager.warmup already calls
+            # manager.reset() (→ policy.reset() which zeroes action_buffer +
+            # _step_counter), but call it again here so it's impossible for
+            # the dummy obs to leak into episode 1's state.
+            self.manager.reset()
+
+    # ── dispatcher (optional — server also uses direct getattr) ───────
+
+    def call(self, func_name: str, obs: Any = None):
+        method = getattr(self, func_name, None)
+        if method is None or not callable(method):
+            raise AttributeError(f"PI05FlashVLAModel has no callable '{func_name}'")
+        if obs is None:
+            return method()
+        return method(obs)
+
+    # ── RPC surface exposed to the client ──────────────────────────────
+
+    def reset_model(self, *_args, **_kwargs) -> None:
+        """Clear episode state. Called at the start of every rollout.
+
+        Resets the async manager (which in turn resets the underlying
+        policy's streaming buffer + action queue). The warmed-up CUDA
+        graph persists across episodes — only the per-episode buffer
+        state is wiped.
+        """
+        self.manager.reset()
+        self._current_instruction = None
+        print("[pi05_flashvla] model reset")
+
+    # Alias — RoboTwin local mode calls `reset()` on some policy classes,
+    # and it's a more idiomatic Python name. Both route to the same cleanup.
+    def reset(self, *args, **kwargs) -> None:
+        self.reset_model(*args, **kwargs)
+
+    def get_action(self, obs_dict: dict) -> np.ndarray:
+        """Run one flashvla step and return a 14-dim absolute qpos.
+
+        obs_dict (from deploy_policy._pack_request):
+            instruction: str
+            head_rgb:   np.uint8 (H, W, 3)
+            left_rgb:   np.uint8 (H, W, 3)
+            right_rgb:  np.uint8 (H, W, 3)
+            state:      np.float32 (14,)
+        """
+        instruction = obs_dict["instruction"]
+        if instruction != self._current_instruction:
+            # First call of a new episode after reset: set the instruction.
+            self._current_instruction = instruction
+            print(f"[pi05_flashvla] instruction: {instruction[:80]}")
+
+        batch = self._encode_batch(obs_dict)
+        batch = self.preprocessor(batch)
+
+        with torch.inference_mode():
+            action = self.manager.act(batch)              # [1, 14] normalized GPU
+        action = self.postprocessor(action)               # [1, 14] real qpos
+
+        return action.detach().to("cpu").numpy().reshape(-1).astype(np.float32)
+
+    # ── helpers ───────────────────────────────────────────────────────
+
+    def _encode_batch(self, obs_dict: dict) -> dict[str, Any]:
+        def _to_chw_float(hwc_uint8: np.ndarray) -> torch.Tensor:
+            t = torch.from_numpy(np.ascontiguousarray(hwc_uint8)).to(dtype=torch.float32) / 255.0
+            return t.permute(2, 0, 1).unsqueeze(0).to(self.device)
+
+        state_np = np.asarray(obs_dict["state"], dtype=np.float32)
+        state = torch.from_numpy(state_np).unsqueeze(0).to(self.device)
+
+        return {
+            "observation.images.cam_high":        _to_chw_float(obs_dict["head_rgb"]),
+            "observation.images.cam_left_wrist":  _to_chw_float(obs_dict["left_rgb"]),
+            "observation.images.cam_right_wrist": _to_chw_float(obs_dict["right_rgb"]),
+            "observation.state":                  state,
+            "task":                               [self._current_instruction or ""],
+        }

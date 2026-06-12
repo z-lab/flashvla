@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashvla"
+version = "0.1.0"
+description = "Real-time VLA inference with FlashVLA."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+]
+
+# NOTE: no special transformers commit is needed. lerobot 0.5.1 ships
+# `lerobot.policies.pi_gemma`, which provides the adaRMS-capable
+# Gemma/PaliGemma modules FlashVLA uses for pi0/pi05. Let lerobot's own
+# `smolvla` extra select its declared stock transformers dependency.
+dependencies = [
+    "lerobot[smolvla]==0.5.1",
+]
+
+[project.optional-dependencies]
+# LIBERO simulation evaluation via LeRobot's own extra.
+libero = ["lerobot[libero]==0.5.1"]
+
+[project.urls]
+Homepage = "https://github.com/z-lab/flashvla"
+Repository = "https://github.com/z-lab/flashvla"
+
+# No console scripts: the package is a pure library (policies / datasets /
+# async_manager). Workflows are standalone scripts at the repo root:
+# train/, sim_eval/, benchmarks/.
+[tool.setuptools.packages.find]
+include = ["flashvla*"]

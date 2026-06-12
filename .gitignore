@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+# Training / evaluation outputs
+outputs/
+checkpoints/
+wandb/
+*.log
+
+# Editors / misc
+*.swp
+*.swo
+.DS_Store

@@ -1,0 +1,13 @@
+# Python dependencies specific to the pi05_flashvla RoboTwin adapter.
+# Install on top of the base RoboTwin conda env (which must already provide
+# SAPIEN, mplib, toppra, transforms3d, trimesh, imageio, etc.).
+#
+# Preferred setup:
+#   conda activate <your-robotwin-env>
+#   pip install -e /path/to/flashvla
+#
+# The editable install of flashvla brings in all the runtime deps it declares
+# in pyproject.toml (torch, transformers, safetensors, accelerate, lerobot,
+# etc.), so this file only lists anything extra that flashvla doesn't.
+
+# Nothing extra at the moment — flashvla pulls in everything we need.

@@ -1,0 +1,80 @@
+# FlashVLA FlashVLA MULTI-TASK Training — RANDOMIZED setting
+#
+# Pools all RoboTwin randomized_500 tasks into a single ConcatDataset.
+# Stats are aggregated across tasks via lerobot.aggregate_stats.
+#
+# Hypothesis test (2026-05-02): does multi-task pooling alone (without
+# grad_accum) fix the place_phone_stand-style time MLP divergence?
+# LIBERO trains stably with multi-task (4 suites) + grad_accum=4. This
+# config isolates the multi-task variable.
+#
+# Tasks: by default uses ALL 50 tasks under
+#   /path/to/RoboTwin-LeRobot-v3.0/<task>/aloha-agilex_randomized_500
+# Override with `--robotwin_multitask.tasks='[t1,t2,...]'` to use a subset
+# (e.g. the 12 from robotwin_tasks.txt).
+
+policy:
+  type: pi05-flashvla
+  pretrained_path: lerobot/pi05_base
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+  state_cond: false
+  num_buffer_slots: 5
+  chunk_size: 10
+  # Randomized data → PerSeg to avoid the noise-floor cascade.
+  timestep_sample_mode: "per-sample"
+  freeze_vision_encoder: false
+  freeze_vlm: false
+  cold_start_mode: current_state
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+# Multi-task — discovers all <root>/<task>/<config_subdir> dirs and pools them.
+robotwin_multitask:
+  enable: true
+  root: /path/to/RoboTwin-LeRobot-v3.0
+  config_subdir: aloha-agilex_randomized_500
+  tasks: []   # empty = use all discovered tasks
+
+# Required by train_flashvla.py for output paths even when multitask is on
+dataset:
+  repo_id: robotwin_official_randomized/multitask
+  video_backend: torchcodec
+
+output_dir: flashvla_action_randomized_multitask
+job_name: flashvla_action_randomized_multitask
+batch_size: 16
+grad_accum_steps: 1
+steps: 50000
+num_workers: 4
+seed: 1000
+
+# Same optimizer/schedule as the failing per-task config (broken combo)
+# so multi-task is the only variable being tested.
+use_policy_training_preset: false
+optimizer:
+  type: adamw
+  lr: 5e-5
+  betas: [0.9, 0.95]
+  weight_decay: 1.0e-10
+  grad_clip_norm: 1.0
+
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 2000
+  peak_lr: 5e-5
+  decay_lr: 1.25e-6
+  num_decay_steps: 50000
+
+save_checkpoint: true
+save_freq: 5000
+
+log_freq: 50
+wandb:
+  enable: true
+  project: flashvla-robotwin-randomized
+  entity: null
+  disable_artifact: true

@@ -1,0 +1,29 @@
+name: flashvla
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  # Real CMake + C/C++ toolchain. lerobot's `[libero]` extra builds a native
+  # extension (egl_probe) from source with CMake at install time. Pulling these
+  # from conda makes the env self-contained (no system `build-essential`/cmake
+  # needed) and — crucially — puts a *real* cmake binary on PATH so egl_probe
+  # compiles before lerobot's PyPI `cmake` *shim* lands. That shim ships a
+  # `bin/cmake` wrapper (`from cmake import cmake`) that breaks under pip's build
+  # isolation; building in the single env-create resolution sidesteps it (pip
+  # builds wheels before installing the shim). See sim_eval/libero/README.md.
+  - cmake
+  - make
+  - c-compiler
+  - cxx-compiler
+  - pip
+  - pip:
+      # Match the validated local conda stack.
+      # The extra PyTorch index provides the CUDA 12.8 wheels.
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.9.1+cu128
+      - torchvision==0.24.1+cu128
+      - torchcodec==0.5
+      # Installs FlashVLA with the LIBERO simulation extra in one resolution.
+      # Drop "[libero]" (use "-e .") for a lean train/benchmark/RoboTwin/real-robot
+      # env — those paths do not build egl_probe.
+      - -e .[libero]

@@ -1,0 +1,45 @@
+# Latency Benchmark: pi05 baseline (eager, no torch.compile).
+#
+# Each call: encode + prefill + N (=10) denoise iterations.
+#
+# Sweep dimension: number of camera views, controlled by ``num_views``
+# (1, 2, or 3). One frame per view. CLI override: --num_views=N.
+#
+# Usage:
+#   python benchmarks/benchmark_latency.py \
+#       --config_path=benchmarks/configs/latency_baseline.yaml \
+#       --num_views=2
+
+type: latency
+variant: baseline
+
+# Default matches the LIBERO dataset below (2 views).
+# Override --num_views=1/2/3; for num_views=3 switch to a 3-camera dataset.
+num_views: 2
+
+policy:
+  type: pi05
+  device: cuda
+  dtype: bfloat16
+
+  pretrained_path: lerobot/pi05_base
+
+  compile_model: false
+
+  fuse_qkv: true
+  fuse_gate_up: true
+
+  num_frames_per_view: 1
+  image_resolution: [224, 224]
+
+dataset:
+  repo_id: HuggingFaceVLA/libero
+  streaming: false
+
+num_samples: 100
+warmup_steps: 10
+batch_size: 1
+num_workers: 0
+seed: 42
+
+output_file: outputs/benchmarks/latency_baseline.json
