@@ -1,116 +1,119 @@
-<!-- markdownlint-disable MD001 MD041 -->
+# FlashVLA: Streaming Action Decoding for Fast and Asynchronous VLA Inference
+
+**Paper** | **Project Page** | **Demo Video** | **Checkpoints**
+
+**FlashVLA** is a general streaming action decoding method for flow-matching
+VLA models. This repo provides training, simulation evaluation, latency
+benchmark, and real-robot deployment code. The commands below use pi0.5 as an
+example.
 
 <p align="center">
-  <picture>
-    <img alt="FlashVLA" src="assets/logo.png" width=40%>
-  </picture>
+  <img alt="FlashVLA" src="assets/logo.png" width="42%">
 </p>
-<h3 align="center">
-Real-time VLA inference with FlashVLA - one denoise step per control tick.
-</h3>
 
----
-
-## About
-
-FlashVLA turns chunked flow-matching VLAs (&pi;<sub>0.5</sub>, &pi;<sub>0</sub>, SmolVLA) into **streaming** policies: instead of paying a full multi-step ODE solve at every chunk boundary, FlashVLA keeps a rolling buffer of N action chunks at staggered noise levels and advances the *whole buffer by one denoise step per inference call* - the head chunk comes out fully denoised and ready to execute, every call, at constant latency.
-
-- **FlashVLA policy** - N-slot denoising buffer with padded cold start; steady-state inference is a single forward pass (encode + prefill + 1 denoise step)
-- **Async chunk overlap** - `AsyncStreamingActionManager` launches the next chunk before the current one runs out; under `torch.compile` + CUDA graphs the launch is dispatch-only and inference hides behind robot/env stepping (p50 chunk-transition latency &asymp; 0.1 ms)
-- **Shared-observation training** - all N buffer configurations trained per observation with a single VLM prefix pass and cross-config attention masking
-- **Seamless [LeRobot](https://github.com/huggingface/lerobot) integration** - datasets (v2.1 / v3.0), pretrained models (`lerobot/pi05_base`), processors and sim envs
+> Demo video and pi0.5 checkpoints will be added soon.
 
 ## Installation
 
 ```bash
-conda env create -f environment.yml   # FlashVLA + LIBERO sim eval, in one resolution
+git clone https://github.com/z-lab/flashvla.git
+cd flashvla
+conda env create -f environment.yml
 conda activate flashvla
 ```
 
-`environment.yml` installs the LIBERO simulation extra too. For a lean
-train / benchmark / RoboTwin / real-robot env, change `-e .[libero]` to
-`-e .` in `environment.yml` before creating it (those paths don't build the
-native `egl_probe` extension). If you ever add LIBERO to an existing env *after*
-the fact, do it as shown in [`sim_eval/libero/README.md`](sim_eval/libero/README.md)
-— installing it as a second step needs one extra command (lerobot's bundled
-`cmake` shim otherwise breaks the `egl_probe` source build).
+`environment.yml` installs the LIBERO extra by default. For training,
+benchmarking, RoboTwin, or real-robot deployment without LIBERO, replace
+`-e .[libero]` with `-e .` in `environment.yml` before creating the env.
 
-That's it — **no custom `transformers` build is required**. FlashVLA installs
-`lerobot[smolvla]==0.5.1` and uses `lerobot.policies.pi_gemma` (shipped in
-that release) for adaRMS-capable Gemma/PaliGemma backbones, so the old
-special transformers commit is not needed.
+## Training pi0.5
 
-## Repository layout
-
-The `flashvla` package is a pure library (policies, datasets, the async
-manager); every workflow is a self-contained directory at the repo root:
-
-```
-flashvla/      the pip-installed library
-train/         training scripts + configs/
-sim_eval/      simulation evaluation (LIBERO, RoboTwin)
-realworld/     real-robot deployment guide
-benchmarks/    inference latency benchmark + configs/
-```
-
-## Quick Start
-
-**Train a FlashVLA policy** (starts from `lerobot/pi05_base`):
+Train FlashVLA on LIBERO:
 
 ```bash
-python train/train.py --config_path=train/configs/pi05/libero/flashvla_action.yaml
+python train/train.py \
+  --config_path=train/configs/pi05/libero/flashvla_action.yaml
+```
 
-# multi-GPU
+Multi-GPU:
+
+```bash
 accelerate launch --multi_gpu --num_processes=4 \
-    train/train.py --config_path=train/configs/pi05/libero/flashvla_action.yaml
+  train/train.py \
+  --config_path=train/configs/pi05/libero/flashvla_action.yaml
 ```
 
-(`train/train_baseline.py` finetunes the plain pi05/pi0/smolvla baselines.)
-
-**Evaluate on LIBERO** with async overlap:
+Train a baseline policy:
 
 ```bash
-python sim_eval/libero/eval.py \
-    --policy.path=outputs/train/flashvla_action_libero/checkpoints/last/pretrained_model \
-    --policy.compile_model=true --policy.fuse_qkv=true --policy.fuse_gate_up=true \
-    --env.type=libero --env.task=libero_spatial \
-    --eval.batch_size=1 --eval.n_episodes=50 \
-    --policy.n_action_steps=5 --inference_overlap_steps=1 \
-    --output_dir=outputs/eval --seed=1000
+python train/train_baseline.py \
+  --config_path=train/configs/pi05/sync.yaml
 ```
 
-**Benchmark inference latency** (standalone scripts under [`benchmarks/`](benchmarks/)):
+For real-world Franka training, use
+[`train/configs/pi05/franka/flashvla_action_franka_dynamic_pap.yaml`](train/configs/pi05/franka/flashvla_action_franka_dynamic_pap.yaml).
+For RoboTwin training, use
+[`train/configs/pi05/robotwin/flashvla_action_per_task.yaml`](train/configs/pi05/robotwin/flashvla_action_per_task.yaml).
+
+## Testing pi0.5 on LIBERO
+
+See [`sim_eval/libero/`](sim_eval/libero/) for single-run and full-sweep
+evaluation.
+
+## Testing pi0.5 on RoboTwin
+
+See [`sim_eval/robotwin/`](sim_eval/robotwin/) for RoboTwin setup and
+server/client evaluation.
+
+## Latency Benchmark
 
 ```bash
-python benchmarks/benchmark_latency.py --config_path=benchmarks/configs/latency_flashvla.yaml
-python benchmarks/benchmark_latency.py --config_path=benchmarks/configs/latency_baseline.yaml   # chunked baseline
+python benchmarks/benchmark_latency.py \
+  --config_path=benchmarks/configs/latency_flashvla.yaml
+
+python benchmarks/benchmark_latency.py \
+  --config_path=benchmarks/configs/latency_baseline.yaml
 ```
 
-## Evaluation
+Use `--num_views=1`, `--num_views=2`, or `--num_views=3` to sweep camera views.
 
-Simulation evaluation lives under [`sim_eval/`](sim_eval/); real-robot deployment under [`realworld/`](realworld/):
+## Real-Robot Deployment
 
-| Target | Where | Notes |
-|---|---|---|
-| **LIBERO** (sim) | [`sim_eval/libero/`](sim_eval/libero/) | `eval.py` single runs + multi-seed × multi-suite × multi-GPU orchestrator |
-| **RoboTwin 2.0** (sim) | [`sim_eval/robotwin/`](sim_eval/robotwin/) | TCP client/server adapters + a small overlay onto upstream RoboTwin |
-| **Real robot** | [`realworld/`](realworld/) | bring your own driver; integrate via `flashvla.async_manager.AsyncStreamingActionManager` |
+```python
+from flashvla.async_manager import AsyncStreamingActionManager
 
-## Supported policies
+manager = AsyncStreamingActionManager(policy, overlap_steps=1)
+manager.warmup(preprocessor(first_obs))
+manager.reset()
 
-| `policy.type` | Backbone | Streaming |
-|---|---|---|
-| `pi05-flashvla` | PaliGemma 3B + 300M Gemma expert (adaRMS) | ✅ |
-| `pi0-flashvla` | PaliGemma 3B + 300M Gemma expert (concat-time, optional adaRMS) | ✅ |
-| `smolvla-flashvla` | SmolVLM2-500M + Llama expert (optional adaRMS) | ✅ |
-| `pi05` / `pi0` / `smolvla` | baselines for finetuning & comparison | — |
+while running:
+    action = manager.act(preprocessor(obs))
+    robot.send_action(postprocessor(action)[0].cpu().numpy())
+```
 
-Key streaming knobs (see `train/configs/*/flashvla_action*.yaml`): `num_buffer_slots` (N), `chunk_size` (C), `n_action_steps`, `timestep_sample_mode` (`per-sample` recommended), `cold_start_mode` (`zero_delta` for delta-action robots, `current_state` for absolute-position robots), `use_action_prefix`.
+See [`realworld/README.md`](realworld/README.md) for the full deployment
+contract.
 
-## Acknowledgment
+## Repository Layout
 
-This project is built upon the following excellent open-source projects: [LeRobot](https://github.com/huggingface/lerobot), [RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin).
+```text
+flashvla/      library code
+train/         training scripts and configs
+sim_eval/      LIBERO and RoboTwin evaluation
+benchmarks/    latency benchmark
+realworld/     real-robot deployment notes
+assets/        images for README
+```
+
+## Acknowledgement
+
+This project builds on [LeRobot](https://github.com/huggingface/lerobot) and
+[RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin).
+
+## Citation
+
+Citation information will be added with the paper release.
 
 ## License
 
-Apache 2.0
+Apache-2.0
