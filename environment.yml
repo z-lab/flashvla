@@ -15,6 +15,12 @@ dependencies:
   - make
   - c-compiler
   - cxx-compiler
+  # FFmpeg for torchcodec video decoding (RoboTwin / Franka datasets store
+  # frames as AV1 video; LIBERO uses image frames and doesn't need it).
+  # torchcodec links FFmpeg's shared libs at runtime; pin to 7.x — torchcodec
+  # 0.9.1 ships decoders for FFmpeg 4–8, and the env's python rpath ($ORIGIN/
+  # ../lib) lets it find these conda libs with no LD_LIBRARY_PATH needed.
+  - ffmpeg=7.*
   - pip
   - pip:
       # Match the validated local conda stack.
@@ -22,7 +28,12 @@ dependencies:
       - --extra-index-url https://download.pytorch.org/whl/cu128
       - torch==2.9.1+cu128
       - torchvision==0.24.1+cu128
-      - torchcodec==0.5
+      # torchcodec MUST come from the cu128 index (same as torch) and match
+      # torch's build ABI: 0.8–0.9 pair with torch 2.9. The "+cu128" local tag
+      # forces the cu128 index (plain pypi wheels are built against a different
+      # c10 ABI → "undefined symbol c10::..." at import). 0.5 (the obvious pin)
+      # is built for torch 2.7 and crashes; >=0.10 needs FFmpeg 8 / newer torch.
+      - torchcodec==0.9.1+cu128
       # Installs FlashVLA with the LIBERO simulation extra in one resolution.
       # Drop "[libero]" (use "-e .") for a lean train/benchmark/RoboTwin/real-robot
       # env — those paths do not build egl_probe.
