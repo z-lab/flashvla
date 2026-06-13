@@ -1,11 +1,4 @@
-# FlashVLA FlashVLA Per-Task Training — MERGED setting
-#
-# Trains pi05-flashvla on merged_550 (50 clean + 500 randomized
-# episodes per task, re-indexed 0..549, processed through the official
-# openpi pipeline).
-#
-# Data: /path/to/RoboTwin-LeRobot-v3.0-merged/<task>/merged_550/
-
+# Policy configuration
 policy:
   type: pi05-flashvla
   pretrained_path: lerobot/pi05_base
@@ -13,11 +6,9 @@ policy:
   dtype: bfloat16
   device: cuda
   state_cond: false
-  num_buffer_slots: 5
-  chunk_size: 10
-  # merged_550 includes the 500 randomized episodes that drive the
-  # noise-floor cascade; use PerSeg.
-  timestep_sample_mode: "per-sample"
+  num_buffer_slots: 4
+  chunk_size: 20
+  timestep_sample_mode: "per-chunk"
   freeze_vision_encoder: false
   freeze_vlm: false
   cold_start_mode: current_state
@@ -26,18 +17,21 @@ policy:
     STATE: QUANTILES
     ACTION: QUANTILES
 
+# Dataset configuration
 dataset:
-  repo_id: robotwin_official_merged/per_task_placeholder
+  repo_id: robotwin_official_clean/per_task_placeholder
   video_backend: torchcodec
-
-output_dir: flashvla_action_merged_per_task/per_task_placeholder
-job_name: flashvla_action_merged
+  
+# Training parameters
+output_dir: pi05_flashvla_clean_per_task/per_task_placeholder
+job_name: pi05_flashvla_clean_per_task
 batch_size: 16
 grad_accum_steps: 1
-steps: 50000
+steps: 10000
 num_workers: 4
 seed: 1000
 
+# Optimizer configuration
 use_policy_training_preset: false
 optimizer:
   type: adamw
@@ -46,6 +40,7 @@ optimizer:
   weight_decay: 1.0e-10
   grad_clip_norm: 1.0
 
+# Learning rate scheduler
 scheduler:
   type: cosine_decay_with_warmup
   num_warmup_steps: 500
@@ -53,12 +48,14 @@ scheduler:
   decay_lr: 2.5e-6
   num_decay_steps: 10000
 
+# Checkpointing
 save_checkpoint: true
 save_freq: 2000
 
+# Logging
 log_freq: 50
 wandb:
   enable: true
-  project: flashvla-robotwin-merged
+  project: flashvla-robotwin
   entity: null
   disable_artifact: true

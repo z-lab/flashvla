@@ -1,13 +1,4 @@
-# PI05 Baseline Per-Task Training on RoboTwin — CLEAN setting
-#
-# Trains on aloha-agilex_clean_50 (50 episodes per task, no domain
-# randomization). Matches the official RoboTwin leaderboard training
-# setup: batch=64-eq × 20000 steps ≈ same ~1.28M samples budget on
-# ~5500 frames/task → ~213 effective epochs (overfit regime, as intended
-# by the official `pi05_aloha_full_base` recipe).
-#
-# Data: /path/to/RoboTwin-LeRobot-v3.0/<task>/aloha-agilex_clean_50/
-
+# Policy configuration
 policy:
   type: pi05
   pretrained_path: lerobot/pi05_base
@@ -23,10 +14,12 @@ policy:
     STATE: QUANTILES
     ACTION: QUANTILES
 
+# Dataset configuration
 dataset:
   repo_id: robotwin_official_clean/per_task_placeholder
   video_backend: torchcodec
 
+# Training parameters
 output_dir: pi05_baseline_clean_per_task/per_task_placeholder
 job_name: pi05_baseline_clean
 batch_size: 16
@@ -35,6 +28,7 @@ steps: 10000
 num_workers: 4
 seed: 1000
 
+# Optimizer configuration
 use_policy_training_preset: false
 optimizer:
   type: adamw
@@ -43,6 +37,7 @@ optimizer:
   weight_decay: 1.0e-10
   grad_clip_norm: 1.0
 
+# Learning rate scheduler
 scheduler:
   type: cosine_decay_with_warmup
   num_warmup_steps: 500
@@ -50,14 +45,14 @@ scheduler:
   decay_lr: 2.5e-6
   num_decay_steps: 10000
 
+# Checkpointing
 save_checkpoint: true
 save_freq: 2000
 
+# Logging
 log_freq: 50
 wandb:
   enable: true
-  project: flashvla-robotwin-clean
+  project: flashvla-robotwin
   entity: null
   disable_artifact: true
-
-max_delay_steps: 0
