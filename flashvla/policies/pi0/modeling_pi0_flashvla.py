@@ -437,7 +437,6 @@ class PI0FlashVLAModel(nn.Module):
         self,
         batch_size: int,
         device: torch.device,
-        use_prefix: bool,
     ) -> tuple[Tensor, Tensor]:
         """PerSeg time sampling: one global t per slot level, shared across configs.
 
@@ -448,14 +447,9 @@ class PI0FlashVLAModel(nn.Module):
                 broadcast (repeat_interleave by C).
         """
         N, C = self.N, self.C
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
 
-        global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-        if use_prefix:
-            prefix_time = torch.zeros(batch_size, 1, device=device, dtype=global_time.dtype)
-            time_per_segment = torch.cat([prefix_time, global_time], dim=1)  # [B, N+1]
-        else:
-            time_per_segment = global_time  # [B, N]
+        time_per_segment = self._sample_global_slot_times(batch_size, device)  # [B, N]
 
         # lookup[k_idx, s] = which segment a (config, slot) maps to.
         # Pad slots (slot levels above k_idx's real budget) get padding-time=1.0
@@ -463,15 +457,9 @@ class PI0FlashVLAModel(nn.Module):
         # but we set 1.0 (pure noise) for clarity. Real slots map to the
         # appropriate slot level in time_per_segment.
         lookup = torch.zeros(N, num_slots_per_config, dtype=torch.long, device=device)
-        if use_prefix:
-            for k_idx in range(N):
-                k = k_idx + 1
-                lookup[k_idx, 0] = 0  # prefix segment (t=0)
-                lookup[k_idx, 1:1 + k] = torch.arange(N - k + 1, N + 1, device=device)
-        else:
-            for k_idx in range(N):
-                k = k_idx + 1
-                lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
+        for k_idx in range(N):
+            k = k_idx + 1
+            lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
 
         segment_lookup = lookup.reshape(-1).unsqueeze(0).expand(batch_size, -1).contiguous()
         # [B, N * num_slots_per_config]
@@ -483,17 +471,15 @@ class PI0FlashVLAModel(nn.Module):
         self,
         batch_size: int,
         device: torch.device,
-        use_prefix: bool,
     ) -> tuple[Tensor, Tensor]:
         """Per-chunk independent time sampling (ablation only).
 
         Each (config k_idx, slot s) draws its own Beta sample. Reproduces the
         pre-PerSeg cross-config incoherence — useful only for diagnosing
-        cascade issues. Real slots get sampled t; padded slots get t=1.0;
-        prefix slots (if enabled) get t=0.0.
+        cascade issues. Real slots get sampled t; padded slots get t=1.0.
         """
         N, C = self.N, self.C
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
 
         alpha = torch.tensor(self.config.time_sampling_beta_alpha, device=device, dtype=torch.float32)
         beta = torch.tensor(self.config.time_sampling_beta_beta, device=device, dtype=torch.float32)
@@ -502,15 +488,11 @@ class PI0FlashVLAModel(nn.Module):
 
         seg_start = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.float32)
         is_real = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.bool)
-        is_prefix = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.bool)
         for k_idx in range(N):
             num_real = k_idx + 1
-            offset = 1 if use_prefix else 0
-            if use_prefix:
-                is_prefix[k_idx, 0] = True
             for i in range(num_real):
-                seg_start[k_idx, offset + i] = (N - num_real + i) / N
-                is_real[k_idx, offset + i] = True
+                seg_start[k_idx, i] = (N - num_real + i) / N
+                is_real[k_idx, i] = True
 
         time_per_slot = seg_start[None, :, :] + samples / N
         time_per_slot = (
@@ -519,9 +501,6 @@ class PI0FlashVLAModel(nn.Module):
         )
         time_per_slot = torch.where(
             is_real[None, :, :], time_per_slot, torch.ones_like(time_per_slot),
-        )
-        time_per_slot = torch.where(
-            is_prefix[None, :, :], torch.zeros_like(time_per_slot), time_per_slot,
         )
         time_per_slot = time_per_slot.reshape(batch_size, -1)  # [B, N*S]
         time_per_token = time_per_slot.repeat_interleave(C, dim=1)
@@ -545,21 +524,11 @@ class PI0FlashVLAModel(nn.Module):
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
-        if self.config.use_action_prefix and H == (N + 1) * C:
-            with_prefix_path = True
-        elif H == N * C:
-            with_prefix_path = False
-        else:
-            expected = f"{N * C} or {(N + 1) * C}" if self.config.use_action_prefix else str(N * C)
-            raise ValueError(f"Expected action horizon {expected}, got {H}.")
+        if H != N * C:
+            raise ValueError(f"Expected action horizon {N * C}, got {H}.")
 
-        # Sample t for the N (or N+1) slot levels of this config; full-buffer config.
-        global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-        if with_prefix_path:
-            prefix_time = torch.zeros(batch_size, 1, device=device, dtype=global_time.dtype)
-            time_per_slot = torch.cat([prefix_time, global_time], dim=1)  # [B, N+1]
-        else:
-            time_per_slot = global_time
+        # Sample t for the N slot levels of this config; full-buffer config.
+        time_per_slot = self._sample_global_slot_times(batch_size, device)  # [B, N]
 
         time_per_token = time_per_slot.repeat_interleave(C, dim=1)  # [B, H]
         time_expanded = time_per_token.unsqueeze(-1)
@@ -615,9 +584,6 @@ class PI0FlashVLAModel(nn.Module):
         losses = F.mse_loss(u_t, v_t, reduction="none")
         if action_is_pad is not None:
             real_mask_loss = ~action_is_pad
-            if with_prefix_path:
-                real_mask_loss = real_mask_loss.clone()
-                real_mask_loss[:, :C] = False  # drop prefix tokens from loss
             losses = losses[real_mask_loss]
         return losses
 
@@ -631,13 +597,12 @@ class PI0FlashVLAModel(nn.Module):
         Args:
             states: ``[B, state_dim]`` (single state shared across all N configs).
             actions: ``[B, N * H_cfg, action_dim]`` flattened in config-major
-                order. ``H_cfg = (N+1)*C`` with prefix, ``N*C`` without.
+                order. ``H_cfg = N*C``.
             action_is_pad: ``[B, N * H_cfg]`` boolean.
         """
         batch_size = states.shape[0]
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        H_cfg = (N + 1) * C if use_prefix else N * C
+        H_cfg = N * C
         device = states.device
 
         if noise is None:
@@ -646,11 +611,11 @@ class PI0FlashVLAModel(nn.Module):
         mode = getattr(self.config, "timestep_sample_mode", "per-sample")
         if mode == "per-sample":
             time_per_slot_all, time_per_token = self._build_per_sample_time(
-                batch_size, device, use_prefix,
+                batch_size, device,
             )
         elif mode == "per-chunk":
             time_per_slot_all, time_per_token = self._build_per_chunk_time(
-                batch_size, device, use_prefix,
+                batch_size, device,
             )
         else:
             raise ValueError(
@@ -668,7 +633,7 @@ class PI0FlashVLAModel(nn.Module):
         )
 
         # Per-config suffix: flatten (B, N) into the batch axis for the embedder.
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
         states_flat = states.unsqueeze(1).expand(batch_size, N, -1).reshape(batch_size * N, -1)
         x_t_flat = x_t.view(batch_size * N, H_cfg, -1)
         time_per_slot_flat = time_per_slot_all.view(batch_size * N, num_slots_per_config)
@@ -731,17 +696,11 @@ class PI0FlashVLAModel(nn.Module):
 
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        # Build loss mask: exclude padded positions AND (if use_prefix) prefix tokens
+        # Build loss mask: exclude padded positions
         if action_is_pad is not None:
             loss_mask = ~action_is_pad  # [B, N*H_cfg]
         else:
             loss_mask = torch.ones(batch_size, N * H_cfg, dtype=torch.bool, device=device)
-        if use_prefix:
-            prefix_exclude = torch.zeros(batch_size, N * H_cfg, dtype=torch.bool, device=device)
-            for k_idx in range(N):
-                start = k_idx * H_cfg
-                prefix_exclude[:, start:start + C] = True
-            loss_mask = loss_mask & ~prefix_exclude
 
         losses = losses[loss_mask]
         return losses
@@ -807,8 +766,7 @@ class PI0FlashVLAModel(nn.Module):
         step_counter is a 0-d int64 tensor — see _cold_step_t docs above.
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = tokens.shape[0]
         device = tokens.device
@@ -848,16 +806,9 @@ class PI0FlashVLAModel(nn.Module):
         slot_idx = torch.arange(buf_slots, device=device)
         slot_idx_buf = torch.arange(buf_len, device=device) // C
 
-        if use_prefix:
-            is_prefix = slot_idx == 0
-            is_real = slot_idx <= num_real
-            time_noisy = (N - num_real + slot_idx).to(torch.float32) / N
-            time_slot = torch.where(is_prefix, torch.zeros_like(time_noisy), time_noisy)
-            time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
-        else:
-            is_real = slot_idx < num_real
-            time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
-            time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
+        is_real = slot_idx < num_real
+        time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
+        time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
 
         time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)  # [B, buf_slots]
         padding_mask = is_real.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
@@ -869,16 +820,9 @@ class PI0FlashVLAModel(nn.Module):
 
         dt = 1.0 / N
         new_noise = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-        if use_prefix:
-            prefix_part = buffer[:, :C, :]
-            noisy_part = buffer[:, C:, :] - dt * v_t[:, C:, :]
-            updated_buffer = torch.cat([prefix_part, noisy_part], dim=1)
-            keep_mask = slot_idx_buf <= num_real
-            noise_mask = slot_idx_buf == (num_real + 1)
-        else:
-            updated_buffer = buffer - dt * v_t
-            keep_mask = slot_idx_buf < num_real
-            noise_mask = slot_idx_buf == num_real
+        updated_buffer = buffer - dt * v_t
+        keep_mask = slot_idx_buf < num_real
+        noise_mask = slot_idx_buf == num_real
 
         keep_mask = keep_mask.view(1, buf_len, 1)
         noise_mask = noise_mask.view(1, buf_len, 1)
@@ -909,8 +853,7 @@ class PI0FlashVLAModel(nn.Module):
         Static shapes throughout — compiled into a single CUDA graph.
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = tokens.shape[0]
         device = tokens.device
@@ -934,12 +877,8 @@ class PI0FlashVLAModel(nn.Module):
             )
 
         # Steady-state time vector
-        if use_prefix:
-            time_per_slot = torch.zeros(bsz, buf_slots, device=device, dtype=torch.float32)
-            time_per_slot[:, 1:] = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
-        else:
-            time_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
-            time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)
+        time_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
+        time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)
 
         v_t = self.denoise_step(
             prefix_pad_masks, prefix_att_masks, state,
@@ -947,19 +886,11 @@ class PI0FlashVLAModel(nn.Module):
         )
 
         dt = 1.0 / N
-        if use_prefix:
-            buffer[:, C:, :] = buffer[:, C:, :] - dt * v_t[:, C:, :]
-            actions_to_execute = buffer[:, C:2*C, :self.config.max_action_dim]
-            new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-            new_buffer[:, :C, :] = buffer[:, C:2*C, :]
-            new_buffer[:, C:N*C, :] = buffer[:, 2*C:, :]
-            buffer = new_buffer
-        else:
-            buffer = buffer - dt * v_t
-            actions_to_execute = buffer[:, :C, :self.config.max_action_dim]
-            new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-            new_buffer[:, :-C, :] = buffer[:, C:, :]
-            buffer = new_buffer
+        buffer = buffer - dt * v_t
+        actions_to_execute = buffer[:, :C, :self.config.max_action_dim]
+        new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
+        new_buffer[:, :-C, :] = buffer[:, C:, :]
+        buffer = new_buffer
 
         return actions_to_execute, buffer
 
@@ -967,18 +898,13 @@ class PI0FlashVLAModel(nn.Module):
     def sample_actions(self, images, img_masks, tokens, masks, state, buffer, step_counter, profile=False):
         """Top-level dispatch: cold-start (eager) or steady streaming (compiled)."""
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = tokens.shape[0]
         device = tokens.device
 
         if buffer is None:
-            if use_prefix:
-                buffer = torch.zeros(bsz, buf_len, self.config.max_action_dim, device=device)
-                buffer[:, C:2*C, :] = self.sample_noise((bsz, C, self.config.max_action_dim), device)
-            else:
-                buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
+            buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
 
         _evs_total = (
             [torch.cuda.Event(enable_timing=True) for _ in range(2)]
@@ -1206,19 +1132,12 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
     def reset(self):
         """Reset buffer and step counter. Call when environment resets.
 
-        Without action prefix:
-            [noise, P, P, P, P]: slot 0 is noise, rest zeros (padding).
-        With action prefix:
-            [zeros, noise, P, P, P, P]: slot 0 is action prefix (zeros),
-            slot 1 is noise, rest zeros (padding).
+        [noise, P, P, P, P]: slot 0 is noise, rest zeros (padding).
         """
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         C = self.config.chunk_size
         self.action_buffer.zero_()
-        if self.config.use_action_prefix:
-            self.action_buffer[:, C:2*C, :].normal_()
-        else:
-            self.action_buffer[:, :C, :].normal_()
+        self.action_buffer[:, :C, :].normal_()
         self._step_counter = 0
         self._cold_start_action = None
 

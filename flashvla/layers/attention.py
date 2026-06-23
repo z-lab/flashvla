@@ -121,16 +121,16 @@ class Attention(nn.Module):
 
         if return_attn_probs:
             # Memory-efficient backend doesn't return attention weights.
-            attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+            attn_scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
             if attention_mask is not None:
-                attn_scores = attn_scores + attention_mask
-            attn_weights = torch.softmax(attn_scores, dim=-1)
+                attn_scores = attn_scores + attention_mask.float()
+            attn_weights = torch.softmax(attn_scores, dim=-1).to(q.dtype)
             out = torch.matmul(attn_weights, v)
             return out, attn_weights
 
-        attn_scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn_scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
         if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask
-        attn_weights = torch.softmax(attn_scores, dim=-1)
+            attn_scores = attn_scores + attention_mask.float()
+        attn_weights = torch.softmax(attn_scores, dim=-1).to(q.dtype)
         out = torch.matmul(attn_weights, v)
         return out

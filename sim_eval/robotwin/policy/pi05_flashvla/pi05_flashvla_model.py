@@ -210,6 +210,37 @@ class PI05FlashVLAModel:
 
         return action.detach().to("cpu").numpy().reshape(-1).astype(np.float32)
 
+    def needs_image_obs(self) -> bool:
+        """Whether the next action call will launch policy inference."""
+        m = self.manager
+        if not m.is_running():
+            return True
+        if m.chunk_index == 0 and m.next_chunk is None:
+            return True
+        return bool(m._should_launch_next())
+
+    def get_cached_action(self) -> np.ndarray:
+        """Replay one already-computed action without a rendered observation."""
+        if self.needs_image_obs():
+            raise RuntimeError("get_cached_action called when the next step needs image observation")
+
+        m = self.manager
+        if m.current_chunk is None:
+            if m.next_chunk is None:
+                raise RuntimeError("no current or next action chunk is available")
+            m.current_chunk = m.next_chunk.detach().cpu().numpy()
+            m.next_chunk = None
+
+        action_np = m.current_chunk[:, m.chunk_index, :]
+        action = torch.from_numpy(action_np).to(self.device)
+
+        m.chunk_index = (m.chunk_index + 1) % m.n_action_steps
+        if m.chunk_index == 0:
+            m.current_chunk = None
+
+        action = self.postprocessor(action)
+        return action.detach().to("cpu").numpy().reshape(-1).astype(np.float32)
+
     # ── helpers ───────────────────────────────────────────────────────
 
     def _encode_batch(self, obs_dict: dict) -> dict[str, Any]:

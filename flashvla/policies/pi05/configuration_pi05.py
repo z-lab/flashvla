@@ -251,7 +251,6 @@ class PI05FlashVLAConfig(PI05Config):
     num_buffer_slots: int = 5      # N = number of slots in buffer
     n_action_steps: int = 10       # Execute one full slot per step
     freeze_vlm: bool = False        # Freeze VLM backbone, only train action expert + suffix embedder
-    use_action_prefix: bool = False  # Prepend a clean (fully denoised) chunk as history action conditioning
 
     # 2026-05-06: RMSNorm-on-time_mlp_out experiment was rejected. It killed
     # the σ_max cascade but also killed eval (0% on bbh). Replaced by
@@ -264,8 +263,8 @@ class PI05FlashVLAConfig(PI05Config):
     # observation; flow-matching math (within a chunk) is unchanged.
     #
     #   "per-sample" (default, PerSeg) — sample one global t per slot level
-    #                  shared across all N configs. time_mlp runs on N (or
-    #                  N+1) unique inputs via segment_lookup. Eliminates the
+    #                  shared across all N configs. time_mlp runs on N unique
+    #                  inputs via segment_lookup. Eliminates the
     #                  per-batch incoherence that drove the cascade.
     #   "per-chunk"   — each buffer config independently samples its own t
     #                   for every chunk, even at the same slot level.
@@ -288,13 +287,13 @@ class PI05FlashVLAConfig(PI05Config):
 
     @property
     def total_action_horizon(self) -> int:
-        """Number of action steps in the noisy prediction window (excludes action prefix)."""
+        """Number of action steps in the noisy prediction window."""
         return self.num_buffer_slots * self.chunk_size
 
     @property
     def total_buffer_slots(self) -> int:
-        """Total slots including action prefix if enabled."""
-        return self.num_buffer_slots + (1 if self.use_action_prefix else 0)
+        """Total number of buffer slots."""
+        return self.num_buffer_slots
 
     @property
     def total_buffer_length(self) -> int:
@@ -303,9 +302,6 @@ class PI05FlashVLAConfig(PI05Config):
 
     @property
     def action_delta_indices(self) -> list:
-        if self.use_action_prefix:
-            # Include C past actions for action prefix conditioning
-            return list(range(-self.chunk_size, self.num_buffer_slots * self.chunk_size))
         return list(range(self.total_action_horizon))
 
 

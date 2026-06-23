@@ -182,7 +182,6 @@ class SmolVLAFlashVLAConfig(SmolVLAConfig):
     chunk_size: int = 10
     num_buffer_slots: int = 5
     n_action_steps: int = 10
-    use_action_prefix: bool = False
 
     # Shared-obs time sampling
     timestep_sample_mode: str = "per-sample"  # or "per-chunk" for ablation
@@ -226,7 +225,7 @@ class SmolVLAFlashVLAConfig(SmolVLAConfig):
 
     @property
     def total_buffer_slots(self) -> int:
-        return self.num_buffer_slots + (1 if self.use_action_prefix else 0)
+        return self.num_buffer_slots
 
     @property
     def total_buffer_length(self) -> int:
@@ -234,6 +233,4 @@ class SmolVLAFlashVLAConfig(SmolVLAConfig):
 
     @property
     def action_delta_indices(self) -> list:
-        if self.use_action_prefix:
-            return list(range(-self.chunk_size, self.num_buffer_slots * self.chunk_size))
         return list(range(self.total_action_horizon))

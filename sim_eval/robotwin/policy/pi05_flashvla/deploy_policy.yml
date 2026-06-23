@@ -39,7 +39,8 @@ task_name: null
 task_config: null
 ckpt_setting: null
 seed: null
-instruction_type: unseen
+# Use the training-set instruction templates/descriptions.
+instruction_type: seen
 # Optional: name of the conda env the server is running in — only used
 # for logging by eval_policy_client.py.
 policy_conda_env: flashvla

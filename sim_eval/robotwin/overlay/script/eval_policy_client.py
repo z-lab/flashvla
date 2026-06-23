@@ -231,6 +231,9 @@ class ModelClient:
 
 def main(usr_args):
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    run_id = os.environ.get("ROBOTWIN_EVAL_RUN_ID")
+    if run_id:
+        current_time = f"{current_time}_{run_id}"
     task_name = usr_args["task_name"]
     task_config = usr_args["task_config"]
     ckpt_setting = usr_args["ckpt_setting"]
@@ -370,6 +373,7 @@ def main(usr_args):
                 "wall_per_ep_s_mean", "total_wall_s",
                 "time_per_step_ms_mean",
                 "n_total_calls",
+                "n_image_obs_total", "n_cached_actions_total", "image_obs_per_ep_mean",
                 "call_lat_ms_mean", "call_lat_ms_p50", "call_lat_ms_p95",
             ):
                 v = agg_metrics.get(k)
@@ -425,6 +429,7 @@ def eval_policy(task_name,
     # vanilla pi05 with pi0_step=50) each call covers pi0_step env steps.
     per_ep: list[dict] = []
     all_call_lats_ms: list[float] = []
+    use_lazy_image_obs = bool(args.get("lazy_image_obs", False)) and policy_name == "pi05_flashvla"
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
@@ -502,9 +507,24 @@ def eval_policy(task_name,
         succ = False
         model.call(func_name='reset_model')
         ep_call_lats_ms: list[float] = []
+        ep_needs_obs_lats_ms: list[float] = []
+        ep_image_obs_count = 0
+        ep_cached_action_count = 0
         ep_wall_t0 = time.perf_counter()
         while TASK_ENV.take_action_cnt < TASK_ENV.step_lim:
-            observation = TASK_ENV.get_obs()
+            needs_image_obs = True
+            if use_lazy_image_obs:
+                _needs_t = time.perf_counter()
+                needs_image_obs = bool(model.call(func_name="needs_image_obs"))
+                ep_needs_obs_lats_ms.append((time.perf_counter() - _needs_t) * 1000.0)
+
+            if needs_image_obs:
+                observation = TASK_ENV.get_obs()
+                ep_image_obs_count += 1
+            else:
+                observation = None
+                ep_cached_action_count += 1
+
             _t = time.perf_counter()
             eval_func(TASK_ENV, model, observation)
             ep_call_lats_ms.append((time.perf_counter() - _t) * 1000.0)
@@ -520,9 +540,12 @@ def eval_policy(task_name,
             "wall_s": float(ep_wall_s),
             "time_per_step_ms": float(1000.0 * ep_wall_s / max(1, ep_steps)),
             "n_calls": len(ep_call_lats_ms),
+            "n_image_obs": ep_image_obs_count,
+            "n_cached_actions": ep_cached_action_count,
             "call_lat_ms_mean": float(np.mean(ep_call_lats_ms)) if ep_call_lats_ms else 0.0,
             "call_lat_ms_p50":  float(np.percentile(ep_call_lats_ms, 50)) if ep_call_lats_ms else 0.0,
             "call_lat_ms_p95":  float(np.percentile(ep_call_lats_ms, 95)) if ep_call_lats_ms else 0.0,
+            "needs_obs_lat_ms_mean": float(np.mean(ep_needs_obs_lats_ms)) if ep_needs_obs_lats_ms else 0.0,
         })
         all_call_lats_ms.extend(ep_call_lats_ms)
         # task_total_reward += TASK_ENV.episode_score
@@ -556,6 +579,8 @@ def eval_policy(task_name,
         steps_arr = np.array([m["steps"] for m in per_ep], dtype=float)
         wall_arr  = np.array([m["wall_s"] for m in per_ep], dtype=float)
         tps_arr   = np.array([m["time_per_step_ms"] for m in per_ep], dtype=float)
+        image_obs_arr = np.array([m.get("n_image_obs", 0) for m in per_ep], dtype=float)
+        cached_arr = np.array([m.get("n_cached_actions", 0) for m in per_ep], dtype=float)
         agg = {
             "n_episodes": n,
             "n_success": int(TASK_ENV.suc),
@@ -569,6 +594,9 @@ def eval_policy(task_name,
             "call_lat_ms_p50":  float(np.percentile(all_call_lats_ms, 50)) if all_call_lats_ms else 0.0,
             "call_lat_ms_p95":  float(np.percentile(all_call_lats_ms, 95)) if all_call_lats_ms else 0.0,
             "n_total_calls": len(all_call_lats_ms),
+            "n_image_obs_total": int(image_obs_arr.sum()),
+            "n_cached_actions_total": int(cached_arr.sum()),
+            "image_obs_per_ep_mean": float(image_obs_arr.mean()),
         }
     else:
         agg = {"n_episodes": 0}

@@ -68,6 +68,8 @@ class Base_Task(gym.Env):
         self.save_data = kwags.get("save_data", False)
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
+        lazy_render_env = os.environ.get("ROBOTWIN_LAZY_RENDER", "0").lower() in ("1", "true", "yes")
+        self.lazy_rendering = bool(kwags.get("lazy_rendering", False)) or lazy_render_env
 
         self.need_topp = True  # TODO
 
@@ -441,6 +443,14 @@ class Base_Task(gym.Env):
             self.scene.set_ambient_light(now_ambient_light)
         self.cameras.update_wrist_camera(self.robot.left_camera.get_pose(), self.robot.right_camera.get_pose())
         self.scene.update_render()
+
+    def _render_during_action(self) -> bool:
+        """Whether take_action should sync the renderer on every physics step."""
+        if not self.eval_mode or not self.lazy_rendering:
+            return True
+        if self.render_freq or self.eval_video_path is not None or self.save_data:
+            return True
+        return False
 
     # =========================================================== Basic APIs ===========================================================
 
@@ -1497,7 +1507,9 @@ class Base_Task(gym.Env):
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
 
-        self._update_render()
+        render_during_action = self._render_during_action()
+        if render_during_action:
+            self._update_render()
         if self.render_freq:
             self.viewer.render()
 
@@ -1662,8 +1674,9 @@ class Base_Task(gym.Env):
                 now_right_id += 1
 
             self.scene.step()
-            self._update_render()
-                
+            if render_during_action:
+                self._update_render()
+
             if self.check_success():
                 self.eval_success = True
                 self.get_obs() # update obs
@@ -1671,7 +1684,8 @@ class Base_Task(gym.Env):
                     self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
-        self._update_render()
+        if render_during_action:
+            self._update_render()
         if self.render_freq:  # UI
             self.viewer.render()
 

@@ -50,7 +50,8 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.rl.wandb_utils import WandBLogger
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
-from lerobot.utils.train_utils import get_step_checkpoint_dir, load_training_state, save_checkpoint, update_last_checkpoint
+from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
+from lerobot.utils.train_utils import (get_step_checkpoint_dir, load_training_state, load_training_step, save_checkpoint, save_training_step, update_last_checkpoint)
 from lerobot.utils.utils import (
     format_big_number,
     has_method,
@@ -71,6 +72,9 @@ from flashvla.datasets.flashvla_dataset import (
     make_multi_root_flashvla_dataset,
 )
 from flashvla.policies.factory import make_policy, make_pre_post_processors
+
+
+ACCELERATOR_STATE_DIR = "accelerator_state"
 
 
 def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> int:
@@ -102,38 +106,76 @@ def make_flashvla_dataset(cfg: FlashVLATrainConfig):
 
     mt_cfg = getattr(cfg, "robotwin_multitask", None)
     if mt_cfg is not None and mt_cfg.enable:
-        if not mt_cfg.root:
-            raise ValueError("cfg.robotwin_multitask.enable=True requires robotwin_multitask.root to be set")
-
-        # Resolve delta_timestamps against the first discovered subset's metadata.
         from pathlib import Path as _Path
-        root_path = _Path(mt_cfg.root).expanduser()
-        if mt_cfg.tasks:
-            probe_task = mt_cfg.tasks[0]
-        else:
-            probe_task = next(
-                p.name for p in sorted(root_path.iterdir())
-                if p.is_dir() and (p / mt_cfg.config_subdir / "meta" / "info.json").is_file()
-            )
-        probe_root = root_path / probe_task / mt_cfg.config_subdir
-        ds_meta = LeRobotDatasetMetadata(
-            repo_id=f"robotwin/{probe_task}_{mt_cfg.config_subdir}",
-            root=probe_root,
-            revision=None,
-        )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
 
-        dataset = make_robotwin_multitask_dataset(
-            root=mt_cfg.root,
-            config_subdir=mt_cfg.config_subdir,
-            tasks=mt_cfg.tasks,
-            num_buffer_slots=cfg.policy.num_buffer_slots,
-            chunk_size=cfg.policy.chunk_size,
-            use_action_prefix=getattr(cfg.policy, "use_action_prefix", False),
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            video_backend=cfg.dataset.video_backend,
-        )
+        if mt_cfg.roots:
+            # Explicit leaf roots (e.g. clean + randomized settings of one task);
+            # these define the multi-dataset training set directly.
+            probe_root = _Path(mt_cfg.roots[0]).expanduser()
+            ds_meta = LeRobotDatasetMetadata(
+                repo_id=f"{cfg.dataset.repo_id}_root0",
+                root=probe_root,
+                revision=None,
+            )
+            delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+            dataset = make_multi_root_flashvla_dataset(
+                repo_id=cfg.dataset.repo_id,
+                roots=mt_cfg.roots,
+                num_buffer_slots=cfg.policy.num_buffer_slots,
+                chunk_size=cfg.policy.chunk_size,
+                delta_timestamps=delta_timestamps,
+                image_transforms=image_transforms,
+                video_backend=cfg.dataset.video_backend,
+            )
+        else:
+            if not mt_cfg.root:
+                raise ValueError(
+                    "cfg.robotwin_multitask.enable=True requires robotwin_multitask.roots "
+                    "or robotwin_multitask.root to be set"
+                )
+            # config_subdirs (a list, pooling multiple settings per task) takes
+            # precedence over the single config_subdir.
+            config_subdirs = mt_cfg.config_subdirs or [mt_cfg.config_subdir]
+            root_path = _Path(mt_cfg.root).expanduser()
+            if mt_cfg.tasks:
+                probe_task = mt_cfg.tasks[0]
+            else:
+                probe_task = next(
+                    p.name for p in sorted(root_path.iterdir())
+                    if p.is_dir()
+                    and all((p / s / "meta" / "info.json").is_file() for s in config_subdirs)
+                )
+            probe_root = root_path / probe_task / config_subdirs[0]
+            ds_meta = LeRobotDatasetMetadata(
+                repo_id=f"robotwin/{probe_task}_{config_subdirs[0]}",
+                root=probe_root,
+                revision=None,
+            )
+            delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+            dataset = make_robotwin_multitask_dataset(
+                root=mt_cfg.root,
+                config_subdir=config_subdirs,
+                tasks=mt_cfg.tasks,
+                num_buffer_slots=cfg.policy.num_buffer_slots,
+                chunk_size=cfg.policy.chunk_size,
+                delta_timestamps=delta_timestamps,
+                image_transforms=image_transforms,
+                video_backend=cfg.dataset.video_backend,
+            )
+
+        # Exact pooled stats override. aggregate_stats() approximates pooled
+        # quantiles by count-weighted averaging, which can deviate from the true
+        # global q01/q99 by a large fraction of the normalization range across the
+        # RoboTwin tasks. The stats_path JSON carries exact global stats; features
+        # present in it replace their aggregated counterparts.
+        if mt_cfg.stats_path:
+            import json as _json
+            from lerobot.datasets.io_utils import cast_stats_to_numpy
+
+            with open(_Path(mt_cfg.stats_path).expanduser()) as f:
+                exact_stats = cast_stats_to_numpy(_json.load(f))
+            dataset.meta.stats.update(exact_stats)
+            logging.info(f"Overrode pooled stats for {sorted(exact_stats)} from {mt_cfg.stats_path}")
 
         if cfg.dataset.use_imagenet_stats:
             for key in dataset.meta.camera_keys:
@@ -156,7 +198,6 @@ def make_flashvla_dataset(cfg: FlashVLATrainConfig):
             roots=all_roots,
             num_buffer_slots=cfg.policy.num_buffer_slots,
             chunk_size=cfg.policy.chunk_size,
-            use_action_prefix=getattr(cfg.policy, "use_action_prefix", False),
             delta_timestamps=delta_timestamps,
             image_transforms=image_transforms,
             video_backend=cfg.dataset.video_backend,
@@ -184,7 +225,6 @@ def make_flashvla_dataset(cfg: FlashVLATrainConfig):
         video_backend=cfg.dataset.video_backend,
         num_buffer_slots=cfg.policy.num_buffer_slots,
         chunk_size=cfg.policy.chunk_size,
-        use_action_prefix=getattr(cfg.policy, "use_action_prefix", False),
     )
 
     if cfg.dataset.use_imagenet_stats:
@@ -209,6 +249,7 @@ def update_policy(
     loss_scale: float = 1.0,
     do_step: bool = True,
     autocast_ctx=None,
+    replicated_params_to_sync: list[torch.nn.Parameter] | None = None,
 ) -> tuple[MetricsTracker, dict]:
     """Performs a single training step."""
     policy.train()
@@ -223,8 +264,18 @@ def update_policy(
     grad_norm_value: float | None = None
 
     if do_step:
+        if replicated_params_to_sync:
+            sync_replicated_gradients(replicated_params_to_sync, accelerator)
+
         if grad_clip_norm > 0:
-            grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
+            if replicated_params_to_sync:
+                grad_norm = clip_fsdp2_mixed_grad_norm_(
+                    list(policy.parameters()),
+                    grad_clip_norm,
+                    accelerator,
+                )
+            else:
+                grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
         else:
             grad_norm = torch.nn.utils.clip_grad_norm_(
                 policy.parameters(), float("inf"), error_if_nonfinite=False
@@ -248,6 +299,141 @@ def update_policy(
     train_metrics.lr = optimizer.param_groups[0]["lr"]
 
     return train_metrics, output_dict
+
+
+def sync_replicated_gradients(
+    params: list[torch.nn.Parameter],
+    accelerator: Accelerator,
+) -> None:
+    """Average gradients for trainable params excluded from FSDP2 sharding."""
+    if accelerator.num_processes <= 1:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    for param in params:
+        if param.grad is None:
+            continue
+        torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM)
+        param.grad.div_(accelerator.num_processes)
+
+
+def clip_fsdp2_mixed_grad_norm_(
+    params: list[torch.nn.Parameter],
+    max_norm: float,
+    accelerator: Accelerator,
+) -> torch.Tensor:
+    """Clip a mix of FSDP2 DTensor grads and replicated Tensor grads."""
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:  # pragma: no cover - older torch without DTensor
+        return accelerator.clip_grad_norm_(params, max_norm)
+
+    device = accelerator.device
+    replicated_sq = torch.zeros((), device=device, dtype=torch.float32)
+    sharded_sq = torch.zeros((), device=device, dtype=torch.float32)
+    grads = []
+
+    for param in params:
+        grad = param.grad
+        if grad is None:
+            continue
+        grads.append(grad)
+        if isinstance(grad, DTensor):
+            local_grad = grad.to_local()
+            grad_sq = local_grad.detach().float().pow(2).sum()
+            is_sharded = any(type(placement).__name__ == "Shard" for placement in grad.placements)
+            if is_sharded:
+                sharded_sq = sharded_sq + grad_sq
+            else:
+                replicated_sq = replicated_sq + grad_sq
+        else:
+            replicated_sq = replicated_sq + grad.detach().float().pow(2).sum()
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.all_reduce(sharded_sq, op=torch.distributed.ReduceOp.SUM)
+
+    total_norm = (replicated_sq + sharded_sq).sqrt()
+    clip_coef = float(max_norm) / (total_norm.item() + 1e-6)
+    if clip_coef < 1.0:
+        for grad in grads:
+            grad.mul_(clip_coef)
+    return total_norm
+
+
+def disable_optimizer_foreach(optimizer: Optimizer) -> None:
+    """Avoid foreach kernels mixing regular Tensor params with DTensor params."""
+    optimizer.defaults["foreach"] = False
+    if "fused" in optimizer.defaults:
+        optimizer.defaults["fused"] = False
+    for group in optimizer.param_groups:
+        group["foreach"] = False
+        if "fused" in group:
+            group["fused"] = False
+
+
+def save_fsdp2_checkpoint(
+    *,
+    accelerator: Accelerator,
+    checkpoint_dir: Path,
+    step: int,
+    cfg: FlashVLATrainConfig,
+    policy: PreTrainedPolicy,
+    preprocessor,
+    postprocessor,
+) -> None:
+    """Save FSDP2 checkpoints in two forms.
+
+    `accelerator.save_state()` owns the sharded model/optimizer/scheduler state
+    used for exact resume. `accelerator.save_model()` exports a normal
+    pretrained_model/model.safetensors for inference/evaluation code that does
+    not know about FSDP2.
+    """
+    pretrained_dir = checkpoint_dir / PRETRAINED_MODEL_DIR
+    training_state_dir = checkpoint_dir / TRAINING_STATE_DIR
+
+    accelerator.wait_for_everyone()
+    accelerator.save_model(
+        policy,
+        pretrained_dir,
+        max_shard_size=cfg.fsdp.save_pretrained_max_shard_size,
+        safe_serialization=True,
+    )
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        unwrapped_policy = accelerator.unwrap_model(policy)
+        unwrapped_policy.config.save_pretrained(pretrained_dir)
+        cfg.save_pretrained(pretrained_dir)
+        if preprocessor is not None:
+            preprocessor.save_pretrained(pretrained_dir)
+        if postprocessor is not None:
+            postprocessor.save_pretrained(pretrained_dir)
+
+        training_state_dir.mkdir(parents=True, exist_ok=True)
+        save_training_step(step, training_state_dir)
+
+    accelerator.wait_for_everyone()
+    accelerator.save_state(str(checkpoint_dir / ACCELERATOR_STATE_DIR), safe_serialization=True)
+    accelerator.wait_for_everyone()
+
+
+def load_fsdp2_checkpoint(
+    *,
+    accelerator: Accelerator,
+    checkpoint_dir: Path,
+) -> int:
+    """Load FSDP2 training state after `accelerator.prepare()`."""
+    accelerator_state_dir = checkpoint_dir / ACCELERATOR_STATE_DIR
+    if not accelerator_state_dir.is_dir():
+        raise NotADirectoryError(
+            f"FSDP2 resume requires {accelerator_state_dir}. "
+            "Older LeRobot-style checkpoints do not contain sharded FSDP2 optimizer state."
+        )
+
+    step = load_training_step(checkpoint_dir / TRAINING_STATE_DIR)
+    accelerator.load_state(str(accelerator_state_dir))
+    return step
 
 
 def auto_resume(cfg: FlashVLATrainConfig) -> None:
@@ -296,11 +482,31 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     auto_resume(cfg)
     cfg.validate()
 
+    fsdp_mixed_precision = getattr(cfg.fsdp, "mixed_precision", "auto")
+    if fsdp_mixed_precision == "auto":
+        # Keep FSDP2 numerically conservative by default. bf16 remains available
+        # only via an explicit `fsdp.mixed_precision=bf16` override.
+        fsdp_mixed_precision = "no"
+    if fsdp_mixed_precision not in {"no", "bf16"}:
+        raise ValueError(
+            f"Unsupported fsdp.mixed_precision={fsdp_mixed_precision!r}. "
+            "Supported values are 'auto', 'no', and 'bf16'."
+        )
+    fsdp_policy_dtype_override = None
+    if cfg.fsdp.enable and fsdp_mixed_precision == "no" and cfg.policy.dtype != "float32":
+        old_policy_dtype = cfg.policy.dtype
+        cfg.policy.dtype = "float32"
+        fsdp_policy_dtype_override = (old_policy_dtype, cfg.policy.dtype)
+
     if accelerator is None:
         from accelerate.utils import DistributedDataParallelKwargs
 
+        if cfg.deepspeed.enable and cfg.fsdp.enable:
+            raise ValueError("deepspeed and fsdp are mutually exclusive; enable only one.")
+
         kwargs_handlers = []
         ds_plugin = None
+        fsdp_plugin = None
 
         if cfg.deepspeed.enable:
             # DeepSpeed ZeRO: bf16/fp16 disabled so DeepSpeed does NOT touch
@@ -330,6 +536,22 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                 }
 
             ds_plugin = DeepSpeedPlugin(hf_ds_config=ds_config)
+        elif cfg.fsdp.enable:
+            # FSDP2 still requires uniform original dtype within each parameter
+            # group. With mixed_precision='bf16', Accelerate upcasts trainable
+            # params to fp32 master weights before sharding, while FSDP2 uses
+            # bf16 all-gather/compute to keep activation and communication cost low.
+            from accelerate import FullyShardedDataParallelPlugin
+
+            fsdp_plugin = FullyShardedDataParallelPlugin(
+                fsdp_version=2,
+                reshard_after_forward=cfg.fsdp.reshard_after_forward,
+                cpu_offload=cfg.fsdp.cpu_offload,
+                mixed_precision_policy=fsdp_mixed_precision if fsdp_mixed_precision != "no" else None,
+                state_dict_type=cfg.fsdp.state_dict_type,
+                auto_wrap_policy="transformer_based_wrap" if cfg.fsdp.wrap_layers else "no_wrap",
+                transformer_cls_names_to_wrap=cfg.fsdp.wrap_layers or None,
+            )
         else:
             ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
             kwargs_handlers.append(ddp_kwargs)
@@ -338,6 +560,8 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             step_scheduler_with_optimizer=False,
             kwargs_handlers=kwargs_handlers,
             deepspeed_plugin=ds_plugin,
+            fsdp_plugin=fsdp_plugin,
+            mixed_precision=fsdp_mixed_precision if cfg.fsdp.enable and fsdp_mixed_precision != "no" else None,
         )
 
     init_logging(accelerator=accelerator)
@@ -351,6 +575,21 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                 f"offload_optimizer={cfg.deepspeed.offload_optimizer}, "
                 f"overlap_comm={cfg.deepspeed.overlap_comm}"
             )
+        if cfg.fsdp.enable:
+            logging.info(
+                f"FSDP2 enabled with reshard_after_forward={cfg.fsdp.reshard_after_forward}, "
+                f"mixed_precision={fsdp_mixed_precision}, "
+                f"state_dict_type={cfg.fsdp.state_dict_type}, "
+                f"wrap_layers={cfg.fsdp.wrap_layers}, "
+                f"ignored_module_classes={cfg.fsdp.ignored_module_classes}, "
+                f"ignored_module_name_suffixes={cfg.fsdp.ignored_module_name_suffixes}"
+            )
+            if fsdp_policy_dtype_override is not None:
+                old_dtype, new_dtype = fsdp_policy_dtype_override
+                logging.info(
+                    f"FSDP2 full-fp32 mode: overriding policy.dtype={old_dtype!r} "
+                    f"to {new_dtype!r}"
+                )
 
     if cfg.wandb.enable and cfg.wandb.project and is_main_process:
         wandb_logger = WandBLogger(cfg)
@@ -386,10 +625,23 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating policy")
 
-    policy = make_policy(
-        cfg=cfg.policy,
-        ds_meta=dataset.meta,
-    )
+    policy_config_dtype = cfg.policy.dtype
+    if cfg.fsdp.enable and fsdp_mixed_precision == "bf16" and cfg.policy.dtype == "bfloat16":
+        # FSDP2 mixed precision wants uniform fp32 original/master weights and
+        # casts to bf16 for compute/all-gather. Initializing directly in fp32
+        # avoids a bf16->fp32 upcast spike during accelerator.prepare().
+        cfg.policy.dtype = "float32"
+        if is_main_process:
+            logging.info("FSDP2 bf16: initializing policy parameters as fp32 master weights")
+
+    try:
+        policy = make_policy(
+            cfg=cfg.policy,
+            ds_meta=dataset.meta,
+        )
+    finally:
+        cfg.policy.dtype = policy_config_dtype
+    policy.config.dtype = policy_config_dtype
 
     # Freeze VLM if configured.
     # Policy modules use different attribute paths:
@@ -469,6 +721,14 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         new_groups.append({**base, "params": time_mlp_params, "weight_decay": time_mlp_wd})
         optimizer.param_groups = new_groups
 
+        # The scheduler was built against the pre-split optimizer, so its
+        # base_lrs / lr_lambdas have the old group count. Rebuild it against the
+        # modified optimizer; otherwise torch's LRScheduler._update_lr hits
+        # `zip(param_groups, values, strict=True)` with mismatched lengths and
+        # crashes on the first scheduler.step() (torch >= 2.10).
+        if cfg.scheduler is not None:
+            lr_scheduler = cfg.scheduler.build(optimizer, cfg.steps)
+
         if is_main_process:
             logging.info(
                 f"Added separate weight_decay={time_mlp_wd} on "
@@ -478,7 +738,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     step = 0
 
     # === Handle Checkpoint Resumption ===
-    if cfg.resume:
+    if cfg.resume and not cfg.fsdp.enable:
         step, optimizer, lr_scheduler = load_training_state(
             cfg.checkpoint_path, optimizer, lr_scheduler
         )
@@ -531,11 +791,65 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         collate_fn=flashvla_collate_fn,
     )
 
+    # FSDP2 ignored_modules needs live module instances, so set it after model
+    # construction and before accelerator.prepare().
+    fsdp_replicated_params_to_sync: list[torch.nn.Parameter] = []
+    if cfg.fsdp.enable and (cfg.fsdp.ignored_module_classes or cfg.fsdp.ignored_module_name_suffixes):
+        ignored_class_names = set(cfg.fsdp.ignored_module_classes)
+        ignored_name_suffixes = tuple(cfg.fsdp.ignored_module_name_suffixes)
+        ignored = []
+        seen_module_ids = set()
+        matched_names = []
+
+        for name, module in policy.named_modules():
+            class_match = type(module).__name__ in ignored_class_names
+            name_match = ignored_name_suffixes and name.endswith(ignored_name_suffixes)
+            if not (class_match or name_match):
+                continue
+            module_id = id(module)
+            if module_id in seen_module_ids:
+                continue
+            seen_module_ids.add(module_id)
+            ignored.append(module)
+            matched_names.append(name or "<root>")
+
+        accelerator.state.fsdp_plugin.ignored_modules = ignored
+        seen_param_ids = set()
+        for module in ignored:
+            for param in module.parameters():
+                if not param.requires_grad or id(param) in seen_param_ids:
+                    continue
+                seen_param_ids.add(id(param))
+                fsdp_replicated_params_to_sync.append(param)
+
+        if is_main_process:
+            preview = matched_names[:20]
+            suffix = "" if len(matched_names) <= len(preview) else f", ... (+{len(matched_names) - len(preview)} more)"
+            num_replicated_params = sum(param.numel() for param in fsdp_replicated_params_to_sync)
+            logging.info(
+                f"FSDP2: ignoring {len(ignored)} module(s); "
+                f"classes={sorted(ignored_class_names)}, "
+                f"name_suffixes={list(ignored_name_suffixes)}, "
+                f"matches={preview}{suffix}, "
+                f"replicated_trainable_params_to_sync={num_replicated_params:,}"
+            )
+
+        if fsdp_replicated_params_to_sync:
+            disable_optimizer_foreach(optimizer)
+            if is_main_process:
+                logging.info("FSDP2: disabled optimizer foreach/fused kernels for mixed Tensor+DTensor params")
+
     # === Prepare for Distributed Training ===
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
+
+    if cfg.resume and cfg.fsdp.enable:
+        step = load_fsdp2_checkpoint(accelerator=accelerator, checkpoint_dir=Path(cfg.checkpoint_path))
+        if is_main_process:
+            logging.info(f"Loaded FSDP2 accelerator state from {cfg.checkpoint_path} at step {step}")
+
     dl_iter = cycle(dataloader)
 
     policy.train()
@@ -600,6 +914,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                 loss_scale=1.0 / cfg.grad_accum_steps,
                 do_step=do_step,
                 autocast_ctx=autocast_ctx,
+                replicated_params_to_sync=fsdp_replicated_params_to_sync,
             )
             step_compute_time += time.perf_counter() - compute_start
 
@@ -631,30 +946,49 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
         # === Checkpointing ===
         if cfg.save_checkpoint and is_saving_step:
-            # unwrap_model must be called on ALL ranks so that DeepSpeed can
-            # gather the full state_dict collectively (it's a NCCL all-gather).
-            unwrapped_policy = accelerator.unwrap_model(policy)
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
 
-            if is_main_process:
-                checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
-                save_checkpoint(
+            if cfg.fsdp.enable:
+                save_fsdp2_checkpoint(
+                    accelerator=accelerator,
                     checkpoint_dir=checkpoint_dir,
                     step=step,
                     cfg=cfg,
-                    policy=unwrapped_policy,
-                    optimizer=optimizer,
-                    scheduler=lr_scheduler,
+                    policy=policy,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                 )
 
-                update_last_checkpoint(checkpoint_dir)
+                if is_main_process:
+                    update_last_checkpoint(checkpoint_dir)
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
+                    logging.info(f"FSDP2 policy checkpointed at step {step}")
+                accelerator.wait_for_everyone()
+            else:
+                # unwrap_model must be called on ALL ranks so that DeepSpeed can
+                # gather the full state_dict collectively (it's a NCCL all-gather).
+                unwrapped_policy = accelerator.unwrap_model(policy)
 
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
-                logging.info(f"Policy checkpointed at step {step}")
+                if is_main_process:
+                    save_checkpoint(
+                        checkpoint_dir=checkpoint_dir,
+                        step=step,
+                        cfg=cfg,
+                        policy=unwrapped_policy,
+                        optimizer=optimizer,
+                        scheduler=lr_scheduler,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                    )
 
-            accelerator.wait_for_everyone()
+                    update_last_checkpoint(checkpoint_dir)
+
+                    if wandb_logger:
+                        wandb_logger.log_policy(checkpoint_dir)
+                    logging.info(f"Policy checkpointed at step {step}")
+
+                accelerator.wait_for_everyone()
 
     # === Training Complete ===
     if is_main_process:

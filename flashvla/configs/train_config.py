@@ -56,6 +56,20 @@ class DeepSpeedConfig:
 
 
 @dataclass
+class FSDPConfig:
+    """FSDP2 (per-parameter sharding) config — mutually exclusive with deepspeed."""
+    enable: bool = False
+    mixed_precision: str = "no"
+    reshard_after_forward: bool = False
+    cpu_offload: bool = False
+    wrap_layers: List[str] = field(default_factory=lambda: ["PI05ModelLayer", "SiglipEncoderLayer", "PaliGemmaMultiModalProjector", "PI05SuffixEmbedder", "Embedding"])
+    ignored_module_classes: List[str] = field(default_factory=lambda: ["SiglipVisionEmbeddings"])
+    ignored_module_name_suffixes: List[str] = field(default_factory=lambda: ["vision_model.post_layernorm", "model.language_model.norm", "action_expert.model.norm", "action_out_proj"])
+    state_dict_type: str = "SHARDED_STATE_DICT"
+    save_pretrained_max_shard_size: str = "50GB"
+
+
+@dataclass
 class BaselineTrainConfig(TrainPipelineConfig):
     """Baseline (non-streaming) training configuration.
 
@@ -90,13 +104,25 @@ class RoboTwinMultiTaskConfig:
     """
 
     enable: bool = False
+    # Explicit LeRobot leaf roots to concatenate. When set, these roots define
+    # the multi-dataset training set directly (e.g. clean + randomized settings
+    # of a single task), bypassing root/config_subdir discovery.
+    roots: List[str] = field(default_factory=list)
     # Local root containing the RoboTwin-LeRobot-v3.0 tree.
     root: str = ""
     # The per-task subdir name (e.g. "aloha-agilex_randomized_500" or "aloha-agilex_clean_50").
     config_subdir: str = "aloha-agilex_randomized_500"
+    # Multiple per-task subdirs to pool per task (e.g. clean_50 + randomized_500
+    # together). When non-empty, takes precedence over config_subdir.
+    config_subdirs: List[str] = field(default_factory=list)
     # List of task names to include. Empty list = use all tasks found under root
-    # that contain the requested config_subdir.
+    # that contain the requested config_subdir(s).
     tasks: List[str] = field(default_factory=list)
+    # Optional JSON with exact pooled normalization stats. aggregate_stats() pools
+    # per-subset quantiles by count-weighted average, which is badly wrong across
+    # many tasks (up to ~47% of the q01-q99 range on wrist dims); this file
+    # overrides the affected features with exact global stats.
+    stats_path: str = ""
 
 
 @dataclass
@@ -111,6 +137,9 @@ class FlashVLATrainConfig(TrainPipelineConfig):
 
     # DeepSpeed ZeRO configuration
     deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
+
+    # FSDP2 configuration (mutually exclusive with deepspeed)
+    fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
     # LIBERO suite filter for per-suite training.
     # None (default) uses the full dataset; set to "goal", "spatial", "object",

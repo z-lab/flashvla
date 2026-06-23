@@ -44,7 +44,6 @@ policy:
   num_buffer_slots: 5
   chunk_size: 10
   cold_start_mode: current_state
-  use_action_prefix: false
 
 dataset:
   # LIBERO has 2 image views: observation.images.image (3rd-person) +

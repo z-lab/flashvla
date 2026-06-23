@@ -111,9 +111,12 @@ def eval(TASK_ENV, model, observation):
     in the same env, which is currently blocked by torch/numpy conflicts).
     Both expose ``call(func_name, obs)``.
     """
-    request = _pack_request(TASK_ENV, observation)
-    # Server unpacks this, runs the policy, returns a (14,) float32 np.array.
-    action = model.call(func_name="get_action", obs=request)
+    if observation is None:
+        action = model.call(func_name="get_cached_action")
+    else:
+        request = _pack_request(TASK_ENV, observation)
+        # Server unpacks this, runs the policy, returns a (14,) float32 np.array.
+        action = model.call(func_name="get_action", obs=request)
     TASK_ENV.take_action(np.asarray(action).reshape(-1))
 
 

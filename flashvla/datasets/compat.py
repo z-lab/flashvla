@@ -197,7 +197,7 @@ def patched_load_stats(local_dir: Path):
     Returns:
         Dictionary of feature stats (min, max, mean, std, count).
     """
-    from lerobot.datasets.utils import STATS_PATH, load_json, cast_stats_to_numpy
+    from lerobot.datasets.io_utils import STATS_PATH, load_json, cast_stats_to_numpy
     
     # v3.0 format: single global stats file
     if (local_dir / STATS_PATH).exists():

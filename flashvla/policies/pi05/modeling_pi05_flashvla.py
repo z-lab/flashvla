@@ -42,10 +42,6 @@ from lerobot.policies.pi_gemma import (
     PaliGemmaForConditionalGenerationWithPiGemma as PaliGemmaForConditionalGeneration,
     _gated_residual,
 )
-# RMSNorm-on-time_mlp fix was rejected (2026-05-06): kills σ_max cascade but
-# also kills eval (0% on bbh). The time_mlp_weight_decay path replaced it.
-# Import kept commented so the dead init/forward branches below stay clean.
-# from flashvla.gemma.modeling_gemma import GemmaRMSNorm
 from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
@@ -289,7 +285,7 @@ class PI05SuffixEmbedder(nn.Module):
           ``time`` is per-token ``[B, L]`` or ``[B, L, 1]`` and time_mlp runs
           on all L positions even though many share identical time values.
         * ``segment_lookup is not None`` (training shared-observation):
-          ``time`` is per-segment ``[B, S]`` (S = N or N+1 with prefix), and
+          ``time`` is per-segment ``[B, S]`` (S = N), and
           ``segment_lookup`` ``[B, num_slots]`` maps each (config, slot) to a
           segment index. time_mlp runs only S times per sample, then the
           per-segment cond is gathered to per-slot and broadcast to per-token.
@@ -384,8 +380,10 @@ class PI05ModelLayer(nn.Module):
     def __init__(self, config, vlm_layer, action_expert_layer):
         super().__init__()
         self.config = config
-        self.input_layernorm = [vlm_layer.input_layernorm, action_expert_layer.input_layernorm]
-        self.post_attention_layernorm = [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
+        self.input_layernorm = nn.ModuleList([vlm_layer.input_layernorm, action_expert_layer.input_layernorm])
+        self.post_attention_layernorm = nn.ModuleList(
+            [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
+        )
         self.self_attn = PI05Attention(config, vlm_layer.self_attn, action_expert_layer.self_attn)
         self.mlp = PI05MLP(config, vlm_layer.mlp, action_expert_layer.mlp)
 
@@ -436,6 +434,15 @@ class PI05ModelLayer(PI05ModelLayer):
     The regular forward method inherits from PI05ModelLayer and works because the
     patched GemmaRMSNorm handles both 2D and 3D cond.
     """
+
+    def forward(self, hidden_states, attention_mask, position_ids, conds=None, use_cache: bool = False, *, suffix_adarms_conds=None, num_offsets: int | None = None, suffix_length: int | None = None):
+        if suffix_adarms_conds is not None:
+            if num_offsets is None or suffix_length is None:
+                raise ValueError("num_offsets and suffix_length are required when suffix_adarms_conds is provided.")
+            return self.forward_shared_observation(hidden_states, attention_mask, position_ids, suffix_adarms_conds, num_offsets, suffix_length, use_cache=use_cache)
+        if conds is None:
+            raise ValueError("conds is required for the regular PI05ModelLayer forward path.")
+        return super().forward(hidden_states, attention_mask, position_ids, conds, use_cache=use_cache)
 
     def forward_shared_observation(
         self,
@@ -587,6 +594,17 @@ class PI05FlashVLAModel(nn.Module):
             self._steady_streaming = torch.compile(self._steady_streaming, mode=config.compile_mode)
             self._cold_start = torch.compile(self._cold_start, mode=config.compile_mode)
 
+    def detach_backbone_layer_aliases(self):
+        num_layers = len(self.layers)
+        self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
+        self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
+
+    def backbone_dtype(self):
+        # bf16 compute dtype from a Linear that survives mlp fusion (only
+        # gate_proj/up_proj deleted) AND detach_backbone_layer_aliases. Do NOT
+        # read a layernorm weight: FlashVLA keeps layernorms float32.
+        return self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype
+
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
         modules = [self.vlm, self.action_expert]
         params_to_keep_float32 = [
@@ -701,16 +719,12 @@ class PI05FlashVLAModel(nn.Module):
         self,
         batch_size: int,
         device: torch.device,
-        use_prefix: bool,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """Build per-segment time tensor + per-slot lookup for shared-observation training.
 
         Returns:
             time_per_segment: ``[B, S]`` per-sample unique time values.
-                * Without prefix: ``S = N``, segment idx ∈ [0, N) maps to global
-                  slot levels.
-                * With prefix: ``S = N+1`` and segment idx 0 is the clean prefix
-                  (time = 0); segment indices 1..N are the global slot levels.
+                ``S = N``, segment idx ∈ [0, N) maps to global slot levels.
             segment_lookup: ``[B, N * num_slots_per_config]`` long tensor of
                 segment indices, one per (config, slot) pair flattened in
                 config-major order. Padded slots carry index 0 (their cond is
@@ -719,29 +733,18 @@ class PI05FlashVLAModel(nn.Module):
                 broadcast from the per-slot times. Used to compute x_t.
         """
         N, C = self.N, self.C
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
 
         global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-        if use_prefix:
-            prefix_time = torch.zeros(batch_size, 1, device=device, dtype=global_time.dtype)
-            time_per_segment = torch.cat([prefix_time, global_time], dim=1)  # [B, N+1]
-        else:
-            time_per_segment = global_time  # [B, N]
+        time_per_segment = global_time  # [B, N]
 
         # Build segment lookup [N, num_slots_per_config], same for every batch element.
         # Padded slots carry 0 (any valid index works — their cond is masked out).
         lookup = torch.zeros(N, num_slots_per_config, dtype=torch.long, device=device)
-        if use_prefix:
-            for k_idx in range(N):
-                k = k_idx + 1
-                lookup[k_idx, 0] = 0  # prefix segment
-                # real noisy slots 1..k: segments 1+(N-k)..N (after prefix shifts segment idx by 1)
-                lookup[k_idx, 1:1 + k] = torch.arange(N - k + 1, N + 1, device=device)
-        else:
-            for k_idx in range(N):
-                k = k_idx + 1
-                # real noisy slots 0..k-1: segments N-k..N-1
-                lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
+        for k_idx in range(N):
+            k = k_idx + 1
+            # real noisy slots 0..k-1: segments N-k..N-1
+            lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
 
         segment_lookup = lookup.reshape(-1).unsqueeze(0).expand(batch_size, -1).contiguous()
         # [B, N * num_slots_per_config]
@@ -758,7 +761,6 @@ class PI05FlashVLAModel(nn.Module):
         self,
         batch_size: int,
         device: torch.device,
-        use_prefix: bool,
     ) -> Tensor:
         """Per-chunk independent time sampling (legacy, ablation-only).
 
@@ -772,7 +774,7 @@ class PI05FlashVLAModel(nn.Module):
             required by flow-matching: a chunk denoises with one t).
         """
         N, C = self.N, self.C
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
 
         alpha = torch.tensor(
             self.config.time_sampling_beta_alpha, device=device, dtype=torch.float32,
@@ -786,21 +788,17 @@ class PI05FlashVLAModel(nn.Module):
             (batch_size, N, num_slots_per_config),
         ).to(device=device, dtype=torch.float32)
 
-        # Build static segment-start matrix and is_real / is_prefix masks
+        # Build static segment-start matrix and is_real mask
         # shared across batch elements.
         seg_start = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.float32)
         is_real = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.bool)
-        is_prefix = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.bool)
         for k_idx in range(N):
             num_real = k_idx + 1
-            offset = 1 if use_prefix else 0
-            if use_prefix:
-                is_prefix[k_idx, 0] = True
             for i in range(num_real):
-                seg_start[k_idx, offset + i] = (N - num_real + i) / N
-                is_real[k_idx, offset + i] = True
+                seg_start[k_idx, i] = (N - num_real + i) / N
+                is_real[k_idx, i] = True
 
-        # time = seg_start + sample/N, then scale+offset; padding=1, prefix=0.
+        # time = seg_start + sample/N, then scale+offset; padding=1.
         time_per_slot = seg_start[None, :, :] + samples / N
         time_per_slot = (
             time_per_slot * self.config.time_sampling_scale
@@ -808,9 +806,6 @@ class PI05FlashVLAModel(nn.Module):
         )
         time_per_slot = torch.where(
             is_real[None, :, :], time_per_slot, torch.ones_like(time_per_slot),
-        )
-        time_per_slot = torch.where(
-            is_prefix[None, :, :], torch.zeros_like(time_per_slot), time_per_slot,
         )
         # [B, N, num_slots_per_config] → expand to per-token [B, N*S*C]
         time_per_token = (
@@ -927,33 +922,19 @@ class PI05FlashVLAModel(nn.Module):
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
-        # Single-config path: H must match a full buffer of N or N+1 slots.
+        # Single-config path: H must match a full buffer of N slots.
         # Note: with only one buffer config, per-sample and per-chunk produce
         # mathematically identical t values per slot (no cross-config sharing
         # to differ on); the switch only changes which suffix_embedder code
         # path is exercised.
-        if self.config.use_action_prefix and H == (N + 1) * C:
-            num_slots_per_config = N + 1
-            with_prefix_path = True
-        elif H == N * C:
-            num_slots_per_config = N
-            with_prefix_path = False
-        else:
-            expected = (
-                f"{N * C} or {(N + 1) * C}"
-                if self.config.use_action_prefix
-                else str(N * C)
-            )
-            raise ValueError(f"Expected action horizon {expected}, got {H}.")
+        if H != N * C:
+            raise ValueError(f"Expected action horizon {N * C}, got {H}.")
+        num_slots_per_config = N
 
         mode = getattr(self.config, "timestep_sample_mode", "per-sample")
         if mode == "per-sample":
             global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-            if with_prefix_path:
-                prefix_time = torch.zeros(batch_size, 1, device=device, dtype=global_time.dtype)
-                time_per_segment = torch.cat([prefix_time, global_time], dim=1)  # [B, N+1]
-            else:
-                time_per_segment = global_time  # [B, N]
+            time_per_segment = global_time  # [B, N]
             segment_lookup = (
                 torch.arange(num_slots_per_config, device=device)
                 .unsqueeze(0).expand(batch_size, -1).contiguous()
@@ -965,10 +946,10 @@ class PI05FlashVLAModel(nn.Module):
             seg_lookup_arg = segment_lookup
         elif mode == "per-chunk":
             # Re-use the shared-obs helper for one config only: take the
-            # first chunk of N (or N+1) flattened entries — the helper
-            # samples (B, N=num_configs, num_slots, C) so single-config
-            # corresponds to the FULL-buffer config (k_idx = N - 1).
-            full = self._build_per_chunk_time(batch_size, device, use_prefix=with_prefix_path)
+            # first chunk of N flattened entries — the helper samples
+            # (B, N=num_configs, num_slots, C) so single-config corresponds
+            # to the FULL-buffer config (k_idx = N - 1).
+            full = self._build_per_chunk_time(batch_size, device)
             # full shape: [B, N * num_slots_per_config * C]; pick last config (k_idx=N-1)
             slice_size = num_slots_per_config * C
             time_per_token = full[:, (N - 1) * slice_size : N * slice_size]
@@ -1009,7 +990,7 @@ class PI05FlashVLAModel(nn.Module):
         suffix_adarms_cond = suffix_adarms_cond.view(batch_size, num_offsets, H, -1)
 
         # Compute dtype from a Linear weight (layernorms are kept float32).
-        backbone_dtype = self.vlm.model.language_model.layers[0].mlp.down_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
@@ -1026,9 +1007,13 @@ class PI05FlashVLAModel(nn.Module):
         hidden_states = [prefix_embs, suffix_embs]
 
         for layer in self.layers:
-            hidden_states = layer.forward_shared_observation(
-                hidden_states, attention_mask, position_ids,
-                suffix_adarms_cond, num_offsets, suffix_length,
+            hidden_states = layer(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                suffix_adarms_conds=suffix_adarms_cond,
+                num_offsets=num_offsets,
+                suffix_length=suffix_length,
             )
 
         # Final layer norm with per-token conditioning
@@ -1053,9 +1038,6 @@ class PI05FlashVLAModel(nn.Module):
         # Keep only real (non-padded) positions
         if action_is_pad is not None:
             real_mask = ~action_is_pad  # [B, H]
-            if self.config.use_action_prefix and H == (N + 1) * C:
-                real_mask = real_mask.clone()
-                real_mask[:, :C] = False
             losses = losses[real_mask]  # [num_real, action_dim]
 
         return losses
@@ -1073,8 +1055,7 @@ class PI05FlashVLAModel(nn.Module):
             tokens: Language token IDs [B, L_text].
             masks: Language attention masks [B, L_text].
             states: Robot states [B, state_dim].
-            actions: Target actions [B, N * H, action_dim].
-                H = N*C (no prefix) or (N+1)*C (with action prefix).
+            actions: Target actions [B, N * H, action_dim]. H = N*C.
             action_is_pad: [B, N * H] boolean, True for padded positions.
             noise: Optional noise [B, N * H, action_dim].
 
@@ -1083,9 +1064,8 @@ class PI05FlashVLAModel(nn.Module):
         """
         batch_size = states.shape[0]
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
         num_offsets = N
-        suffix_length = H = (N + 1) * C if use_prefix else N * C
+        suffix_length = H = N * C
         device = states.device
 
         if noise is None:
@@ -1094,12 +1074,12 @@ class PI05FlashVLAModel(nn.Module):
         mode = getattr(self.config, "timestep_sample_mode", "per-sample")
         if mode == "per-sample":
             time_per_segment, segment_lookup, time_per_token = (
-                self._build_shared_obs_segment_lookup(batch_size, device, use_prefix)
+                self._build_shared_obs_segment_lookup(batch_size, device)
             )
             time_for_embedder = time_per_segment
             seg_lookup_arg = segment_lookup
         elif mode == "per-chunk":
-            time_per_token = self._build_per_chunk_time(batch_size, device, use_prefix)
+            time_per_token = self._build_per_chunk_time(batch_size, device)
             time_for_embedder = time_per_token
             seg_lookup_arg = None
         else:
@@ -1110,7 +1090,6 @@ class PI05FlashVLAModel(nn.Module):
 
         # x_t still needs per-token times (each token gets its own noise sample).
         time_expanded = time_per_token.unsqueeze(-1)  # [B, N*H, 1]
-        # For action prefix (time=0): x_t = 0*noise + 1*actions = actions (ground truth)
         # For noisy slots: x_t = t*noise + (1-t)*actions (standard flow matching)
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
@@ -1139,7 +1118,7 @@ class PI05FlashVLAModel(nn.Module):
         suffix_adarms_cond = suffix_adarms_cond.view(batch_size, N, H, -1)
 
         # Compute dtype from a Linear weight (layernorms are kept float32).
-        backbone_dtype = self.vlm.model.language_model.layers[0].mlp.down_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
@@ -1156,9 +1135,13 @@ class PI05FlashVLAModel(nn.Module):
         hidden_states = [prefix_embs, suffix_embs]
 
         for layer in self.layers:
-            hidden_states = layer.forward_shared_observation(
-                hidden_states, attention_mask, position_ids,
-                suffix_adarms_cond, num_offsets, suffix_length,
+            hidden_states = layer(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                suffix_adarms_conds=suffix_adarms_cond,
+                num_offsets=num_offsets,
+                suffix_length=suffix_length,
             )
 
         # Final layer norm with per-token conditioning
@@ -1180,19 +1163,11 @@ class PI05FlashVLAModel(nn.Module):
         # Compute MSE loss
         losses = F.mse_loss(u_t, v_t, reduction="none")  # [B, N*H, action_dim]
 
-        # Build loss mask: exclude padded positions AND action prefix positions
+        # Build loss mask: exclude padded positions
         if action_is_pad is not None:
             loss_mask = ~action_is_pad  # [B, N*H]
         else:
             loss_mask = torch.ones(batch_size, N * H, dtype=torch.bool, device=device)
-
-        if use_prefix:
-            # Exclude action prefix (first C tokens of each config)
-            prefix_mask = torch.zeros(batch_size, N * H, dtype=torch.bool, device=device)
-            for k_idx in range(N):
-                start = k_idx * H
-                prefix_mask[:, start:start + C] = True
-            loss_mask = loss_mask & ~prefix_mask
 
         losses = losses[loss_mask]
 
@@ -1214,8 +1189,7 @@ class PI05FlashVLAModel(nn.Module):
             prefix_pad_masks: Cached prefix padding masks [B, L_prefix].
             prefix_att_masks: Cached prefix attention masks [B, L_prefix].
             state: Robot state [B, state_dim].
-            x_t: Current buffer [B, buf_len, action_dim].
-                buf_len = (N+1)*C with action prefix, N*C without.
+            x_t: Current buffer [B, buf_len, action_dim]. buf_len = N*C.
             timestep: Per-token time [B, buf_len].
             padding_mask: [B, buf_len] boolean (per-token).
 
@@ -1227,7 +1201,7 @@ class PI05FlashVLAModel(nn.Module):
         )
 
         # Compute dtype from a Linear weight (layernorms are kept float32).
-        backbone_dtype = self.vlm.model.language_model.layers[0].mlp.down_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -1268,8 +1242,7 @@ class PI05FlashVLAModel(nn.Module):
             (updated_buffer, breakdown_dict_or_None)
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = tokens.shape[0]
         device = tokens.device
@@ -1313,21 +1286,11 @@ class PI05FlashVLAModel(nn.Module):
         slot_idx = torch.arange(buf_slots, device=device)              # [buf_slots]
         slot_idx_buf = torch.arange(buf_len, device=device) // C       # [buf_len]
 
-        if use_prefix:
-            # slot 0 = action prefix (always real, time=0)
-            # slot 1..num_real = noisy real, time = (N - num_real + slot_idx)/N
-            # slot num_real+1..N = padding, time = 1.0
-            is_prefix = slot_idx == 0
-            is_real = slot_idx <= num_real
-            time_noisy = (N - num_real + slot_idx).to(torch.float32) / N
-            time_slot = torch.where(is_prefix, torch.zeros_like(time_noisy), time_noisy)
-            time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
-        else:
-            # slot 0..num_real-1 = noisy real, time = (N - num_real + 1 + slot_idx)/N
-            # slot num_real..N-1 = padding, time = 1.0
-            is_real = slot_idx < num_real
-            time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
-            time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
+        # slot 0..num_real-1 = noisy real, time = (N - num_real + 1 + slot_idx)/N
+        # slot num_real..N-1 = padding, time = 1.0
+        is_real = slot_idx < num_real
+        time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
+        time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
 
         padding_mask = is_real.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
         time = time_slot.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
@@ -1340,17 +1303,9 @@ class PI05FlashVLAModel(nn.Module):
         dt = 1.0 / N
         # New buffer assembled via masks instead of slice assignment.
         new_noise = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-        if use_prefix:
-            # Prefix slot (idx 0) is kept verbatim; noisy slots get updated.
-            prefix_part = buffer[:, :C, :]
-            noisy_part = buffer[:, C:, :] - dt * v_t[:, C:, :]
-            updated_buffer = torch.cat([prefix_part, noisy_part], dim=1)
-            keep_mask = slot_idx_buf <= num_real           # slot 0..num_real
-            noise_mask = slot_idx_buf == (num_real + 1)    # slot num_real+1
-        else:
-            updated_buffer = buffer - dt * v_t
-            keep_mask = slot_idx_buf < num_real            # slot 0..num_real-1
-            noise_mask = slot_idx_buf == num_real          # slot num_real
+        updated_buffer = buffer - dt * v_t
+        keep_mask = slot_idx_buf < num_real            # slot 0..num_real-1
+        noise_mask = slot_idx_buf == num_real          # slot num_real
 
         keep_mask = keep_mask.view(1, buf_len, 1)
         noise_mask = noise_mask.view(1, buf_len, 1)
@@ -1384,8 +1339,7 @@ class PI05FlashVLAModel(nn.Module):
         outer caller measures wall-clock total instead.
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = tokens.shape[0]
         device = tokens.device
@@ -1423,14 +1377,8 @@ class PI05FlashVLAModel(nn.Module):
         if profile:
             _ev_record(_evs_total[2])
         # Steady-state time vector (all slots real)
-        if use_prefix:
-            time_per_slot = torch.zeros(bsz, buf_slots, device=device, dtype=torch.float32)
-            time_per_slot[:, 0] = 0.0  # action prefix
-            time_per_slot[:, 1:] = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
-            time = time_per_slot.unsqueeze(2).expand(-1, -1, C).reshape(bsz, buf_len)
-        else:
-            time_per_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
-            time = time_per_slot.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
+        time_per_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
+        time = time_per_slot.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
 
         v_t = self.denoise_step(
             prefix_pad_masks, prefix_att_masks, state,
@@ -1438,25 +1386,12 @@ class PI05FlashVLAModel(nn.Module):
         )
 
         dt = 1.0 / N
-        if use_prefix:
-            # Only update noisy slots
-            buffer[:, C:, :] = buffer[:, C:, :] - dt * v_t[:, C:, :]
+        buffer = buffer - dt * v_t
+        actions_to_execute = buffer[:, :C, :self.config.max_action_dim]
+        new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
+        new_buffer[:, :-C, :] = buffer[:, C:, :]
+        buffer = new_buffer
 
-            # Extract first noisy slot (fully denoised)
-            actions_to_execute = buffer[:, C:2*C, :self.config.max_action_dim]
-
-            # Denoised slot becomes new action prefix; shift remaining; append noise
-            new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-            new_buffer[:, :C, :] = buffer[:, C:2*C, :]     # new action prefix
-            new_buffer[:, C:N*C, :] = buffer[:, 2*C:, :]   # shift noisy slots left
-            buffer = new_buffer
-        else:
-            buffer = buffer - dt * v_t
-            actions_to_execute = buffer[:, :C, :self.config.max_action_dim]
-            new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-            new_buffer[:, :-C, :] = buffer[:, C:, :]
-            buffer = new_buffer
-        
         if profile:
             _ev_record(_evs_total[3])
             _cuda_sync()
@@ -1475,11 +1410,7 @@ class PI05FlashVLAModel(nn.Module):
     def sample_actions(self, images, img_masks, tokens, masks, state, buffer, step_counter, profile=False):
         """Top-level dispatch: cold-start (eager) or steady streaming (compiled).
 
-        When use_action_prefix=True, buffer layout is:
-            [action_prefix(C), noisy_slot_0(C), ..., noisy_slot_{N-1}(C)]
-        The action prefix (position 0:C) holds the previously fully-denoised
-        chunk as history conditioning. On extraction, the denoised slot becomes
-        the new action prefix.
+        Buffer layout is [noisy_slot_0(C), ..., noisy_slot_{N-1}(C)].
 
         Args:
             images: Input images.
@@ -1497,19 +1428,14 @@ class PI05FlashVLAModel(nn.Module):
              new_step_counter, profile_results_or_None).
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = tokens.shape[0]
         device = tokens.device
 
         # Initialize buffer on first call
         if buffer is None:
-            if use_prefix:
-                buffer = torch.zeros(bsz, buf_len, self.config.max_action_dim, device=device)
-                buffer[:, C:2*C, :] = self.sample_noise((bsz, C, self.config.max_action_dim), device)
-            else:
-                buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
+            buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
 
         if step_counter < N - 1:
             # Cold start. Write the current step into our persistent 0-d
@@ -1687,6 +1613,8 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
         if getattr(config, "fuse_gate_up", True):
             instance.model.init_mlp_fusion_from_existing()
 
+        instance.model.detach_backbone_layer_aliases()
+
         # Load action + state normalization stats for cold-start action
         # computation (see flashvla.policies.pi05.utils.load_cold_start_stats).
         instance._cold_start_stats = load_cold_start_stats(pretrained_name_or_path)
@@ -1696,20 +1624,12 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
     def reset(self):
         """Reset buffer and step counter. Call when environment resets.
 
-        Without action prefix:
-            [noise, P, P, P, P]: slot 0 is noise, rest zeros (padding).
-        With action prefix:
-            [zeros, noise, P, P, P, P]: slot 0 is action prefix (zeros),
-            slot 1 is noise, rest zeros (padding).
+        Buffer layout [noise, P, P, P, P]: slot 0 is noise, rest zeros (padding).
         """
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         C = self.config.chunk_size
         self.action_buffer.zero_()
-        if self.config.use_action_prefix:
-            # Action prefix at [0:C] stays zeros; first noisy slot at [C:2C]
-            self.action_buffer[:, C:2*C, :].normal_()
-        else:
-            self.action_buffer[:, :C, :].normal_()
+        self.action_buffer[:, :C, :].normal_()
         self._step_counter = 0
         self._cold_start_action = None  # will be set on first select_action
 
@@ -1802,7 +1722,7 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
 
         losses = losses[..., :self.config.max_action_dim]
 
-        loss = losses.mean()
+        loss = losses.mean() if losses.numel() > 0 else losses.sum()
         loss_dict["loss"] = loss.item()
 
         return loss, loss_dict

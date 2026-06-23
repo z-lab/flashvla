@@ -304,7 +304,7 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         return global_time * 0.999 + 0.001  # [B, N]
 
     def _build_per_sample_time(
-        self, batch_size: int, device: torch.device, use_prefix: bool,
+        self, batch_size: int, device: torch.device,
     ) -> tuple[Tensor, Tensor]:
         """PerSeg time: one global t per slot level shared across N configs.
 
@@ -315,26 +315,16 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
             time_per_token: ``[B, N * num_slots_per_config * C]`` per-token.
         """
         N, C = self.N, self.C
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
 
         global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-        if use_prefix:
-            prefix_time = torch.zeros(batch_size, 1, device=device, dtype=global_time.dtype)
-            time_per_segment = torch.cat([prefix_time, global_time], dim=1)  # [B, N+1]
-        else:
-            time_per_segment = global_time
+        time_per_segment = global_time
 
         # lookup[k_idx, s] = which segment maps to config k's slot s
         lookup = torch.zeros(N, num_slots_per_config, dtype=torch.long, device=device)
-        if use_prefix:
-            for k_idx in range(N):
-                k = k_idx + 1
-                lookup[k_idx, 0] = 0  # prefix segment (t=0)
-                lookup[k_idx, 1:1 + k] = torch.arange(N - k + 1, N + 1, device=device)
-        else:
-            for k_idx in range(N):
-                k = k_idx + 1
-                lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
+        for k_idx in range(N):
+            k = k_idx + 1
+            lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
 
         segment_lookup = lookup.reshape(-1).unsqueeze(0).expand(batch_size, -1).contiguous()
         time_per_slot = torch.gather(time_per_segment, 1, segment_lookup)
@@ -342,11 +332,11 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         return time_per_slot, time_per_token
 
     def _build_per_chunk_time(
-        self, batch_size: int, device: torch.device, use_prefix: bool,
+        self, batch_size: int, device: torch.device,
     ) -> tuple[Tensor, Tensor]:
         """Per-chunk: each config independently samples its t. Ablation only."""
         N, C = self.N, self.C
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
 
         beta_dist = torch.distributions.Beta(
             concentration1=torch.tensor(1.5, device=device, dtype=torch.float32),
@@ -358,20 +348,15 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
 
         seg_start = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.float32)
         is_real = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.bool)
-        is_prefix = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.bool)
         for k_idx in range(N):
             num_real = k_idx + 1
-            offset = 1 if use_prefix else 0
-            if use_prefix:
-                is_prefix[k_idx, 0] = True
             for i in range(num_real):
-                seg_start[k_idx, offset + i] = (N - num_real + i) / N
-                is_real[k_idx, offset + i] = True
+                seg_start[k_idx, i] = (N - num_real + i) / N
+                is_real[k_idx, i] = True
 
         time_per_slot = seg_start[None, :, :] + samples / N
         time_per_slot = time_per_slot * 0.999 + 0.001
         time_per_slot = torch.where(is_real[None, :, :], time_per_slot, torch.ones_like(time_per_slot))
-        time_per_slot = torch.where(is_prefix[None, :, :], torch.zeros_like(time_per_slot), time_per_slot)
         time_per_slot = time_per_slot.reshape(batch_size, -1)  # [B, N*S]
         time_per_token = time_per_slot.repeat_interleave(C, dim=1)
         return time_per_slot, time_per_token
@@ -396,13 +381,12 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         Args:
             state: ``[B, max_state_dim]`` (shared across all N configs).
             actions: ``[B, N * H_cfg, action_dim]`` config-major.
-                H_cfg = (N+1)*C with prefix, N*C without.
+                H_cfg = N*C.
             action_is_pad: ``[B, N * H_cfg]`` boolean.
         """
         bsize = state.shape[0]
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        H_cfg = (N + 1) * C if use_prefix else N * C
+        H_cfg = N * C
         device = state.device
 
         if noise is None:
@@ -410,9 +394,9 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
 
         mode = getattr(self.config, "timestep_sample_mode", "per-sample")
         if mode == "per-sample":
-            time_per_slot_all, time_per_token = self._build_per_sample_time(bsize, device, use_prefix)
+            time_per_slot_all, time_per_token = self._build_per_sample_time(bsize, device)
         elif mode == "per-chunk":
-            time_per_slot_all, time_per_token = self._build_per_chunk_time(bsize, device, use_prefix)
+            time_per_slot_all, time_per_token = self._build_per_chunk_time(bsize, device)
         else:
             raise ValueError(f"Unknown timestep_sample_mode={mode!r}")
 
@@ -426,7 +410,7 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         )
 
         # Per-config suffix: flatten (B, N) into batch dim for the embedder
-        num_slots_per_config = (N + 1) if use_prefix else N
+        num_slots_per_config = N
         x_t_flat = x_t.view(bsize * N, H_cfg, -1)
         time_per_slot_flat = time_per_slot_all.view(bsize * N, num_slots_per_config)
         if action_is_pad is not None:
@@ -487,17 +471,11 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
 
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        # Loss mask: exclude padded slots and (if use_prefix) the prefix tokens
+        # Loss mask: exclude padded slots
         if action_is_pad is not None:
             loss_mask = ~action_is_pad
         else:
             loss_mask = torch.ones(bsize, N * H_cfg, dtype=torch.bool, device=device)
-        if use_prefix:
-            prefix_exclude = torch.zeros(bsize, N * H_cfg, dtype=torch.bool, device=device)
-            for k_idx in range(N):
-                start = k_idx * H_cfg
-                prefix_exclude[:, start:start + C] = True
-            loss_mask = loss_mask & ~prefix_exclude
 
         losses = losses[loss_mask]
         return losses
@@ -577,8 +555,7 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         construction keeps shapes static for compile compatibility.
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = buffer.shape[0]
         device = buffer.device
@@ -591,16 +568,9 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         slot_idx = torch.arange(buf_slots, device=device)
         slot_idx_buf = torch.arange(buf_len, device=device) // C
 
-        if use_prefix:
-            is_prefix = slot_idx == 0
-            is_real = slot_idx <= num_real
-            time_noisy = (N - num_real + slot_idx).to(torch.float32) / N
-            time_slot = torch.where(is_prefix, torch.zeros_like(time_noisy), time_noisy)
-            time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
-        else:
-            is_real = slot_idx < num_real
-            time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
-            time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
+        is_real = slot_idx < num_real
+        time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
+        time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
 
         time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)
         padding_mask = is_real.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
@@ -611,16 +581,9 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
 
         dt = 1.0 / N
         new_noise = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-        if use_prefix:
-            prefix_part = buffer[:, :C, :]
-            noisy_part = buffer[:, C:, :] - dt * v_t[:, C:, :]
-            updated_buffer = torch.cat([prefix_part, noisy_part], dim=1)
-            keep_mask = slot_idx_buf <= num_real
-            noise_mask = slot_idx_buf == (num_real + 1)
-        else:
-            updated_buffer = buffer - dt * v_t
-            keep_mask = slot_idx_buf < num_real
-            noise_mask = slot_idx_buf == num_real
+        updated_buffer = buffer - dt * v_t
+        keep_mask = slot_idx_buf < num_real
+        noise_mask = slot_idx_buf == num_real
 
         keep_mask = keep_mask.view(1, buf_len, 1)
         noise_mask = noise_mask.view(1, buf_len, 1)
@@ -641,8 +604,7 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         ``config.compile_model=True``.
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = buffer.shape[0]
         device = buffer.device
@@ -651,31 +613,19 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
             images, img_masks, lang_tokens, lang_masks, state,
         )
 
-        if use_prefix:
-            time_per_slot = torch.zeros(bsz, buf_slots, device=device, dtype=torch.float32)
-            time_per_slot[:, 1:] = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
-        else:
-            time_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
-            time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)
+        time_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
+        time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)
 
         v_t = self.denoise_step(
             prefix_pad_masks, past_key_values, buffer, time_per_slot, padding_mask=None,
         )
 
         dt = 1.0 / N
-        if use_prefix:
-            buffer[:, C:, :] = buffer[:, C:, :] - dt * v_t[:, C:, :]
-            actions_to_execute = buffer[:, C:2 * C, :self.config.max_action_dim]
-            new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-            new_buffer[:, :C, :] = buffer[:, C:2 * C, :]
-            new_buffer[:, C:N * C, :] = buffer[:, 2 * C:, :]
-            buffer = new_buffer
-        else:
-            buffer = buffer - dt * v_t
-            actions_to_execute = buffer[:, :C, :self.config.max_action_dim]
-            new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
-            new_buffer[:, :-C, :] = buffer[:, C:, :]
-            buffer = new_buffer
+        buffer = buffer - dt * v_t
+        actions_to_execute = buffer[:, :C, :self.config.max_action_dim]
+        new_buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
+        new_buffer[:, :-C, :] = buffer[:, C:, :]
+        buffer = new_buffer
 
         return actions_to_execute, buffer
 
@@ -689,18 +639,13 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         Returns (actions_to_execute [B, C, action_dim] or None, updated_buffer, new_step_counter).
         """
         N, C = self.N, self.C
-        use_prefix = self.config.use_action_prefix
-        buf_slots = N + 1 if use_prefix else N
+        buf_slots = N
         buf_len = buf_slots * C
         bsz = state.shape[0]
         device = state.device
 
         if buffer is None:
-            if use_prefix:
-                buffer = torch.zeros(bsz, buf_len, self.config.max_action_dim, device=device)
-                buffer[:, C:2 * C, :] = self.sample_noise((bsz, C, self.config.max_action_dim), device)
-            else:
-                buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
+            buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
 
         if step_counter < N - 1:
             self._cold_step_t.fill_(step_counter)
@@ -749,10 +694,7 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
         self._queues = {ACTION: deque([], maxlen=self.config.n_action_steps)}
         C = self.config.chunk_size
         self.action_buffer.zero_()
-        if self.config.use_action_prefix:
-            self.action_buffer[:, C:2 * C, :].normal_()
-        else:
-            self.action_buffer[:, :C, :].normal_()
+        self.action_buffer[:, :C, :].normal_()
         self._step_counter = 0
         self._cold_start_action = None
 

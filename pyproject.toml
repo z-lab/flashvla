@@ -20,6 +20,9 @@ classifiers = [
 # `smolvla` extra select its declared stock transformers dependency.
 dependencies = [
     "lerobot[smolvla]==0.5.1",
+    # FSDP2/DDP training: accelerate>=1.13 ships fsdp_version=2 + save_state/
+    # save_model with sharded state_dict_type used by train/train.py.
+    "accelerate>=1.13.0",
 ]
 
 [project.optional-dependencies]

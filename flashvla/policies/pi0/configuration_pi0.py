@@ -252,7 +252,6 @@ class PI0FlashVLAConfig(PI0Config):
     chunk_size: int = 10           # Actions per slot (fixed)
     num_buffer_slots: int = 5      # N = number of slots in buffer
     n_action_steps: int = 10       # Execute one full slot per step
-    use_action_prefix: bool = False  # Prepend a clean past chunk as history conditioning
 
     # Shared-observation time sampling. Same semantics as pi05:
     #   "per-sample" (PerSeg) — one global t per slot level shared across N configs.
@@ -302,13 +301,13 @@ class PI0FlashVLAConfig(PI0Config):
 
     @property
     def total_action_horizon(self) -> int:
-        """Number of action steps in the noisy prediction window (excludes prefix)."""
+        """Number of action steps in the noisy prediction window."""
         return self.num_buffer_slots * self.chunk_size
 
     @property
     def total_buffer_slots(self) -> int:
-        """Total slots including action prefix if enabled."""
-        return self.num_buffer_slots + (1 if self.use_action_prefix else 0)
+        """Total slots in the buffer."""
+        return self.num_buffer_slots
 
     @property
     def total_buffer_length(self) -> int:
@@ -317,9 +316,6 @@ class PI0FlashVLAConfig(PI0Config):
 
     @property
     def action_delta_indices(self) -> list:
-        if self.use_action_prefix:
-            # Include C past actions for the action prefix conditioning.
-            return list(range(-self.chunk_size, self.num_buffer_slots * self.chunk_size))
         return list(range(self.total_action_horizon))
 
 

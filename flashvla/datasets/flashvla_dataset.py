@@ -61,20 +61,16 @@ class FlashVLADataset(LeRobotDataset):
         batch_encoding_size: int = 1,
         num_buffer_slots: int = 5,
         chunk_size: int = 10,
-        use_action_prefix: bool = False,
     ):
         """Initialize FlashVLADataset.
 
         Args:
             num_buffer_slots: N, number of slots in the denoising buffer.
             chunk_size: C, number of actions per slot.
-            use_action_prefix: If True, prepend a clean chunk (C past actions)
-                as history conditioning. Buffer becomes (N+1)*C per config.
             Other args: same as LeRobotDataset.
         """
         self.num_buffer_slots = num_buffer_slots
         self.chunk_size = chunk_size
-        self.use_action_prefix = use_action_prefix
         self.total_action_horizon = num_buffer_slots * chunk_size
 
         super().__init__(
@@ -94,14 +90,8 @@ class FlashVLADataset(LeRobotDataset):
     def __getitem__(self, idx) -> dict:
         """Get sample with all N buffer configurations.
 
-        When use_action_prefix=False (default):
-            Each config k has k real noisy slots + (N-k) padded slots.
-            Per-config length: H = N*C.
-
-        When use_action_prefix=True:
-            Each config k has 1 clean prefix (C past actions) + k real noisy
-            slots + (N-k) padded slots.  Per-config length: H_cfg = (N+1)*C.
-            Buffer layout per config: [clean(C), noisy(k*C), pad((N-k)*C)]
+        Each config k has k real noisy slots + (N-k) padded slots.
+        Per-config length: H = N*C.
 
         Returns:
             Dictionary containing:
@@ -127,54 +117,23 @@ class FlashVLADataset(LeRobotDataset):
         full_actions = base_item["action"]
         full_action_is_pad = base_item.get("action_is_pad", torch.zeros(full_actions.shape[0], dtype=torch.bool))
 
-        if self.use_action_prefix:
-            # full_actions has (N+1)*C entries: first C = past (prefix), rest = future (noisy)
-            prefix_actions = full_actions[:C]                # [C, action_dim]
-            prefix_is_pad = full_action_is_pad[:C]           # [C]
-            noisy_actions = full_actions[C:]                  # [N*C, action_dim]
-            noisy_is_pad = full_action_is_pad[C:]             # [N*C]
+        H_cfg = N * C  # per-config length
 
-            H_cfg = (N + 1) * C  # per-config length
+        actions_list = []
+        action_is_pad_list = []
 
-            actions_list = []
-            action_is_pad_list = []
+        for k_idx in range(N):
+            k = k_idx + 1
 
-            for k_idx in range(N):
-                k = k_idx + 1  # number of real noisy slots
+            action_config = torch.zeros_like(full_actions)
+            action_is_pad_config = torch.ones(H_cfg, dtype=torch.bool)
 
-                # Build config: prefix + noisy slots + padding
-                action_config = torch.zeros(H_cfg, full_actions.shape[-1])
-                is_pad_config = torch.ones(H_cfg, dtype=torch.bool)
+            real_len = min(k * C, full_actions.shape[0])
+            action_config[:real_len] = full_actions[:real_len]
+            action_is_pad_config[:real_len] = full_action_is_pad[:real_len]
 
-                # Prefix (always present)
-                action_config[:C] = prefix_actions
-                is_pad_config[:C] = prefix_is_pad
-
-                # Noisy slots: first k*C of the noisy portion
-                real_len = min(k * C, noisy_actions.shape[0])
-                action_config[C:C + real_len] = noisy_actions[:real_len]
-                is_pad_config[C:C + real_len] = noisy_is_pad[:real_len]
-
-                actions_list.append(action_config)
-                action_is_pad_list.append(is_pad_config)
-        else:
-            H_cfg = N * C  # per-config length
-
-            actions_list = []
-            action_is_pad_list = []
-
-            for k_idx in range(N):
-                k = k_idx + 1
-
-                action_config = torch.zeros_like(full_actions)
-                action_is_pad_config = torch.ones(H_cfg, dtype=torch.bool)
-
-                real_len = min(k * C, full_actions.shape[0])
-                action_config[:real_len] = full_actions[:real_len]
-                action_is_pad_config[:real_len] = full_action_is_pad[:real_len]
-
-                actions_list.append(action_config)
-                action_is_pad_list.append(action_is_pad_config)
+            actions_list.append(action_config)
+            action_is_pad_list.append(action_is_pad_config)
 
         result["action"] = torch.cat(actions_list, dim=0)          # [N * H_cfg, action_dim]
         result["action_is_pad"] = torch.cat(action_is_pad_list, dim=0)  # [N * H_cfg]
@@ -299,12 +258,11 @@ class MultiFlashVLADataset(ConcatDataset):
 
 def make_robotwin_multitask_dataset(
     root: str | Path,
-    config_subdir: str,
+    config_subdir: str | list[str],
     tasks: list[str] | None,
     *,
     num_buffer_slots: int,
     chunk_size: int,
-    use_action_prefix: bool = False,
     delta_timestamps: dict[str, list[float]] | None = None,
     image_transforms: Callable | None = None,
     video_backend: str | None = None,
@@ -312,42 +270,52 @@ def make_robotwin_multitask_dataset(
     """Discover RoboTwin-LeRobot-v3.0 subsets under `root` and build a multi-task dataset.
 
     Layout: <root>/<task_name>/<config_subdir>/{meta,data,videos}/...
+
+    `config_subdir` may be a single subdir name or a list of subdir names. When a
+    list is given, every (task, subdir) leaf is included as its own subset — e.g.
+    pass ["aloha-agilex_clean_50", "aloha-agilex_randomized_500"] to pool the clean
+    and randomized settings of each task. Tasks are auto-discovered only if they
+    contain ALL requested subdirs.
     """
     root = Path(root).expanduser()
     if not root.is_dir():
         raise FileNotFoundError(f"RoboTwin root does not exist: {root}")
 
+    config_subdirs = [config_subdir] if isinstance(config_subdir, str) else list(config_subdir)
+
     if tasks:
         task_names = list(tasks)
     else:
-        # Auto-discover: every immediate subdir with <name>/<config_subdir>/meta/info.json
+        # Auto-discover: every immediate subdir that has <name>/<subdir>/meta/info.json
+        # for ALL requested config_subdirs.
         task_names = sorted(
             p.name for p in root.iterdir()
-            if p.is_dir() and (p / config_subdir / "meta" / "info.json").is_file()
+            if p.is_dir()
+            and all((p / subdir / "meta" / "info.json").is_file() for subdir in config_subdirs)
         )
 
     if not task_names:
         raise FileNotFoundError(
-            f"No RoboTwin sub-datasets found under {root} with config_subdir={config_subdir}"
+            f"No RoboTwin sub-datasets found under {root} with config_subdirs={config_subdirs}"
         )
 
     subsets: list[FlashVLADataset] = []
     for task in task_names:
-        sub_root = root / task / config_subdir
-        if not (sub_root / "meta" / "info.json").is_file():
-            raise FileNotFoundError(f"Missing meta/info.json for RoboTwin subset: {sub_root}")
-        subset = FlashVLADataset(
-            repo_id=f"robotwin/{task}_{config_subdir}",
-            root=sub_root,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            revision=None,
-            video_backend=video_backend,
-            num_buffer_slots=num_buffer_slots,
-            chunk_size=chunk_size,
-            use_action_prefix=use_action_prefix,
-        )
-        subsets.append(subset)
+        for subdir in config_subdirs:
+            sub_root = root / task / subdir
+            if not (sub_root / "meta" / "info.json").is_file():
+                raise FileNotFoundError(f"Missing meta/info.json for RoboTwin subset: {sub_root}")
+            subset = FlashVLADataset(
+                repo_id=f"robotwin/{task}_{subdir}",
+                root=sub_root,
+                delta_timestamps=delta_timestamps,
+                image_transforms=image_transforms,
+                revision=None,
+                video_backend=video_backend,
+                num_buffer_slots=num_buffer_slots,
+                chunk_size=chunk_size,
+            )
+            subsets.append(subset)
 
     return MultiFlashVLADataset(subsets)
 
@@ -358,7 +326,6 @@ def make_multi_root_flashvla_dataset(
     *,
     num_buffer_slots: int,
     chunk_size: int,
-    use_action_prefix: bool = False,
     delta_timestamps: dict[str, list[float]] | None = None,
     image_transforms: Callable | None = None,
     video_backend: str | None = None,
@@ -389,7 +356,6 @@ def make_multi_root_flashvla_dataset(
             video_backend=video_backend,
             num_buffer_slots=num_buffer_slots,
             chunk_size=chunk_size,
-            use_action_prefix=use_action_prefix,
         )
         subsets.append(subset)
 
