@@ -32,7 +32,7 @@ Train FlashVLA on LIBERO:
 
 ```bash
 python train/train.py \
-  --config_path=train/configs/pi05/libero/flashvla_action.yaml
+  --config_path=train/configs/pi05/libero/pi05_flashvla.yaml
 ```
 
 Multi-GPU:
@@ -40,20 +40,18 @@ Multi-GPU:
 ```bash
 accelerate launch --multi_gpu --num_processes=4 \
   train/train.py \
-  --config_path=train/configs/pi05/libero/flashvla_action.yaml
+  --config_path=train/configs/pi05/libero/pi05_flashvla.yaml
 ```
 
 Train a baseline policy:
 
 ```bash
 python train/train_baseline.py \
-  --config_path=train/configs/pi05/sync.yaml
+  --config_path=train/configs/pi05/libero/pi05_baseline.yaml
 ```
 
-For real-world Franka training, use
-[`train/configs/pi05/franka/flashvla_action_franka_dynamic_pap.yaml`](train/configs/pi05/franka/flashvla_action_franka_dynamic_pap.yaml).
 For RoboTwin training, use
-[`train/configs/pi05/robotwin/flashvla_action_per_task.yaml`](train/configs/pi05/robotwin/flashvla_action_per_task.yaml).
+[`train/configs/pi05/robotwin/pi05_flashvla_clean_per_task.yaml`](train/configs/pi05/robotwin/pi05_flashvla_clean_per_task.yaml).
 
 ## Testing pi0.5 on LIBERO
 
