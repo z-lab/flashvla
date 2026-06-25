@@ -257,18 +257,6 @@ class PI05SuffixEmbedder(nn.Module):
         self.time_mlp_in = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
         self.time_mlp_out = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
 
-        # RMSNorm on silu(time_mlp_out) — rejected (see import comment above).
-        # The forward branch below is kept gated on this attr so flipping it
-        # back to a Module re-enables the experiment without code changes.
-        self.time_mlp_out_norm = None
-        # if getattr(config, "use_time_mlp_norm", False):
-        #     self.time_mlp_out_norm = GemmaRMSNorm(
-        #         config.action_expert_config.hidden_size,
-        #         eps=config.action_expert_config.rms_norm_eps,
-        #     )
-        # else:
-        #     self.time_mlp_out_norm = None
-
         # Optional state conditioning MLP
         if config.state_cond:
             self.state_proj = nn.Linear(config.max_state_dim, config.action_expert_config.hidden_size)
@@ -277,30 +265,17 @@ class PI05SuffixEmbedder(nn.Module):
             nn.init.zeros_(self.state_mlp_out.weight)
             nn.init.zeros_(self.state_mlp_out.bias)
 
-    def forward(self, state, noisy_actions, time, padding_mask=None, segment_lookup=None):
+    def forward(self, state, noisy_actions, time, padding_mask=None):
         """Embed noisy actions with time and state conditioning.
 
-        Two paths:
-        * ``segment_lookup is None`` (legacy, e.g. inference denoise_step):
-          ``time`` is per-token ``[B, L]`` or ``[B, L, 1]`` and time_mlp runs
-          on all L positions even though many share identical time values.
-        * ``segment_lookup is not None`` (training shared-observation):
-          ``time`` is per-segment ``[B, S]`` (S = N), and
-          ``segment_lookup`` ``[B, num_slots]`` maps each (config, slot) to a
-          segment index. time_mlp runs only S times per sample, then the
-          per-segment cond is gathered to per-slot and broadcast to per-token.
-          Forward output is bit-equivalent to the legacy path; backward is
-          much cheaper because the C tokens within a slot now contribute one
-          summed gradient to time_mlp.weight instead of C separate ones.
+        ``time`` is per-token ``[B, L]`` (or ``[B, L, 1]``); time_mlp runs on all
+        L positions.
 
         Args:
             state: Robot state ``[B, state_dim]``.
             noisy_actions: Noisy action sequence x_t ``[B, L, action_dim]``.
-            time: Either ``[B, L]`` per-token (legacy) or ``[B, S]`` per-segment.
+            time: Per-token times ``[B, L]`` (or ``[B, L, 1]``).
             padding_mask: ``[B, L]`` boolean per-token. True = real, False = padded.
-            segment_lookup: optional ``[B, num_slots]`` long tensor with values in
-                ``[0, S)``. ``num_slots = L // C``. Padded slots may carry any
-                valid index because their cond is zeroed out via padding_mask.
 
         Returns:
             suffix_embs: ``[B, L, D]``.
@@ -330,22 +305,7 @@ class PI05SuffixEmbedder(nn.Module):
         time_emb = self.time_mlp_out(time_emb)
         time_emb = F.silu(time_emb)
 
-        # RMSNorm-on-cond fix was rejected; the no-op branch below stays in
-        # place so flipping the gate in __init__ re-runs the ablation.
-        # if self.time_mlp_out_norm is not None:
-        #     time_emb, _ = self.time_mlp_out_norm(time_emb)
-
-        if segment_lookup is None:
-            # Legacy per-token path: time_mlp output is already [B, L, D]
-            adarms_cond = time_emb
-        else:
-            # Per-segment path: time_mlp output is [B, S, D]; gather then expand
-            d = time_emb.size(-1)
-            per_slot_cond = torch.gather(
-                time_emb, dim=1,
-                index=segment_lookup.unsqueeze(-1).expand(-1, -1, d),
-            )  # [B, num_slots, D]
-            adarms_cond = per_slot_cond.repeat_interleave(C, dim=1)  # [B, L, D]
+        adarms_cond = time_emb
 
         suffix_embs = self.action_in_proj(noisy_actions)  # [B, L, D]
 
@@ -684,89 +644,15 @@ class PI05FlashVLAModel(nn.Module):
     def sample_noise(self, shape, device):
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
 
-    def _sample_global_slot_times(self, bsize: int, device: torch.device) -> Tensor:
-        """Sample shared denoising times for global slots 0..N-1.
-
-        Slot level `i` is sampled from the Beta-shaped segment
-        [i / N, (i + 1) / N], then scaled and offset by the configured
-        time sampling parameters. The resulting [B, N] tensor is shared by
-        every buffer config in shared-observation training.
-        """
-        N = self.N
-        alpha = torch.tensor(
-            self.config.time_sampling_beta_alpha,
-            device=device,
-            dtype=torch.float32,
-        )
-        beta = torch.tensor(
-            self.config.time_sampling_beta_beta,
-            device=device,
-            dtype=torch.float32,
-        )
-        beta_dist = torch.distributions.Beta(concentration1=alpha, concentration0=beta)
-
-        samples = beta_dist.sample((bsize, N)).to(device=device, dtype=torch.float32)
-        level_indices = torch.arange(N, device=device, dtype=torch.float32)
-        seg_starts = level_indices / N
-        global_time = seg_starts[None, :] + samples / N
-        global_time = (
-            global_time * self.config.time_sampling_scale
-            + self.config.time_sampling_offset
-        )
-        return global_time
-
-    def _build_shared_obs_segment_lookup(
-        self,
-        batch_size: int,
-        device: torch.device,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Build per-segment time tensor + per-slot lookup for shared-observation training.
-
-        Returns:
-            time_per_segment: ``[B, S]`` per-sample unique time values.
-                ``S = N``, segment idx ∈ [0, N) maps to global slot levels.
-            segment_lookup: ``[B, N * num_slots_per_config]`` long tensor of
-                segment indices, one per (config, slot) pair flattened in
-                config-major order. Padded slots carry index 0 (their cond is
-                zeroed by ``padding_mask`` downstream and does not affect loss).
-            time_per_token: ``[B, N * num_slots_per_config * C]`` per-token times
-                broadcast from the per-slot times. Used to compute x_t.
-        """
-        N, C = self.N, self.C
-        num_slots_per_config = N
-
-        global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-        time_per_segment = global_time  # [B, N]
-
-        # Build segment lookup [N, num_slots_per_config], same for every batch element.
-        # Padded slots carry 0 (any valid index works — their cond is masked out).
-        lookup = torch.zeros(N, num_slots_per_config, dtype=torch.long, device=device)
-        for k_idx in range(N):
-            k = k_idx + 1
-            # real noisy slots 0..k-1: segments N-k..N-1
-            lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
-
-        segment_lookup = lookup.reshape(-1).unsqueeze(0).expand(batch_size, -1).contiguous()
-        # [B, N * num_slots_per_config]
-
-        # Per-slot times by gathering, then expand to per-token for x_t computation.
-        # time_per_segment: [B, S], segment_lookup: [B, K] → time_per_slot: [B, K]
-        time_per_slot = torch.gather(time_per_segment, 1, segment_lookup)
-        time_per_token = time_per_slot.repeat_interleave(C, dim=1)
-        # [B, N * num_slots_per_config * C]
-
-        return time_per_segment, segment_lookup, time_per_token
-
     def _build_per_chunk_time(
         self,
         batch_size: int,
         device: torch.device,
     ) -> Tensor:
-        """Per-chunk independent time sampling (legacy, ablation-only).
+        """Per-chunk independent time sampling.
 
         Each (config k_idx, slot s) pair draws its own Beta sample, so two
-        configs at the same slot level get DIFFERENT t. Reproduces the
-        pre-PerSeg behavior that drove the noise-floor cascade.
+        configs at the same slot level get DIFFERENT t.
 
         Returns:
             time_per_token: ``[B, N * num_slots_per_config * C]``. All C
@@ -893,155 +779,6 @@ class PI05FlashVLAModel(nn.Module):
 
         return attention_mask, position_ids
     
-    def forward(
-        self, images, img_masks, tokens, masks,
-        states, actions, action_is_pad,
-        noise=None,
-    ):
-        """Forward pass for FlashVLA policy.
-
-        Args:
-            images: List of image tensors [B, C, H, W].
-            img_masks: List of validity masks [B].
-            tokens: Language token IDs [B, L_text].
-            masks: Language attention masks [B, L_text].
-            states: Robot states [B, state_dim].
-            actions: Target actions [B, H, action_dim]. H is the total horizon.
-            action_is_pad: [B, H] boolean, True for padded positions.
-            noise: Optional noise [B, H, action_dim].
-
-        Returns:
-            Per-element MSE loss [B, H, action_dim].
-        """
-        batch_size = states.shape[0]
-        N, C = self.N, self.C
-        suffix_length = H = actions.shape[1]
-        num_offsets = 1
-        device = states.device
-
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        # Single-config path: H must match a full buffer of N slots.
-        # Note: with only one buffer config, per-sample and per-chunk produce
-        # mathematically identical t values per slot (no cross-config sharing
-        # to differ on); the switch only changes which suffix_embedder code
-        # path is exercised.
-        if H != N * C:
-            raise ValueError(f"Expected action horizon {N * C}, got {H}.")
-        num_slots_per_config = N
-
-        mode = getattr(self.config, "timestep_sample_mode", "per-sample")
-        if mode == "per-sample":
-            global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-            time_per_segment = global_time  # [B, N]
-            segment_lookup = (
-                torch.arange(num_slots_per_config, device=device)
-                .unsqueeze(0).expand(batch_size, -1).contiguous()
-            )
-            time_per_token = (
-                torch.gather(time_per_segment, 1, segment_lookup).repeat_interleave(C, dim=1)
-            )
-            time_for_embedder = time_per_segment
-            seg_lookup_arg = segment_lookup
-        elif mode == "per-chunk":
-            # Re-use the shared-obs helper for one config only: take the
-            # first chunk of N flattened entries — the helper samples
-            # (B, N=num_configs, num_slots, C) so single-config corresponds
-            # to the FULL-buffer config (k_idx = N - 1).
-            full = self._build_per_chunk_time(batch_size, device)
-            # full shape: [B, N * num_slots_per_config * C]; pick last config (k_idx=N-1)
-            slice_size = num_slots_per_config * C
-            time_per_token = full[:, (N - 1) * slice_size : N * slice_size]
-            time_for_embedder = time_per_token
-            seg_lookup_arg = None
-        else:
-            raise ValueError(
-                f"timestep_sample_mode must be 'per-sample' or 'per-chunk', got {mode!r}"
-            )
-
-        # Compute noisy actions and target velocity.
-        time_expanded = time_per_token.unsqueeze(-1)  # [B, H, 1]
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        # Embed shared prefix once
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
-            images, img_masks, tokens, masks
-        )
-
-        real_mask = ~action_is_pad if action_is_pad is not None else None
-        suffix_embs, suffix_pad_masks, suffix_att_masks, suffix_adarms_cond = self.suffix_embedder(
-            states, x_t, time_for_embedder,
-            padding_mask=real_mask,
-            segment_lookup=seg_lookup_arg,
-        )
-        # suffix_embs: [B, H, D], suffix_pad_masks: [B, H],
-        # suffix_att_masks: [B, H], suffix_adarms_cond: [B, H, D]
-        hidden_dim = suffix_embs.shape[-1]
-
-        # Single suffix pad mask for attention: [B, 1, H]
-        suffix_pad_masks_per_offset = suffix_pad_masks.view(batch_size, num_offsets, H)
-
-        # Representative att_masks (same block structure for all configs): [B, H]
-        suffix_att_masks = suffix_att_masks[:, :H]
-
-        # adarms_cond reshaped for layers: [B, 1, H, D]
-        suffix_adarms_cond = suffix_adarms_cond.view(batch_size, num_offsets, H, -1)
-
-        # Compute dtype from a Linear weight (layernorms are kept float32).
-        backbone_dtype = self.backbone_dtype()
-        prefix_embs = prefix_embs.to(dtype=backbone_dtype)
-        suffix_embs = suffix_embs.to(dtype=backbone_dtype)
-
-        attention_mask, position_ids = self._build_shared_obs_mask(
-            prefix_pad_masks=prefix_pad_masks,
-            prefix_att_masks=prefix_att_masks,
-            suffix_pad_masks_per_offset=suffix_pad_masks_per_offset,
-            suffix_att_masks=suffix_att_masks,
-            num_offsets=num_offsets,
-            dtype=prefix_embs.dtype,
-        )
-
-        # Forward through transformer layers
-        hidden_states = [prefix_embs, suffix_embs]
-
-        for layer in self.layers:
-            hidden_states = layer(
-                hidden_states,
-                attention_mask,
-                position_ids,
-                suffix_adarms_conds=suffix_adarms_cond,
-                num_offsets=num_offsets,
-                suffix_length=suffix_length,
-            )
-
-        # Final layer norm with per-token conditioning
-        norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
-
-        prefix_out = hidden_states[0]
-        prefix_out, _ = norms[0](prefix_out, cond=None)
-
-        suffix_out = hidden_states[1]  # [B, H, D]
-        suffix_out = suffix_out.view(batch_size * num_offsets, H, hidden_dim)
-        cond = suffix_adarms_cond.view(batch_size * num_offsets, H, -1)
-        suffix_out, _ = norms[1](suffix_out, cond=cond)
-        suffix_out = suffix_out.view(batch_size, H, hidden_dim)
-
-        # Project to action space
-        suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-        v_t = self.action_out_proj(suffix_out)  # [B, H, action_dim]
-
-        # Compute MSE loss
-        losses = F.mse_loss(u_t, v_t, reduction="none")  # [B, H, action_dim]
-
-        # Keep only real (non-padded) positions
-        if action_is_pad is not None:
-            real_mask = ~action_is_pad  # [B, H]
-            losses = losses[real_mask]  # [num_real, action_dim]
-
-        return losses
-
     def forward_shared_observation(
         self, images, img_masks, tokens, masks,
         states, actions, action_is_pad,
@@ -1071,24 +808,9 @@ class PI05FlashVLAModel(nn.Module):
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
-        mode = getattr(self.config, "timestep_sample_mode", "per-sample")
-        if mode == "per-sample":
-            time_per_segment, segment_lookup, time_per_token = (
-                self._build_shared_obs_segment_lookup(batch_size, device)
-            )
-            time_for_embedder = time_per_segment
-            seg_lookup_arg = segment_lookup
-        elif mode == "per-chunk":
-            time_per_token = self._build_per_chunk_time(batch_size, device)
-            time_for_embedder = time_per_token
-            seg_lookup_arg = None
-        else:
-            raise ValueError(
-                f"timestep_sample_mode must be 'per-sample' or 'per-chunk', "
-                f"got {mode!r}"
-            )
+        time_per_token = self._build_per_chunk_time(batch_size, device)
 
-        # x_t still needs per-token times (each token gets its own noise sample).
+        # x_t needs per-token times (each token gets its own noise sample).
         time_expanded = time_per_token.unsqueeze(-1)  # [B, N*H, 1]
         # For noisy slots: x_t = t*noise + (1-t)*actions (standard flow matching)
         x_t = time_expanded * noise + (1 - time_expanded) * actions
@@ -1102,9 +824,8 @@ class PI05FlashVLAModel(nn.Module):
         # action_is_pad: True = padded; suffix embedder expects True = real
         real_mask = ~action_is_pad if action_is_pad is not None else None
         suffix_embs, suffix_pad_masks, suffix_att_masks, suffix_adarms_cond = self.suffix_embedder(
-            states, x_t, time_for_embedder,
+            states, x_t, time_per_token,
             padding_mask=real_mask,
-            segment_lookup=seg_lookup_arg,
         )
         hidden_dim = suffix_embs.shape[-1]
 

@@ -7,25 +7,12 @@ multi-suite / multi-GPU orchestrator.
 
 ## Requirements
 
-The default `environment.yml` already installs the LIBERO extra (`-e ".[libero]"`)
-in the same resolution as everything else, so a fresh `conda env create` needs
-nothing more here.
-
-### Adding LIBERO to an existing env
-
-LIBERO pulls lerobot's `[libero]` extra, which builds the native `egl_probe`
-extension from source with CMake. lerobot **also** depends on the PyPI `cmake`
-*shim* package, whose `bin/cmake` wrapper (`from cmake import cmake`) fails under
-pip's build isolation — the env's `site-packages` is stripped from `sys.path`, so
-the import dies with `ModuleNotFoundError: No module named 'cmake'` and the build
-aborts. This bites only when `egl_probe` is compiled into an env that *already*
-has lerobot (hence the shim) installed — i.e. installing the extra as a **second
-step** with the env activated. Drop the shim first so the real conda/system CMake
-does the build (the shim is unused at runtime; the extra reinstalls it at the
-end, after `egl_probe` is already built):
+The base `environment.yml` installs the FlashVLA env **without** LIBERO. After
+creating and activating it (`conda env create -f environment.yml && conda activate
+flashvla`), add the LIBERO extra:
 
 ```bash
-pip uninstall -y cmake        # no-op if not present; removes the broken shim
+pip uninstall -y cmake        # remove lerobot's broken cmake shim (no-op if absent)
 pip install -e ".[libero]"    # egl_probe now builds with the real cmake
 ```
 

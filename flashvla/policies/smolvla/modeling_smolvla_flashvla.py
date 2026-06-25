@@ -150,8 +150,8 @@ class LlamaAdaRMSNorm(nn.Module):
             )
 
         modulation = self.dense(cond.to(self.dense.weight.dtype))
-        # Cond may be per-sample [B, D] or per-token [B, L, D]. Broadcast the
-        # per-sample case to match the token axis of normed [B, L, D].
+        # Cond may be per-batch [B, D] or per-token [B, L, D]. Broadcast the
+        # per-batch case to match the token axis of normed [B, L, D].
         if hidden_states.ndim == 3 and modulation.ndim == 2:
             modulation = modulation.unsqueeze(1)
         scale, shift = torch.chunk(modulation, 2, dim=-1)
@@ -287,54 +287,13 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         return embs, pad_masks, att_masks, adarms_cond
 
     # ------------------------------------------------------------------
-    # Shared-obs time sampling (PerSeg / per-chunk) — same as pi0 streaming
+    # Shared-obs time sampling (per-chunk) — same as pi0 streaming
     # ------------------------------------------------------------------
-
-    def _sample_global_slot_times(self, bsize: int, device: torch.device) -> Tensor:
-        """Sample one global t per slot level, shared across all N configs."""
-        N = self.N
-        beta_dist = torch.distributions.Beta(
-            concentration1=torch.tensor(1.5, device=device, dtype=torch.float32),
-            concentration0=torch.tensor(1.0, device=device, dtype=torch.float32),
-        )
-        samples = beta_dist.sample((bsize, N)).to(device=device, dtype=torch.float32)
-        level_indices = torch.arange(N, device=device, dtype=torch.float32)
-        seg_starts = level_indices / N
-        global_time = seg_starts[None, :] + samples / N
-        return global_time * 0.999 + 0.001  # [B, N]
-
-    def _build_per_sample_time(
-        self, batch_size: int, device: torch.device,
-    ) -> tuple[Tensor, Tensor]:
-        """PerSeg time: one global t per slot level shared across N configs.
-
-        Returns:
-            time_per_slot_all_configs: ``[B, N * num_slots_per_config]`` flat
-                in config-major order. Padded slots get t=1.0 (placeholder,
-                will be masked by padding_mask downstream).
-            time_per_token: ``[B, N * num_slots_per_config * C]`` per-token.
-        """
-        N, C = self.N, self.C
-        num_slots_per_config = N
-
-        global_time = self._sample_global_slot_times(batch_size, device)  # [B, N]
-        time_per_segment = global_time
-
-        # lookup[k_idx, s] = which segment maps to config k's slot s
-        lookup = torch.zeros(N, num_slots_per_config, dtype=torch.long, device=device)
-        for k_idx in range(N):
-            k = k_idx + 1
-            lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
-
-        segment_lookup = lookup.reshape(-1).unsqueeze(0).expand(batch_size, -1).contiguous()
-        time_per_slot = torch.gather(time_per_segment, 1, segment_lookup)
-        time_per_token = time_per_slot.repeat_interleave(C, dim=1)
-        return time_per_slot, time_per_token
 
     def _build_per_chunk_time(
         self, batch_size: int, device: torch.device,
     ) -> tuple[Tensor, Tensor]:
-        """Per-chunk: each config independently samples its t. Ablation only."""
+        """Per-chunk: each config independently samples its t."""
         N, C = self.N, self.C
         num_slots_per_config = N
 
@@ -392,13 +351,7 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
-        mode = getattr(self.config, "timestep_sample_mode", "per-sample")
-        if mode == "per-sample":
-            time_per_slot_all, time_per_token = self._build_per_sample_time(bsize, device)
-        elif mode == "per-chunk":
-            time_per_slot_all, time_per_token = self._build_per_chunk_time(bsize, device)
-        else:
-            raise ValueError(f"Unknown timestep_sample_mode={mode!r}")
+        time_per_slot_all, time_per_token = self._build_per_chunk_time(bsize, device)
 
         time_expanded = time_per_token.unsqueeze(-1)
         x_t = time_expanded * noise + (1 - time_expanded) * actions

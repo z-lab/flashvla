@@ -1,17 +1,14 @@
 # FlashVLA: Streaming Action Decoding for Fast and Asynchronous VLA Inference
 
-**Paper** | **Project Page** | **Demo Video** | **Checkpoints**
+**Paper** | **Blog**
 
-**FlashVLA** is a general streaming action decoding method for flow-matching
-VLA models. This repo provides training, simulation evaluation, latency
-benchmark, and real-robot deployment code. The commands below use pi0.5 as an
-example.
+**FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution.
 
 <p align="center">
-  <img alt="FlashVLA" src="assets/logo.png" width="42%">
+  <a href="https://youtu.be/-qU_243aaVw">
+    <img src="https://img.youtube.com/vi/-qU_243aaVw/maxresdefault.jpg" width="640" alt="FlashVLA demo video">
+  </a>
 </p>
-
-> Demo video and pi0.5 checkpoints will be added soon.
 
 ## Installation
 
@@ -22,45 +19,39 @@ conda env create -f environment.yml
 conda activate flashvla
 ```
 
-`environment.yml` installs the LIBERO extra by default. For training,
-benchmarking, RoboTwin, or real-robot deployment without LIBERO, replace
-`-e .[libero]` with `-e .` in `environment.yml` before creating the env.
+This sets up the core FlashVLA environment for training, benchmarking, and
+real-robot deployment. LIBERO and RoboTwin evaluation each need additional,
+simulator-specific setup — see their READMEs under [`sim_eval/`](sim_eval/).
 
-## Training pi0.5
+## Training
 
-Train FlashVLA on LIBERO:
-
-```bash
-python train/train.py \
-  --config_path=train/configs/pi05/libero/pi05_flashvla.yaml
-```
-
-Multi-GPU:
+All training runs go through a single launcher, which selects the streaming or
+baseline trainer from the config's policy type and handles single- or multi-GPU:
 
 ```bash
-accelerate launch --multi_gpu --num_processes=4 \
-  train/train.py \
-  --config_path=train/configs/pi05/libero/pi05_flashvla.yaml
+# single GPU
+bash train/train.sh train/configs/pi05/libero/pi05_flashvla.yaml
+
+# multi-GPU (e.g. 4 GPUs)
+bash train/train.sh train/configs/pi05/libero/pi05_flashvla.yaml 4
+
+# baseline policy (same launcher, picks the baseline trainer)
+bash train/train.sh train/configs/pi05/libero/pi05_baseline.yaml
 ```
 
-Train a baseline policy:
-
-```bash
-python train/train_baseline.py \
-  --config_path=train/configs/pi05/libero/pi05_baseline.yaml
-```
-
-For RoboTwin training, use
+Configs live under [`train/configs/`](train/configs/) — pi0.5 and pi0, on LIBERO
+and RoboTwin, in FlashVLA and baseline variants. For RoboTwin, point the launcher
+at e.g.
 [`train/configs/pi05/robotwin/pi05_flashvla_clean_per_task.yaml`](train/configs/pi05/robotwin/pi05_flashvla_clean_per_task.yaml).
 
-## Testing pi0.5 on LIBERO
+## Evaluate on LIBERO
 
-See [`sim_eval/libero/`](sim_eval/libero/) for single-run and full-sweep
-evaluation.
+See [`sim_eval/libero/`](sim_eval/libero/) for the LIBERO environment setup and
+how to launch single-run and full-sweep evaluation.
 
-## Testing pi0.5 on RoboTwin
+## Evaluate on RoboTwin
 
-See [`sim_eval/robotwin/`](sim_eval/robotwin/) for RoboTwin setup and
+See [`sim_eval/robotwin/`](sim_eval/robotwin/) for the RoboTwin setup and the
 server/client evaluation.
 
 ## Latency Benchmark
@@ -91,17 +82,6 @@ while running:
 
 See [`realworld/README.md`](realworld/README.md) for the full deployment
 contract.
-
-## Repository Layout
-
-```text
-flashvla/      library code
-train/         training scripts and configs
-sim_eval/      LIBERO and RoboTwin evaluation
-benchmarks/    latency benchmark
-realworld/     real-robot deployment notes
-assets/        images for README
-```
 
 ## Acknowledgement
 

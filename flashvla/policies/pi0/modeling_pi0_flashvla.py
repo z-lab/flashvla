@@ -414,69 +414,18 @@ class PI0FlashVLAModel(nn.Module):
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
 
     # ------------------------------------------------------------------
-    # Shared-obs time sampling (PerSeg / per-chunk)
+    # Shared-obs time sampling (per-chunk)
     # ------------------------------------------------------------------
-
-    def _sample_global_slot_times(self, bsize: int, device: torch.device) -> Tensor:
-        """Sample one global t per slot level, shared across all N configs."""
-        N = self.N
-        alpha = torch.tensor(self.config.time_sampling_beta_alpha, device=device, dtype=torch.float32)
-        beta = torch.tensor(self.config.time_sampling_beta_beta, device=device, dtype=torch.float32)
-        beta_dist = torch.distributions.Beta(concentration1=alpha, concentration0=beta)
-        samples = beta_dist.sample((bsize, N)).to(device=device, dtype=torch.float32)
-        level_indices = torch.arange(N, device=device, dtype=torch.float32)
-        seg_starts = level_indices / N
-        global_time = seg_starts[None, :] + samples / N
-        global_time = (
-            global_time * self.config.time_sampling_scale
-            + self.config.time_sampling_offset
-        )
-        return global_time  # [B, N]
-
-    def _build_per_sample_time(
-        self,
-        batch_size: int,
-        device: torch.device,
-    ) -> tuple[Tensor, Tensor]:
-        """PerSeg time sampling: one global t per slot level, shared across configs.
-
-        Returns:
-            time_per_slot_all_configs: ``[B, N * num_slots_per_config]`` flat
-                per-(config, slot) times in config-major order.
-            time_per_token: ``[B, N * num_slots_per_config * C]`` per-token
-                broadcast (repeat_interleave by C).
-        """
-        N, C = self.N, self.C
-        num_slots_per_config = N
-
-        time_per_segment = self._sample_global_slot_times(batch_size, device)  # [B, N]
-
-        # lookup[k_idx, s] = which segment a (config, slot) maps to.
-        # Pad slots (slot levels above k_idx's real budget) get padding-time=1.0
-        # — they'll be masked out by padding_mask, so the value is irrelevant,
-        # but we set 1.0 (pure noise) for clarity. Real slots map to the
-        # appropriate slot level in time_per_segment.
-        lookup = torch.zeros(N, num_slots_per_config, dtype=torch.long, device=device)
-        for k_idx in range(N):
-            k = k_idx + 1
-            lookup[k_idx, :k] = torch.arange(N - k, N, device=device)
-
-        segment_lookup = lookup.reshape(-1).unsqueeze(0).expand(batch_size, -1).contiguous()
-        # [B, N * num_slots_per_config]
-        time_per_slot = torch.gather(time_per_segment, 1, segment_lookup)
-        time_per_token = time_per_slot.repeat_interleave(C, dim=1)
-        return time_per_slot, time_per_token
 
     def _build_per_chunk_time(
         self,
         batch_size: int,
         device: torch.device,
     ) -> tuple[Tensor, Tensor]:
-        """Per-chunk independent time sampling (ablation only).
+        """Per-chunk independent time sampling.
 
-        Each (config k_idx, slot s) draws its own Beta sample. Reproduces the
-        pre-PerSeg cross-config incoherence — useful only for diagnosing
-        cascade issues. Real slots get sampled t; padded slots get t=1.0.
+        Each (config k_idx, slot s) draws its own Beta sample. Real slots get
+        sampled t; padded slots get t=1.0.
         """
         N, C = self.N, self.C
         num_slots_per_config = N
@@ -507,85 +456,8 @@ class PI0FlashVLAModel(nn.Module):
         return time_per_slot, time_per_token
 
     # ------------------------------------------------------------------
-    # Training: single-config and shared-observation forwards
+    # Training: shared-observation forward
     # ------------------------------------------------------------------
-
-    def forward(
-        self, images, img_masks, tokens, masks,
-        states, actions, action_is_pad,
-        noise=None,
-    ):
-        """Single-config training forward (one buffer state per sample)."""
-        batch_size = states.shape[0]
-        N, C = self.N, self.C
-        device = states.device
-        H = actions.shape[1]  # total action horizon
-
-        if noise is None:
-            noise = self.sample_noise(actions.shape, actions.device)
-
-        if H != N * C:
-            raise ValueError(f"Expected action horizon {N * C}, got {H}.")
-
-        # Sample t for the N slot levels of this config; full-buffer config.
-        time_per_slot = self._sample_global_slot_times(batch_size, device)  # [B, N]
-
-        time_per_token = time_per_slot.repeat_interleave(C, dim=1)  # [B, H]
-        time_expanded = time_per_token.unsqueeze(-1)
-        x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions
-
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
-            images, img_masks, tokens, masks,
-        )
-        real_mask = ~action_is_pad if action_is_pad is not None else None
-        suffix_embs, suffix_pad_masks, suffix_att_masks, suffix_adarms_cond = self.suffix_embedder(
-            states, x_t, time_per_slot, padding_mask=real_mask,
-        )
-        # concat mode: suffix [B, 1+H, D] (state token at idx 0)
-        # adaRMS mode: suffix [B, H, D] (no state token), adarms_cond [B, H, D]
-        L_suf = suffix_embs.shape[1]
-        use_adarms = self.config.use_adarms_time_cond
-
-        backbone_dtype = self.vlm.model.language_model.layers[0].self_attn.o_proj.weight.dtype
-        prefix_embs = prefix_embs.to(dtype=backbone_dtype)
-        suffix_embs = suffix_embs.to(dtype=backbone_dtype)
-        if suffix_adarms_cond is not None:
-            suffix_adarms_cond = suffix_adarms_cond.to(dtype=backbone_dtype)
-
-        suffix_pad_per_offset = suffix_pad_masks.view(batch_size, 1, L_suf)
-        attention_mask, position_ids = build_flashvla_attention_mask_and_position_ids(
-            prefix_pad_masks=prefix_pad_masks,
-            prefix_att_masks=prefix_att_masks,
-            suffix_pad_masks_per_offset=suffix_pad_per_offset,
-            suffix_att_masks=suffix_att_masks,
-            num_offsets=1,
-            dtype=prefix_embs.dtype,
-        )
-
-        hidden_states = [prefix_embs, suffix_embs]
-        conds = [None, suffix_adarms_cond]  # None in concat mode, per-token in adaRMS mode
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=False)
-
-        # Final norm. adaRMS mode passes per-token cond; concat mode passes None.
-        _, _ = self.vlm.language_model.norm(hidden_states[0], cond=None)
-        suffix_out, _ = self.action_expert.model.norm(hidden_states[1], cond=suffix_adarms_cond)
-
-        # In concat mode, suffix has state at idx 0 — slice it off. In adaRMS
-        # mode, suffix is already action-only.
-        if use_adarms:
-            action_out = suffix_out  # [B, H, D]
-        else:
-            action_out = suffix_out[:, 1:, :]  # [B, H, D]
-        action_out = action_out.to(dtype=self.action_out_proj.weight.dtype)
-        v_t = self.action_out_proj(action_out)  # [B, H, action_dim]
-
-        losses = F.mse_loss(u_t, v_t, reduction="none")
-        if action_is_pad is not None:
-            real_mask_loss = ~action_is_pad
-            losses = losses[real_mask_loss]
-        return losses
 
     def forward_shared_observation(
         self, images, img_masks, tokens, masks,
@@ -608,19 +480,9 @@ class PI0FlashVLAModel(nn.Module):
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
 
-        mode = getattr(self.config, "timestep_sample_mode", "per-sample")
-        if mode == "per-sample":
-            time_per_slot_all, time_per_token = self._build_per_sample_time(
-                batch_size, device,
-            )
-        elif mode == "per-chunk":
-            time_per_slot_all, time_per_token = self._build_per_chunk_time(
-                batch_size, device,
-            )
-        else:
-            raise ValueError(
-                f"timestep_sample_mode must be 'per-sample' or 'per-chunk', got {mode!r}"
-            )
+        time_per_slot_all, time_per_token = self._build_per_chunk_time(
+            batch_size, device,
+        )
 
         # x_t needs per-token times
         time_expanded = time_per_token.unsqueeze(-1)

@@ -36,7 +36,8 @@ from torch.utils.data import ConcatDataset
 from torch.utils.data._utils.collate import default_collate
 
 from lerobot.datasets.compute_stats import aggregate_stats
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.factory import resolve_delta_timestamps
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 
 
 class FlashVLADataset(LeRobotDataset):
@@ -152,7 +153,7 @@ def flashvla_collate_fn(batch: list[dict]) -> dict:
     return default_collate(batch)
 
 
-class _MultiDatasetMetaShim:
+class _MultiDatasetMeta:
     """Duck-typed stand-in for LeRobotDatasetMetadata, exposing the fields used
     during training (make_policy, make_pre_post_processors, logging).
     """
@@ -248,7 +249,7 @@ class MultiFlashVLADataset(ConcatDataset):
         sub_metas = [s.meta for s in subsets]
         pooled = aggregate_stats([m.stats for m in sub_metas if m.stats is not None])
         # aggregate_stats returns numpy; LeRobot normalization expects tensors, same as load_stats.
-        self.meta = _MultiDatasetMetaShim(sub_metas, pooled)
+        self.meta = _MultiDatasetMeta(sub_metas, pooled)
 
         self.num_frames = sum(s.num_frames for s in subsets)
         self.num_episodes = sum(s.num_episodes for s in subsets)
@@ -256,107 +257,187 @@ class MultiFlashVLADataset(ConcatDataset):
         self.episodes = None  # EpisodeAwareSampler path is not used by FlashVLA.
 
 
-def make_robotwin_multitask_dataset(
-    root: str | Path,
-    config_subdir: str | list[str],
-    tasks: list[str] | None,
-    *,
-    num_buffer_slots: int,
-    chunk_size: int,
-    delta_timestamps: dict[str, list[float]] | None = None,
-    image_transforms: Callable | None = None,
-    video_backend: str | None = None,
-) -> MultiFlashVLADataset:
-    """Discover RoboTwin-LeRobot-v3.0 subsets under `root` and build a multi-task dataset.
+def make_robotwin_multitask_flashvla_dataset(cfg, image_transforms=None) -> MultiFlashVLADataset:
+    """Build the RoboTwin multi-task FlashVLA dataset by concatenating LeRobot leaves.
 
-    Layout: <root>/<task_name>/<config_subdir>/{meta,data,videos}/...
+    Two modes, both driven by `cfg.robotwin_multitask`:
+      * `roots` — explicit LeRobot leaf roots (e.g. clean + randomized settings of
+        one task), concatenated directly.
+      * `root` + `config_subdir(s)` (+ optional `tasks`) — discover task leaves under
+        a RoboTwin-LeRobot-v3.0 tree (`<root>/<task>/<config_subdir>/...`). A list of
+        `config_subdirs` pools every (task, subdir) leaf; tasks are auto-discovered
+        only if they contain ALL requested subdirs.
 
-    `config_subdir` may be a single subdir name or a list of subdir names. When a
-    list is given, every (task, subdir) leaf is included as its own subset — e.g.
-    pass ["aloha-agilex_clean_50", "aloha-agilex_randomized_500"] to pool the clean
-    and randomized settings of each task. Tasks are auto-discovered only if they
-    contain ALL requested subdirs.
+    `stats_path`, if set, overrides the pooled stats with exact global ones. Mirrors
+    `make_robotwin_multitask_baseline_dataset` but builds FlashVLADataset subsets
+    (num_buffer_slots / chunk_size from cfg.policy).
     """
-    root = Path(root).expanduser()
-    if not root.is_dir():
-        raise FileNotFoundError(f"RoboTwin root does not exist: {root}")
-
-    config_subdirs = [config_subdir] if isinstance(config_subdir, str) else list(config_subdir)
-
-    if tasks:
-        task_names = list(tasks)
+    mt = cfg.robotwin_multitask
+    if mt.roots:
+        root_specs = [
+            (f"{cfg.dataset.repo_id}_root{i}", Path(r).expanduser())
+            for i, r in enumerate(mt.roots)
+        ]
     else:
-        # Auto-discover: every immediate subdir that has <name>/<subdir>/meta/info.json
-        # for ALL requested config_subdirs.
-        task_names = sorted(
-            p.name for p in root.iterdir()
-            if p.is_dir()
-            and all((p / subdir / "meta" / "info.json").is_file() for subdir in config_subdirs)
-        )
+        if not mt.root:
+            raise ValueError(
+                "cfg.robotwin_multitask.enable=True requires robotwin_multitask.roots "
+                "or robotwin_multitask.root to be set"
+            )
+        # config_subdirs (a list, pooling multiple settings per task) takes
+        # precedence over the single config_subdir.
+        config_subdirs = mt.config_subdirs or [mt.config_subdir]
+        root = Path(mt.root).expanduser()
+        if mt.tasks:
+            task_names = list(mt.tasks)
+        else:
+            task_names = sorted(
+                p.name for p in root.iterdir()
+                if p.is_dir()
+                and all((p / s / "meta" / "info.json").is_file() for s in config_subdirs)
+            )
+        if not task_names:
+            raise FileNotFoundError(
+                f"No RoboTwin sub-datasets found under {root} with config_subdirs={config_subdirs}"
+            )
+        root_specs = [
+            (f"robotwin/{task}_{subdir}", root / task / subdir)
+            for task in task_names
+            for subdir in config_subdirs
+        ]
 
-    if not task_names:
-        raise FileNotFoundError(
-            f"No RoboTwin sub-datasets found under {root} with config_subdirs={config_subdirs}"
-        )
+    probe_repo_id, probe_root = root_specs[0]
+    ds_meta = LeRobotDatasetMetadata(probe_repo_id, root=probe_root, revision=None)
+    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
 
     subsets: list[FlashVLADataset] = []
-    for task in task_names:
-        for subdir in config_subdirs:
-            sub_root = root / task / subdir
-            if not (sub_root / "meta" / "info.json").is_file():
-                raise FileNotFoundError(f"Missing meta/info.json for RoboTwin subset: {sub_root}")
-            subset = FlashVLADataset(
-                repo_id=f"robotwin/{task}_{subdir}",
+    for repo_id, sub_root in root_specs:
+        if not (sub_root / "meta" / "info.json").is_file():
+            raise FileNotFoundError(f"Missing meta/info.json for RoboTwin subset: {sub_root}")
+        subsets.append(
+            FlashVLADataset(
+                repo_id=repo_id,
                 root=sub_root,
                 delta_timestamps=delta_timestamps,
                 image_transforms=image_transforms,
                 revision=None,
-                video_backend=video_backend,
-                num_buffer_slots=num_buffer_slots,
-                chunk_size=chunk_size,
+                video_backend=cfg.dataset.video_backend,
+                num_buffer_slots=cfg.policy.num_buffer_slots,
+                chunk_size=cfg.policy.chunk_size,
             )
-            subsets.append(subset)
-
-    return MultiFlashVLADataset(subsets)
-
-
-def make_multi_root_flashvla_dataset(
-    repo_id: str,
-    roots: list[str | Path],
-    *,
-    num_buffer_slots: int,
-    chunk_size: int,
-    delta_timestamps: dict[str, list[float]] | None = None,
-    image_transforms: Callable | None = None,
-    video_backend: str | None = None,
-) -> MultiFlashVLADataset:
-    """Build MultiFlashVLADataset from multiple roots sharing the same schema.
-
-    Intended use: mix different settings of the SAME task (e.g., clean_50 +
-    randomized_500 for `click_bell`). Sub-datasets are concatenated via
-    ConcatDataset; stats are pooled across roots so quantile normalization is
-    consistent over the union.
-
-    All roots must have matching features/fps (enforced by _MultiDatasetMetaShim).
-    """
-    if not roots:
-        raise ValueError("make_multi_root_flashvla_dataset needs at least one root")
-
-    subsets: list[FlashVLADataset] = []
-    for i, r in enumerate(roots):
-        r = Path(r).expanduser()
-        if not (r / "meta" / "info.json").is_file():
-            raise FileNotFoundError(f"Missing meta/info.json for root #{i}: {r}")
-        subset = FlashVLADataset(
-            repo_id=f"{repo_id}_root{i}",
-            root=r,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            revision=None,
-            video_backend=video_backend,
-            num_buffer_slots=num_buffer_slots,
-            chunk_size=chunk_size,
         )
-        subsets.append(subset)
 
-    return MultiFlashVLADataset(subsets)
+    dataset = MultiFlashVLADataset(subsets)
+
+    # Exact pooled stats override (aggregate_stats count-weighted quantiles deviate
+    # from the true global q01/q99 across many tasks).
+    if mt.stats_path:
+        import json as _json
+        from lerobot.datasets.io_utils import cast_stats_to_numpy
+
+        with open(Path(mt.stats_path).expanduser()) as f:
+            dataset.meta.stats.update(cast_stats_to_numpy(_json.load(f)))
+
+    return dataset
+
+
+class MultiBaselineDataset(ConcatDataset):
+    """Concatenation of plain LeRobotDataset subsets for baseline (non-streaming)
+    multi-task training.
+
+    Like MultiFlashVLADataset, stats are pooled across subsets via
+    aggregate_stats so normalization is consistent over the union, and a
+    duck-typed `.meta` is exposed for the training loop. The subsets are plain
+    LeRobotDatasets (no buffer-config expansion) because the baseline policy
+    consumes a single action chunk per sample.
+    """
+
+    def __init__(self, subsets: list[LeRobotDataset]):
+        if len(subsets) == 0:
+            raise ValueError("MultiBaselineDataset needs at least one subset")
+        super().__init__(subsets)
+        self.subsets = subsets
+
+        sub_metas = [s.meta for s in subsets]
+        pooled = aggregate_stats([m.stats for m in sub_metas if m.stats is not None])
+        self.meta = _MultiDatasetMeta(sub_metas, pooled)
+
+        self.num_frames = sum(s.num_frames for s in subsets)
+        self.num_episodes = sum(s.num_episodes for s in subsets)
+        self.episodes = None
+
+
+def make_robotwin_multitask_baseline_dataset(cfg, image_transforms=None) -> MultiBaselineDataset:
+    """Build a baseline RoboTwin multi-task dataset by concatenating LeRobot leaves.
+
+    Mirrors `make_robotwin_multitask_flashvla_dataset` (same `roots` / `config_subdirs`
+    discovery and `stats_path` override) but builds plain LeRobotDataset subsets
+    for the baseline trainer. Reads `cfg.robotwin_multitask` / `cfg.policy` /
+    `cfg.dataset`.
+    """
+    mt = cfg.robotwin_multitask
+    if mt.roots:
+        # Explicit leaf roots (e.g. clean + randomized settings of one task).
+        root_specs = [
+            (f"{cfg.dataset.repo_id}_root{i}", Path(r).expanduser())
+            for i, r in enumerate(mt.roots)
+        ]
+    else:
+        if not mt.root:
+            raise ValueError(
+                "cfg.robotwin_multitask.enable=True requires robotwin_multitask.roots "
+                "or robotwin_multitask.root to be set"
+            )
+        # config_subdirs (a list, pooling multiple settings per task) takes
+        # precedence over the single config_subdir.
+        config_subdirs = mt.config_subdirs or [mt.config_subdir]
+        root = Path(mt.root).expanduser()
+        if mt.tasks:
+            task_names = list(mt.tasks)
+        else:
+            task_names = sorted(
+                p.name for p in root.iterdir()
+                if p.is_dir()
+                and all((p / s / "meta" / "info.json").is_file() for s in config_subdirs)
+            )
+        if not task_names:
+            raise FileNotFoundError(
+                f"No RoboTwin sub-datasets found under {root} with config_subdirs={config_subdirs}"
+            )
+        root_specs = [
+            (f"robotwin/{task}_{subdir}", root / task / subdir)
+            for task in task_names
+            for subdir in config_subdirs
+        ]
+
+    probe_repo_id, probe_root = root_specs[0]
+    ds_meta = LeRobotDatasetMetadata(probe_repo_id, root=probe_root, revision=None)
+    delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
+
+    subsets: list[LeRobotDataset] = []
+    for repo_id, sub_root in root_specs:
+        if not (sub_root / "meta" / "info.json").is_file():
+            raise FileNotFoundError(f"Missing meta/info.json for RoboTwin subset: {sub_root}")
+        subsets.append(
+            LeRobotDataset(
+                repo_id=repo_id,
+                root=sub_root,
+                episodes=cfg.dataset.episodes,
+                delta_timestamps=delta_timestamps,
+                image_transforms=image_transforms,
+                revision=None,
+                video_backend=cfg.dataset.video_backend,
+            )
+        )
+
+    dataset = MultiBaselineDataset(subsets)
+
+    # Exact pooled stats override (same rationale as the FlashVLA multitask path).
+    if mt.stats_path:
+        import json as _json
+        from lerobot.datasets.io_utils import cast_stats_to_numpy
+
+        with open(Path(mt.stats_path).expanduser()) as f:
+            dataset.meta.stats.update(cast_stats_to_numpy(_json.load(f)))
+
+    return dataset

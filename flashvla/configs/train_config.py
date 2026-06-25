@@ -70,37 +70,13 @@ class FSDPConfig:
 
 
 @dataclass
-class BaselineTrainConfig(TrainPipelineConfig):
-    """Baseline (non-streaming) training configuration.
-
-    Extends TrainPipelineConfig with delay-augmentation parameters.
-    """
-
-    # Temporal delay augmentation: random offset in [0, max_delay_steps]
-    # Set to 0 to disable (standard training without delay)
-    max_delay_steps: int = 0
-
-    # Gradient accumulation steps
-    grad_accum_steps: int = 1
-
-    # Shared observation optimization: train all offsets together with shared
-    # observation (images + language). This provides ~(max_delay_steps+1)x speedup
-    # by computing observation embeddings only once and using custom attention
-    # masks to prevent cross-offset attention.
-    shared_observation: bool = False
-
-    # DeepSpeed ZeRO configuration
-    deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-
-
-@dataclass
 class RoboTwinMultiTaskConfig:
     """Multi-task training config for the RoboTwin-LeRobot-v3.0 dataset layout.
 
     The dataset on disk is organized as:
         <root>/<task_name>/<config_subdir>/{meta,data,videos}/...
     Each leaf directory is itself a complete LeRobotDataset v3.0. When enabled,
-    the trainer builds one FlashVLADataset per leaf and concatenates them.
+    the trainer builds one dataset per leaf and concatenates them.
     """
 
     enable: bool = False
@@ -126,6 +102,18 @@ class RoboTwinMultiTaskConfig:
 
 
 @dataclass
+class BaselineTrainConfig(TrainPipelineConfig):
+    """Baseline (non-streaming) pi0.5 / pi0 finetuning configuration."""
+
+    # Gradient accumulation steps
+    grad_accum_steps: int = 1
+
+    # RoboTwin multi-task training: when enabled, concatenate RoboTwin leaves
+    # into one baseline training set (see make_robotwin_multitask_baseline_dataset).
+    robotwin_multitask: RoboTwinMultiTaskConfig = field(default_factory=RoboTwinMultiTaskConfig)
+
+
+@dataclass
 class FlashVLATrainConfig(TrainPipelineConfig):
     """FlashVLA flashvla training configuration.
 
@@ -141,17 +129,5 @@ class FlashVLATrainConfig(TrainPipelineConfig):
     # FSDP2 configuration (mutually exclusive with deepspeed)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
-    # LIBERO suite filter for per-suite training.
-    # None (default) uses the full dataset; set to "goal", "spatial", "object",
-    # or "libero_10" to train on only that suite's episodes.
-    train_suite: str | None = None
-
     # RoboTwin multi-task training configuration
     robotwin_multitask: RoboTwinMultiTaskConfig = field(default_factory=RoboTwinMultiTaskConfig)
-
-    # Extra dataset roots for multi-root mixed training on a single task.
-    # E.g., pass the randomized_500 root via --extra_dataset_roots='[...]'
-    # while cfg.dataset.root points at clean_50. All roots must share schema
-    # and fps; stats are pooled across roots via LeRobot's aggregate_stats.
-    # Ignored when robotwin_multitask is enabled.
-    extra_dataset_roots: List[str] = field(default_factory=list)

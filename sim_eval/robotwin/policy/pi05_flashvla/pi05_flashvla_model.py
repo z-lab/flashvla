@@ -106,9 +106,7 @@ class PI05FlashVLAModel:
         # ModelClient socket has a finite timeout; lazy warmup with
         # compile_mode='max-autotune' (this ckpt's default) can take 5-10 min
         # and reliably blows past it.
-        self._warmed_up = False
         self._eager_warmup()
-        self._warmed_up = True
 
     def _eager_warmup(self) -> None:
         """Pre-run manager.warmup with a fabricated obs.

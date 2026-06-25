@@ -188,37 +188,10 @@ class ModelServer:
 
 
 # --------------------- Utility Decorators ---------------------
-def class_decorator(task_name):
-    """Instantiate environment class for given task"""
-    envs_module = importlib.import_module(f"envs.{task_name}")
-    if not hasattr(envs_module, task_name):
-        raise SystemExit("Task not found")
-    return getattr(envs_module, task_name)()
-
-
 def eval_function_decorator(policy_name, model_name, conda_env=None):
     """Load a specified function (e.g., get_model) from a policy module"""
     module = importlib.import_module(policy_name)
     return getattr(module, model_name)
-
-
-def get_camera_config(camera_type):
-    """Load camera configuration from YAML file"""
-    cfg_path = os.path.join(os.path.dirname(__file__), "../task_config/_camera_config.yml")
-    if not os.path.isfile(cfg_path):
-        raise FileNotFoundError("Camera config file not found")
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
-    if camera_type not in cfg:
-        raise KeyError(f"Camera type '{camera_type}' is not defined")
-    return cfg[camera_type]
-
-
-def get_embodiment_config(robot_file):
-    """Load robot embodiment configuration from YAML"""
-    path = os.path.join(robot_file, "config.yml")
-    with open(path, 'r', encoding='utf-8') as f:
-        return yaml.safe_load(f)
 
 
 def main(usr_args):

@@ -169,8 +169,8 @@ class SmolVLAFlashVLAConfig(SmolVLAConfig):
     Architecture deltas vs the baseline SmolVLA:
     - Buffer of ``num_buffer_slots`` × ``chunk_size`` action tokens; one-step
       inference in steady state instead of the baseline's 10-step ODE.
-    - Per-slot time replaces per-sample scalar t; the per-token concat path
-      (``action_time_mlp_in/out``) handles this naturally without FiLM.
+    - Per-slot time replaces the baseline's single scalar t; the per-token
+      concat path (``action_time_mlp_in/out``) handles this naturally without FiLM.
     - State stays in the prefix (smolvla's native layout — unlike pi0/lingbot
       which would put state at suffix index 0). Shared-observation training
       reuses one prefix encoding across all N buffer configs.
@@ -182,9 +182,6 @@ class SmolVLAFlashVLAConfig(SmolVLAConfig):
     chunk_size: int = 10
     num_buffer_slots: int = 5
     n_action_steps: int = 10
-
-    # Shared-obs time sampling
-    timestep_sample_mode: str = "per-sample"  # or "per-chunk" for ablation
 
     # Cold-start action source for the N-1 warm-up calls
     cold_start_mode: str = "zero_delta"  # or "current_state"

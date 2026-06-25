@@ -4,10 +4,12 @@ Evaluates FlashVLA policies on [RoboTwin 2.0](https://github.com/RoboTwin-Platfo
 via a TCP client/server split: the **server** runs the FlashVLA policy in the
 `flashvla` python env; the **client** runs the SAPIEN simulator in RoboTwin's
 own env (different torch/python constraints). This directory contains only
-the FlashVLA-specific pieces — RoboTwin itself is not vendored.
+the FlashVLA-specific pieces — RoboTwin itself is not vendored. It also ships a
+one-click pipeline to build the RoboTwin **training** dataset (see below).
 
 ```
 robotwin/
+├── robotwin_pipeline/        # download + convert RoboTwin 2.0 -> LeRobot v3 training data
 ├── policy/
 │   └── pi05_flashvla/        # flashvla server adapter (serve.sh, eval_client.sh, model wrapper)
 └── overlay/                  # small patches to RoboTwin core (see below)
@@ -15,6 +17,37 @@ robotwin/
     ├── script/eval_policy_client.py
     └── envs/_base_task.py
 ```
+
+## Building the training dataset
+
+`robotwin_pipeline/` downloads the official RoboTwin 2.0 dataset and converts it
+into the LeRobot v3 layout FlashVLA trains on (`train/configs/pi05/robotwin/`).
+One-click, runs in the `flashvla` env — no GPU, no RoboTwin sim env, no SLURM:
+
+```bash
+conda activate flashvla
+bash robotwin_pipeline/run_pipeline.sh /path/to/data_dir
+```
+
+It runs all stages idempotently (safe to resume): download
+`TianxingChen/RoboTwin2.0` (aloha-agilex `clean_50` + `randomized_500`, ~273 GB)
+→ unzip → convert each task×setting to LeRobot v3 → augment per-task quantile
+stats (q01/q99) → pool exact global stats. Options:
+`bash robotwin_pipeline/run_pipeline.sh [DATA_DIR] [PARALLELISM]`, plus env
+overrides `SETTINGS="aloha-agilex_clean_50"` (one setting) and `SKIP_DOWNLOAD=1`.
+
+Then point a training config at the result:
+
+```yaml
+robotwin_multitask:
+  enable: true
+  root: <data_dir>/RoboTwin-LeRobot-v3.0
+  config_subdirs: [aloha-agilex_clean_50, aloha-agilex_randomized_500]
+  stats_path: <data_dir>/RoboTwin-LeRobot-v3.0/_pooled_stats/pooled_stats.json
+```
+
+The `robotwin_pipeline/scripts/` (convert / augment / compute) are also runnable
+standalone. (~273 GB raw — delete the zips after conversion to reclaim space.)
 
 ## Setup
 

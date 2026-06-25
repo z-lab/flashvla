@@ -8,7 +8,6 @@ policy:
   state_cond: false
   num_buffer_slots: 4
   chunk_size: 20
-  timestep_sample_mode: "per-chunk"
   freeze_vision_encoder: false
   freeze_vlm: false
   cold_start_mode: current_state

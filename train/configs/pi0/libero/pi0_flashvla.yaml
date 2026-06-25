@@ -7,7 +7,6 @@ policy:
   device: cuda
   num_buffer_slots: 4
   chunk_size: 10
-  timestep_sample_mode: "per-chunk"
   freeze_vlm: false
   use_adarms_time_cond: true          
   normalization_mapping:

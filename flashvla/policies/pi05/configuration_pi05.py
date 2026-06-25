@@ -252,26 +252,6 @@ class PI05FlashVLAConfig(PI05Config):
     n_action_steps: int = 10       # Execute one full slot per step
     freeze_vlm: bool = False        # Freeze VLM backbone, only train action expert + suffix embedder
 
-    # 2026-05-06: RMSNorm-on-time_mlp_out experiment was rejected. It killed
-    # the σ_max cascade but also killed eval (0% on bbh). Replaced by
-    # ``time_mlp_weight_decay`` below. Field kept (commented) so re-running
-    # the ablation only needs an uncomment + flag flip.
-    # use_time_mlp_norm: bool = False
-
-    # Time-conditioning sampling for shared-observation training. Only
-    # affects how t is drawn for the N buffer configs that share an
-    # observation; flow-matching math (within a chunk) is unchanged.
-    #
-    #   "per-sample" (default, PerSeg) — sample one global t per slot level
-    #                  shared across all N configs. time_mlp runs on N unique
-    #                  inputs via segment_lookup. Eliminates the
-    #                  per-batch incoherence that drove the cascade.
-    #   "per-chunk"   — each buffer config independently samples its own t
-    #                   for every chunk, even at the same slot level.
-    #                   Reproduces the pre-fix behavior (5 different t per
-    #                   slot level per batch). Useful for ablations only.
-    timestep_sample_mode: str = "per-sample"
-
     # Optional weight-decay applied ONLY to the suffix embedder's time_mlp_in /
     # time_mlp_out parameters (weight + bias). Direct attack on the cascade
     # root cause (σ_max growth at noise floor) without changing forward pass

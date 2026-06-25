@@ -40,7 +40,5 @@ task_config: null
 ckpt_setting: null
 seed: null
 # Use the training-set instruction templates/descriptions.
-instruction_type: seen
-# Optional: name of the conda env the server is running in — only used
-# for logging by eval_policy_client.py.
+instruction_type: unseen  # Please set to 'seen' for multitask checkpoints.
 policy_conda_env: flashvla

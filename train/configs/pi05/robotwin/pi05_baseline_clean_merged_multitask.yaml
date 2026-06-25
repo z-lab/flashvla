@@ -1,9 +1,9 @@
-# FlashVLA Action Streaming MULTI-TASK training — CLEAN-only merge (50 tasks).
+# PI0.5 baseline MULTI-TASK training on RoboTwin — CLEAN-only merge.
 #
-# Pools all RoboTwin tasks x {aloha-agilex_clean_50} into a single ConcatDataset
-# (frame-proportional mixing). Set robotwin_multitask.config_subdirs to
-# [aloha-agilex_clean_50, aloha-agilex_randomized_500] to also pool the
-# randomized setting.
+# Baseline counterpart of pi05_flashvla_clean_merged_multitask.yaml: pools all
+# RoboTwin tasks x {aloha-agilex_clean_50} into a single training set. Set
+# robotwin_multitask.config_subdirs to [aloha-agilex_clean_50,
+# aloha-agilex_randomized_500] to also pool the randomized setting.
 #
 # Expected data layout (each leaf is a complete LeRobot v3.0 dataset):
 #   <root>/<task>/aloha-agilex_clean_50/{meta,data,videos}/...
@@ -11,22 +11,19 @@
 # exact global q01/q99 over the union, point robotwin_multitask.stats_path at a
 # JSON of pooled stats; features present there override the aggregated ones.
 #
-# Mirrors pi05_flashvla_clean_per_task.yaml but scaled to the merge. The
-# batch_size / grad_accum / steps / lr below are reasonable defaults — confirm
-# before launch. Effective batch = batch_size x num_gpus x grad_accum.
+# The batch_size / grad_accum / steps / lr below are reasonable defaults —
+# confirm before launch. Effective batch = batch_size x num_gpus x grad_accum.
 
 policy:
-  type: pi05-flashvla
+  type: pi05
   pretrained_path: lerobot/pi05_base
   push_to_hub: false
   dtype: bfloat16
   device: cuda
   state_cond: false
-  num_buffer_slots: 4
-  chunk_size: 20
+  chunk_size: 50
+  n_action_steps: 50
   freeze_vision_encoder: false
-  freeze_vlm: false
-  cold_start_mode: current_state
   normalization_mapping:
     VISUAL: IDENTITY
     STATE: QUANTILES
@@ -43,11 +40,11 @@ robotwin_multitask:
 # Required for output paths even when multitask is on (the multitask dataset is
 # built from robotwin_multitask above, not from dataset.repo_id).
 dataset:
-  repo_id: robotwin/multitask_clean
+  repo_id: robotwin/baseline_multitask_clean
   video_backend: torchcodec
 
-output_dir: pi05_flashvla_clean_merged_multitask
-job_name: pi05_flashvla_clean_merged_multitask
+output_dir: pi05_baseline_clean_merged_multitask
+job_name: pi05_baseline_clean_merged_multitask
 batch_size: 4
 grad_accum_steps: 4
 steps: 50000

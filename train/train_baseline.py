@@ -46,7 +46,7 @@ from lerobot.datasets.factory import (
     resolve_delta_timestamps,
 )
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import cycle
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -64,7 +64,7 @@ from lerobot.utils.utils import (
 from tqdm import tqdm
 
 from flashvla.configs.train_config import BaselineTrainConfig
-from flashvla.datasets import DelayAugmentedDataset, SharedObservationDataset, shared_observation_collate_fn
+from flashvla.datasets.flashvla_dataset import make_robotwin_multitask_baseline_dataset
 from flashvla.policies.factory import make_policy, make_pre_post_processors
 
 
@@ -78,87 +78,48 @@ def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> in
 
 
 def make_baseline_dataset(cfg: BaselineTrainConfig):
-    """Create a DelayAugmentedDataset for training with temporal delay augmentation.
-    
-    This function creates a dataset that implements the delay-augmentation training strategy.
-    
-    The temporal delay augmentation:
-        - chunk_size = 50, max_delay_steps = 12
-        - delta_indices = [0, 1, ..., 49] (50 action steps)
-        - offset = random integer from [0, 12]
-        - query = [idx+offset, idx+1+offset, ..., idx+49+offset]
-        - Returns 50 actions starting from idx+offset instead of idx
-    
-    This teaches the policy that observations may be "stale" by up to
-    max_delay_steps, and it should predict where the robot will be,
-    not where it currently is.
-    
-    When shared_observation=True, returns a SharedObservationDataset that
-    provides all offsets for each sample, enabling efficient training with
-    shared observation embeddings.
-    
-    Args:
-        cfg: Training configuration containing dataset, policy, and 
-             max_delay_steps settings.
-    
-    Returns:
-        DelayAugmentedDataset or SharedObservationDataset: Dataset instance.
+    """Create the dataset for baseline (non-streaming) training.
+
+    RoboTwin multi-task configs are concatenated from local LeRobot leaves; all
+    other configs use a standard LeRobotDataset with policy-derived action delta
+    timestamps.
     """
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
     )
-    
-    # Load dataset metadata (camera keys, stats, etc.)
+
+    # Multi-task RoboTwin path: concatenate per-task LeRobot leaves into one set.
+    mt_cfg = getattr(cfg, "robotwin_multitask", None)
+    if mt_cfg is not None and mt_cfg.enable:
+        dataset = make_robotwin_multitask_baseline_dataset(cfg, image_transforms=image_transforms)
+        if cfg.dataset.use_imagenet_stats:
+            for key in dataset.meta.camera_keys:
+                for stats_type, stats in IMAGENET_STATS.items():
+                    dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
+        return dataset
+
     ds_meta = LeRobotDatasetMetadata(
         cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
     )
-    
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
-    
-    # Determine which dataset class to use
-    if cfg.shared_observation and cfg.max_delay_steps > 0:
-        logging.info(
-            f"Creating SharedObservationDataset with max_delay_steps={cfg.max_delay_steps} "
-            f"(training all offsets [0, {cfg.max_delay_steps}] with shared observation)"
-        )
-        dataset = SharedObservationDataset(
-            cfg.dataset.repo_id,
-            root=cfg.dataset.root,
-            episodes=cfg.dataset.episodes,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            revision=cfg.dataset.revision,
-            video_backend=cfg.dataset.video_backend,
-            max_delay_steps=cfg.max_delay_steps,
-        )
-    else:
-        # Log the temporal delay configuration
-        if cfg.max_delay_steps > 0:
-            logging.info(
-                f"Creating DelayAugmentedDataset with max_delay_steps={cfg.max_delay_steps} "
-                f"(random delays from [0, {cfg.max_delay_steps}])"
-            )
-        else:
-            logging.info("Creating DelayAugmentedDataset with max_delay_steps=0 (no temporal delay)")
-        
-        # Create dataset with temporal offset augmentation
-        dataset = DelayAugmentedDataset(
-            cfg.dataset.repo_id,
-            root=cfg.dataset.root,
-            episodes=cfg.dataset.episodes,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            revision=cfg.dataset.revision,
-            video_backend=cfg.dataset.video_backend,
-            max_delay_steps=cfg.max_delay_steps,
-        )
-    
+
+    logging.info("Creating LeRobotDataset for baseline training")
+    dataset = LeRobotDataset(
+        cfg.dataset.repo_id,
+        root=cfg.dataset.root,
+        episodes=cfg.dataset.episodes,
+        delta_timestamps=delta_timestamps,
+        image_transforms=image_transforms,
+        revision=cfg.dataset.revision,
+        video_backend=cfg.dataset.video_backend,
+    )
+
     # Apply ImageNet stats if requested (same as original make_dataset)
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
             for stats_type, stats in IMAGENET_STATS.items():
                 dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
-    
+
     return dataset
 
 
@@ -174,7 +135,6 @@ def update_policy(
     *,
     loss_scale: float = 1.0,
     do_step: bool = True,
-    use_shared_observation: bool = False,
 ) -> tuple[MetricsTracker, dict]:
     """
     Performs a single training step to update the policy's weights.
@@ -193,8 +153,7 @@ def update_policy(
         lock: Optional threading lock for thread-safe optimizer updates.
         loss_scale: Scaling factor for loss (1/grad_accum_steps for accumulation).
         do_step: Whether to perform optimizer step (False for accumulation).
-        use_shared_observation: If True, use shared observation forward for efficiency.
-    
+
     Returns:
         Tuple of:
         - Updated MetricsTracker with loss, grad_norm, and lr.
@@ -204,15 +163,7 @@ def update_policy(
 
     # Forward pass with automatic mixed precision (AMP)
     with accelerator.autocast():
-        if use_shared_observation:
-            # Use shared observation forward when available
-            unwrapped_policy = accelerator.unwrap_model(policy, keep_fp32_wrapper=True)
-            if hasattr(unwrapped_policy, 'forward_shared_observation'):
-                loss, output_dict = unwrapped_policy.forward_shared_observation(batch)
-            else:
-                raise ValueError("Policy does not have a forward_shared_observation method")
-        else:
-            loss, output_dict = policy.forward(batch)
+        loss, output_dict = policy.forward(batch)
         # Keep unscaled loss for logging, scale for gradient accumulation
         raw_loss = loss.detach()
         loss = loss * loss_scale
@@ -322,7 +273,7 @@ def train(cfg: BaselineTrainConfig, accelerator: Accelerator | None = None):
     
     This function orchestrates the complete training pipeline:
     1. Setup: logging, seeding, device configuration, W&B
-    2. Data: create DelayAugmentedDataset with temporal delay augmentation
+    2. Data: create the (multi-task) LeRobot dataset
     3. Model: create policy
     4. Optimization: create optimizer and LR scheduler
     5. Resume: load checkpoint if resuming
@@ -486,10 +437,6 @@ def train(cfg: BaselineTrainConfig, accelerator: Accelerator | None = None):
         shuffle = True
         sampler = None
 
-    # Use custom collate function for shared observation dataset
-    use_shared_observation = cfg.shared_observation and cfg.max_delay_steps > 0
-    collate_fn = shared_observation_collate_fn if use_shared_observation else None
-
     dataloader = torch.utils.data.DataLoader(
         dataset,
         num_workers=cfg.num_workers,
@@ -499,7 +446,6 @@ def train(cfg: BaselineTrainConfig, accelerator: Accelerator | None = None):
         pin_memory=device.type == "cuda",
         drop_last=False,
         prefetch_factor=2 if cfg.num_workers > 0 else None,
-        collate_fn=collate_fn,
     )
 
     # === Prepare for Distributed Training ===
@@ -569,7 +515,6 @@ def train(cfg: BaselineTrainConfig, accelerator: Accelerator | None = None):
                 lr_scheduler=lr_scheduler if do_step else None,
                 loss_scale=1.0 / cfg.grad_accum_steps,  # Scale loss for accumulation
                 do_step=do_step,
-                use_shared_observation=use_shared_observation,
             )
             step_compute_time += time.perf_counter() - compute_start
 

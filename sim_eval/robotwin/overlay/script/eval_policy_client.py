@@ -17,7 +17,6 @@ import yaml
 from datetime import datetime
 import importlib
 import argparse
-import pdb
 
 from generate_episode_instructions import *
 
@@ -336,7 +335,6 @@ def main(usr_args):
     # Default to 100 successful eps per task; override via --test_num for
     # smoke tests (e.g. 2-3 to validate end-to-end pipeline in ~5 minutes).
     test_num = int(usr_args.get("test_num", 100))
-    topk = 1
     print(f"\033[33m[eval] test_num={test_num}\033[0m")
 
     # model = get_model(usr_args)
@@ -353,8 +351,6 @@ def main(usr_args):
         policy_conda_env=policy_conda_env,
     )
     suc_nums.append(suc_num)
-
-    topk_success_rate = sorted(suc_nums, reverse=True)[:topk]
 
     file_path = os.path.join(save_dir, f"_result.txt")
     with open(file_path, "w") as file:
@@ -416,7 +412,6 @@ def eval_policy(task_name,
     eval_func = eval_function_decorator(policy_name, "eval", conda_env=policy_conda_env)
 
     now_seed = st_seed
-    task_total_reward = 0
     clear_cache_freq = args["clear_cache_freq"]
 
     args["eval_mode"] = True
@@ -548,7 +543,6 @@ def eval_policy(task_name,
             "needs_obs_lat_ms_mean": float(np.mean(ep_needs_obs_lats_ms)) if ep_needs_obs_lats_ms else 0.0,
         })
         all_call_lats_ms.extend(ep_call_lats_ms)
-        # task_total_reward += TASK_ENV.episode_score
         if TASK_ENV.eval_video_path is not None:
             TASK_ENV._del_eval_video_ffmpeg()
 

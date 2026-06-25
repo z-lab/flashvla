@@ -63,13 +63,11 @@ from tqdm import tqdm
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from flashvla.configs.train_config import FlashVLATrainConfig
-from flashvla.datasets.task_filter import get_episode_indices_for_suite
 from flashvla.datasets.flashvla_dataset import (
     FlashVLADataset,
     MultiFlashVLADataset,
     flashvla_collate_fn,
-    make_robotwin_multitask_dataset,
-    make_multi_root_flashvla_dataset,
+    make_robotwin_multitask_flashvla_dataset,
 )
 from flashvla.policies.factory import make_policy, make_pre_post_processors
 
@@ -106,102 +104,7 @@ def make_flashvla_dataset(cfg: FlashVLATrainConfig):
 
     mt_cfg = getattr(cfg, "robotwin_multitask", None)
     if mt_cfg is not None and mt_cfg.enable:
-        from pathlib import Path as _Path
-
-        if mt_cfg.roots:
-            # Explicit leaf roots (e.g. clean + randomized settings of one task);
-            # these define the multi-dataset training set directly.
-            probe_root = _Path(mt_cfg.roots[0]).expanduser()
-            ds_meta = LeRobotDatasetMetadata(
-                repo_id=f"{cfg.dataset.repo_id}_root0",
-                root=probe_root,
-                revision=None,
-            )
-            delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
-            dataset = make_multi_root_flashvla_dataset(
-                repo_id=cfg.dataset.repo_id,
-                roots=mt_cfg.roots,
-                num_buffer_slots=cfg.policy.num_buffer_slots,
-                chunk_size=cfg.policy.chunk_size,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                video_backend=cfg.dataset.video_backend,
-            )
-        else:
-            if not mt_cfg.root:
-                raise ValueError(
-                    "cfg.robotwin_multitask.enable=True requires robotwin_multitask.roots "
-                    "or robotwin_multitask.root to be set"
-                )
-            # config_subdirs (a list, pooling multiple settings per task) takes
-            # precedence over the single config_subdir.
-            config_subdirs = mt_cfg.config_subdirs or [mt_cfg.config_subdir]
-            root_path = _Path(mt_cfg.root).expanduser()
-            if mt_cfg.tasks:
-                probe_task = mt_cfg.tasks[0]
-            else:
-                probe_task = next(
-                    p.name for p in sorted(root_path.iterdir())
-                    if p.is_dir()
-                    and all((p / s / "meta" / "info.json").is_file() for s in config_subdirs)
-                )
-            probe_root = root_path / probe_task / config_subdirs[0]
-            ds_meta = LeRobotDatasetMetadata(
-                repo_id=f"robotwin/{probe_task}_{config_subdirs[0]}",
-                root=probe_root,
-                revision=None,
-            )
-            delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
-            dataset = make_robotwin_multitask_dataset(
-                root=mt_cfg.root,
-                config_subdir=config_subdirs,
-                tasks=mt_cfg.tasks,
-                num_buffer_slots=cfg.policy.num_buffer_slots,
-                chunk_size=cfg.policy.chunk_size,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                video_backend=cfg.dataset.video_backend,
-            )
-
-        # Exact pooled stats override. aggregate_stats() approximates pooled
-        # quantiles by count-weighted averaging, which can deviate from the true
-        # global q01/q99 by a large fraction of the normalization range across the
-        # RoboTwin tasks. The stats_path JSON carries exact global stats; features
-        # present in it replace their aggregated counterparts.
-        if mt_cfg.stats_path:
-            import json as _json
-            from lerobot.datasets.io_utils import cast_stats_to_numpy
-
-            with open(_Path(mt_cfg.stats_path).expanduser()) as f:
-                exact_stats = cast_stats_to_numpy(_json.load(f))
-            dataset.meta.stats.update(exact_stats)
-            logging.info(f"Overrode pooled stats for {sorted(exact_stats)} from {mt_cfg.stats_path}")
-
-        if cfg.dataset.use_imagenet_stats:
-            for key in dataset.meta.camera_keys:
-                for stats_type, stats in IMAGENET_STATS.items():
-                    dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
-
-        return dataset
-
-    # Multi-root path: mix different settings of the same task (e.g. clean + random).
-    # Triggered when cfg.extra_dataset_roots is non-empty.
-    extra_roots = getattr(cfg, "extra_dataset_roots", None) or []
-    if extra_roots:
-        all_roots = [cfg.dataset.root] + list(extra_roots)
-        ds_meta = LeRobotDatasetMetadata(
-            cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
-        )
-        delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
-        dataset = make_multi_root_flashvla_dataset(
-            repo_id=cfg.dataset.repo_id,
-            roots=all_roots,
-            num_buffer_slots=cfg.policy.num_buffer_slots,
-            chunk_size=cfg.policy.chunk_size,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            video_backend=cfg.dataset.video_backend,
-        )
+        dataset = make_robotwin_multitask_flashvla_dataset(cfg, image_transforms=image_transforms)
         if cfg.dataset.use_imagenet_stats:
             for key in dataset.meta.camera_keys:
                 for stats_type, stats in IMAGENET_STATS.items():

@@ -253,14 +253,6 @@ class PI0FlashVLAConfig(PI0Config):
     num_buffer_slots: int = 5      # N = number of slots in buffer
     n_action_steps: int = 10       # Execute one full slot per step
 
-    # Shared-observation time sampling. Same semantics as pi05:
-    #   "per-sample" (PerSeg) — one global t per slot level shared across N configs.
-    #   "per-chunk" — each config independently samples its t (ablation only).
-    # Note: pi0 doesn't share the time_mlp dedup speedup that PerSeg buys for pi05
-    # (time is concat'd with per-token action_emb, no separate time-only MLP path),
-    # but PerSeg still matters for cross-config consistency in shared-obs training.
-    timestep_sample_mode: str = "per-sample"
-
     # Cold-start action source for the N-1 buffer warm-up calls.
     #   "zero_delta"    — postprocessor(action) == 0 (safe for delta-action envs).
     #   "current_state" — postprocessor(action) == current qpos (required for absolute-qpos envs).
