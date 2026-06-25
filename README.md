@@ -23,6 +23,16 @@ This sets up the core FlashVLA environment for training, benchmarking, and
 real-robot deployment. LIBERO and RoboTwin evaluation each need additional,
 simulator-specific setup — see their READMEs under [`sim_eval/`](sim_eval/).
 
+The pi0/pi05 policies load their tokenizer from the gated
+[`google/paligemma-3b-pt-224`](https://huggingface.co/google/paligemma-3b-pt-224)
+(the `lerobot/pi0_base` / `lerobot/pi05_base` checkpoints provide weights but not a
+tokenizer). Accept that model's license on the Hub, then authenticate before
+training or evaluating — otherwise loading a policy fails with a 401 on the gated repo:
+
+```bash
+huggingface-cli login   # token must have access to google/paligemma-3b-pt-224
+```
+
 ## Training
 
 All training runs go through a single launcher, which selects the streaming or
