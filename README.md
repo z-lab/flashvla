@@ -66,8 +66,9 @@ python benchmarks/benchmark_latency.py \
 
 Use `--num_views=1`, `--num_views=2`, or `--num_views=3` to sweep camera views.
 
-## Real-Robot Deployment
+## Real-World Deployment
 
+On the policy server side, you can use the following skeleton.
 ```python
 from flashvla.async_manager import AsyncStreamingActionManager
 
@@ -80,17 +81,30 @@ while running:
     robot.send_action(postprocessor(action)[0].cpu().numpy())
 ```
 
-See [`realworld/README.md`](realworld/README.md) for the full deployment
-contract.
+- `overlap_steps=N` launches the next chunk's inference N control steps before
+  the current chunk runs out; under `compile_model=true` the launch is
+  dispatch-only and the GPU work hides behind robot execution. `0` = synchronous.
+- During the streaming cold start (first `num_buffer_slots - 1` chunks) the
+  manager emits a hold-still action set by `cold_start_mode`: `zero_delta`
+  (zero action; delta-action robots) or `current_state` (current qpos;
+  absolute-position robots — **required** if a zero command would move the arm).
+- `manager.warmup(...)` captures the CUDA graph once off-robot (10–30 s); call
+  `manager.reset()` at each episode boundary to clear the denoise buffer.
 
 ## Acknowledgement
 
 This project builds on [LeRobot](https://github.com/huggingface/lerobot) and
-[RoboTwin](https://github.com/RoboTwin-Platform/RoboTwin).
+[VLASH](https://github.com/mit-han-lab/vlash).
 
 ## Citation
 
-Citation information will be added with the paper release.
+```bibtex
+@article{flashvla2026,
+  title   = {{FlashVLA: Streaming Action Decoding for Fast and Asynchronous VLA Inference}},
+  author  = {Li, Zekai and Tang, Jiaming and Liu, Zhijian},
+  year    = {2026}
+}
+```
 
 ## License
 
