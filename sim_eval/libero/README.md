@@ -12,14 +12,21 @@ creating and activating it (`conda env create -f environment.yml && conda activa
 flashvla`), add the LIBERO extra:
 
 ```bash
-pip uninstall -y cmake        # remove lerobot's broken cmake shim (no-op if absent)
-pip install -e ".[libero]"    # egl_probe now builds with the real cmake
+# egl_probe builds a tiny native extension via cmake. Its CMakeLists predates
+# CMake 4 (declares cmake_minimum_required < 3.5), which CMake 4.x refuses by
+# default — so pass CMAKE_POLICY_VERSION_MINIMUM=3.5 to let the modern cmake
+# (shipped by environment.yml) configure it.
+CMAKE_POLICY_VERSION_MINIMUM=3.5 pip install -e ".[libero]"
 ```
 
-This needs a real `cmake` (>= 3.5) and a C/C++ compiler on PATH. `environment.yml`
-provides them via conda; otherwise install your own (e.g.
-`conda install -c conda-forge cmake make c-compiler cxx-compiler`, or
-`sudo apt install cmake build-essential`).
+This needs a `cmake` and a C/C++ compiler on PATH; `environment.yml` provides
+them via conda (otherwise `conda install -c conda-forge cmake make c-compiler
+cxx-compiler`, or `sudo apt install cmake build-essential`).
+
+> Do **not** `pip uninstall cmake`: the conda `cmake` and lerobot's PyPI `cmake`
+> dependency share the same `$CONDA_PREFIX/bin/cmake`, so uninstalling the pip
+> one deletes the binary entirely and the build then fails with
+> `RuntimeError: CMake must be installed`.
 
 Headless rendering needs EGL:
 

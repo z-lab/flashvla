@@ -19,8 +19,8 @@ dataset:
 # Training parameters
 output_dir: pi05_baseline_libero
 job_name: pi05_baseline_libero
-batch_size: 16
-grad_accum_steps: 2
+batch_size: 8
+grad_accum_steps: 4
 steps: 50000
 num_workers: 4
 seed: 1000

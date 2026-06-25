@@ -17,6 +17,14 @@ dependencies:
   # 0.9.1 ships decoders for FFmpeg 4–8, and the env's python rpath ($ORIGIN/
   # ../lib) lets it find these conda libs with no LD_LIBRARY_PATH needed.
   - ffmpeg=7.*
+  # torchcodec's CUDA decoder also dlopens NVIDIA NPP (libnppicc.so.12) for
+  # color conversion. torch's cu128 wheels bundle cublas/cudnn/etc. but NOT NPP,
+  # so without this `import torchcodec` fails with "Could not load libtorchcodec".
+  # Install it from conda-forge into $ENV/lib so it's found via the same python
+  # rpath as ffmpeg (no LD_LIBRARY_PATH). MUST be the CUDA-12 series (soname
+  # .so.12) — conda-forge's default `libnpp` is now 13.x (CUDA 13), which does
+  # NOT satisfy torchcodec; hence the 12.* pin.
+  - libnpp=12.*
   - pip
   - pip:
       # Match the validated local conda stack.
@@ -30,6 +38,10 @@ dependencies:
       # c10 ABI → "undefined symbol c10::..." at import). 0.5 (the obvious pin)
       # is built for torch 2.7 and crashes; >=0.10 needs FFmpeg 8 / newer torch.
       - torchcodec==0.9.1+cu128
+      # h5py: RoboTwin's raw 2.0 dataset is HDF5, so the one-click data pipeline
+      # (sim_eval/robotwin/robotwin_pipeline/scripts/convert_robotwin_to_lerobot.py)
+      # imports it. Not pulled in by torch/lerobot, so add it explicitly.
+      - h5py
       # Core FlashVLA library (training, benchmarking, RoboTwin server, real
       # robot). For LIBERO evaluation, add the `[libero]` extra afterwards —
       # see sim_eval/libero/README.md.

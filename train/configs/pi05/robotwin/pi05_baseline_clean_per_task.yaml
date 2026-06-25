@@ -22,8 +22,8 @@ dataset:
 # Training parameters
 output_dir: pi05_baseline_clean_per_task/per_task_placeholder
 job_name: pi05_baseline_clean
-batch_size: 16
-grad_accum_steps: 1
+batch_size: 8
+grad_accum_steps: 2
 steps: 10000
 num_workers: 4
 seed: 1000
