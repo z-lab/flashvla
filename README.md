@@ -1,6 +1,6 @@
 # FlashVLA: Streaming Action Decoding for Fast and Asynchronous VLA Inference
 
-**Paper** | **Blog**
+**Paper** | **Blog** | [**Models**](https://huggingface.co/z-lab)
 
 **FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution.
 
@@ -10,7 +10,7 @@
   </a>
 </p>
 
-## Installation
+## Install
 
 ```bash
 git clone https://github.com/z-lab/flashvla.git
@@ -19,87 +19,105 @@ conda env create -f environment.yml
 conda activate flashvla
 ```
 
-This sets up the core FlashVLA environment for training, benchmarking, and
-real-robot deployment. LIBERO and RoboTwin evaluation each need additional,
-simulator-specific setup — see their READMEs under [`sim_eval/`](sim_eval/).
+This installs the core FlashVLA env for training, benchmarking, and real-robot
+deployment. LIBERO and RoboTwin evaluation each need extra, simulator-specific
+setup — see their READMEs under [`sim_eval/`](sim_eval/).
 
-The pi0/pi05 policies load their tokenizer from the gated
-[`google/paligemma-3b-pt-224`](https://huggingface.co/google/paligemma-3b-pt-224)
-(the `lerobot/pi0_base` / `lerobot/pi05_base` checkpoints provide weights but not a
-tokenizer). Accept that model's license on the Hub, then authenticate before
-training or evaluating — otherwise loading a policy fails with a 401 on the gated repo:
+The pi0 / pi0.5 policies load their tokenizer from the gated
+[`google/paligemma-3b-pt-224`](https://huggingface.co/google/paligemma-3b-pt-224),
+so authenticate before training or evaluating (otherwise loading fails with a 401):
 
 ```bash
 huggingface-cli login   # token must have access to google/paligemma-3b-pt-224
 ```
 
-## Training
+## Evaluation
 
-All training runs go through a single launcher, which selects the streaming or
-baseline trainer from the config's policy type and handles single- or multi-GPU:
+Evaluate the released FlashVLA pi0.5 checkpoints —
+[`z-lab/flashvla-pi05-libero`](https://huggingface.co/z-lab/flashvla-pi05-libero)
+and [`z-lab/flashvla-pi05-robotwin`](https://huggingface.co/z-lab/flashvla-pi05-robotwin)
+— with async chunk-overlap inference. On LIBERO:
 
 ```bash
-# single GPU
-bash train/train.sh train/configs/pi05/libero/pi05_flashvla.yaml
-
-# multi-GPU (e.g. 4 GPUs)
-bash train/train.sh train/configs/pi05/libero/pi05_flashvla.yaml 4
-
-# baseline policy (same launcher, picks the baseline trainer)
-bash train/train.sh train/configs/pi05/libero/pi05_baseline.yaml
+bash sim_eval/libero/eval.sh
 ```
 
-Configs live under [`train/configs/`](train/configs/) — pi0.5 and pi0, on LIBERO
-and RoboTwin, in FlashVLA and baseline variants. For RoboTwin, point the launcher
-at e.g.
-[`train/configs/pi05/robotwin/pi05_flashvla_clean_per_task.yaml`](train/configs/pi05/robotwin/pi05_flashvla_clean_per_task.yaml).
+See [`sim_eval/libero/`](sim_eval/libero/) and [`sim_eval/robotwin/`](sim_eval/robotwin/)
+for per-simulator setup and the full evaluation (single run, multi-seed sweeps,
+and the RoboTwin server/client).
 
-## Evaluate on LIBERO
+## Performance
 
-See [`sim_eval/libero/`](sim_eval/libero/) for the LIBERO environment setup and
-how to launch single-run and full-sweep evaluation.
+π0.5 vs. **+ FlashVLA** (**bold** = the better result). `d` is the async step delay:
+`d=0` is synchronous, `d≥1` overlaps the next chunk's inference with robot execution.
 
-## Evaluate on RoboTwin
+### LIBERO
 
-See [`sim_eval/robotwin/`](sim_eval/robotwin/) for the RoboTwin setup and the
-server/client evaluation.
+Success rate (%) + per-step latency (averaged over 2,000 episodes):
+
+| Method | Spatial | Object | Goal | Long | Avg | Time/Step (ms) |
+|:--|:--:|:--:|:--:|:--:|:--:|:--:|
+| π0.5 | **98.8** | 98.2 | **98.0** | 92.4 | 96.9 | 53.8 |
+| **+ FlashVLA** (`d=0`) | 98.6 | 99.0 | 97.8 | **96.2** | **97.9** (↑1.0) | – |
+| **+ FlashVLA** (`d=1`) | 96.0 | **99.6** | 96.4 | 96.0 | 97.0 (↑0.1) | **29.4** (1.83×) |
+
+### RoboTwin 2.0
+
+50-task multitask success rate (%) — `d=0` synchronous, `d=1`/`d=2` asynchronous:
+
+| Method | Clean | Random | Avg |
+|:--|:--:|:--:|:--:|
+| π0.5 | 82.74 | 76.76 | 79.75 |
+| **+ FlashVLA** (`d=0`) | 90.64 (↑7.90) | 90.06 (↑13.30) | 90.35 (↑10.60) |
+| **+ FlashVLA** (`d=1`) | **91.14** (↑8.40) | **90.60** (↑13.84) | **90.87** (↑11.12) |
+| **+ FlashVLA** (`d=2`) | 90.20 (↑7.46) | 89.66 (↑12.90) | 89.93 (↑10.18) |
 
 ## Latency Benchmark
 
-```bash
-python benchmarks/benchmark_latency.py \
-  --config_path=benchmarks/configs/latency_flashvla.yaml
+Per-action inference latency is measured with `benchmarks/benchmark_latency.py`:
 
-python benchmarks/benchmark_latency.py \
-  --config_path=benchmarks/configs/latency_baseline.yaml
+```bash
+python benchmarks/benchmark_latency.py --config_path=benchmarks/configs/latency_flashvla.yaml   # FlashVLA
+python benchmarks/benchmark_latency.py --config_path=benchmarks/configs/latency_baseline.yaml   # baseline (π0.5)
 ```
 
 Use `--num_views=1`, `--num_views=2`, or `--num_views=3` to sweep camera views.
 
-## Real-World Deployment
+Per-action latency (ms) on RTX 4090 / 5090 with 2 and 3 camera views (π0.5 uses PyTorch max-autotune):
 
-On the policy server side, you can use the following skeleton.
-```python
-from flashvla.async_manager import AsyncStreamingActionManager
+| Method | RTX 4090 (2 views) | RTX 4090 (3 views) | RTX 5090 (2 views) | RTX 5090 (3 views) |
+|:--|:--:|:--:|:--:|:--:|
+| π0.5 | 46.1 | 56.1 | 37.5 | 45.4 |
+| **+ FlashVLA** | **26.7** | **36.8** | **20.3** | **27.1** |
 
-manager = AsyncStreamingActionManager(policy, overlap_steps=1)
-manager.warmup(preprocessor(first_obs))
-manager.reset()
+## Training
 
-while running:
-    action = manager.act(preprocessor(obs))
-    robot.send_action(postprocessor(action)[0].cpu().numpy())
+All training goes through one multi-GPU launcher —
+`bash train/train.sh <config> <num_gpus>` (replace `8` below with your GPU count).
+
+**LIBERO:**
+
+```bash
+bash train/train.sh train/configs/pi05/libero/pi05_flashvla.yaml 8
 ```
 
-- `overlap_steps=N` launches the next chunk's inference N control steps before
-  the current chunk runs out; under `compile_model=true` the launch is
-  dispatch-only and the GPU work hides behind robot execution. `0` = synchronous.
-- During the streaming cold start (first `num_buffer_slots - 1` chunks) the
-  manager emits a hold-still action set by `cold_start_mode`: `zero_delta`
-  (zero action; delta-action robots) or `current_state` (current qpos;
-  absolute-position robots — **required** if a zero command would move the arm).
-- `manager.warmup(...)` captures the CUDA graph once off-robot (10–30 s); call
-  `manager.reset()` at each episode boundary to clear the denoise buffer.
+**RoboTwin** — first build the LeRobot-format training dataset
+(see [Building the training dataset](sim_eval/robotwin/README.md#building-the-training-dataset)),
+then:
+
+```bash
+bash train/train.sh train/configs/pi05/robotwin/pi05_flashvla_clean_merged_multitask.yaml 8
+```
+
+Multi-GPU training defaults to DDP. For large models or to save memory, enable
+FSDP2 bf16 mixed precision by adding an `fsdp` block to the config (numerically
+sensitive modules such as RMSNorm stay in fp32):
+
+```yaml
+fsdp:
+  enable: true
+  mixed_precision: bf16
+```
 
 ## Acknowledgement
 

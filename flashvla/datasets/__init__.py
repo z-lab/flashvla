@@ -19,7 +19,6 @@ lerobot v2.1/v3.0 formats. The compat module is imported first to patch lerobot
 before other imports.
 """
 
-# Apply compatibility patches for lerobot v2.1/v3.0 before importing anything else
 import flashvla.datasets.compat  # noqa: F401
 
 from flashvla.datasets.flashvla_dataset import FlashVLADataset, flashvla_collate_fn

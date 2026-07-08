@@ -53,11 +53,9 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device) -> torch.dtyp
     if isinstance(device, torch.device):
         device = device.type
         
-    # MPS doesn't support float64
     if device == "mps" and dtype == torch.float64:
         return torch.float32
     
-    # Some Intel XPU devices lack FP64
     if device == "xpu" and dtype == torch.float64:
         if hasattr(torch.xpu, "get_device_capability"):
             device_capability = torch.xpu.get_device_capability()
@@ -74,17 +72,6 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device) -> torch.dtyp
         return dtype
 
 
-# ============================================================
-# Cold-start helpers for FlashVLA inference
-# ============================================================
-#
-# Action streaming fills a rolling denoise buffer over the first
-# (N-1) inference calls. During this window no real action can be
-# produced yet, so the policy must return a "hold the robot still"
-# action in whatever space the env expects. The helpers below keep
-# all normalization math out of the modeling file — the policy only
-# needs to load a :class:`ColdStartStats` once and call
-# :func:`compute_cold_start_action` per inference.
 
 
 @dataclass
@@ -99,9 +86,6 @@ class ColdStartStats:
     ``{action,state}_{q01,q99}``. Fields for the unused mode stay ``None``.
     """
 
-    # Normalization mode as it appears in policy_postprocessor.json's norm_map.
-    # Supported: "MEAN_STD", "QUANTILES". Unknown modes fall back to MEAN_STD
-    # with a warning.
     action_norm_mode: str = "MEAN_STD"
     state_norm_mode: str = "MEAN_STD"
 
@@ -180,8 +164,6 @@ def load_cold_start_stats(checkpoint_dir: str | Path) -> ColdStartStats:
         state_norm_mode=_mode_for("STATE"),
     )
 
-    # Load whichever pair of stats the declared mode needs; fall back to
-    # whatever else is available so downstream can still attempt best-effort.
     def _maybe(key: str) -> Tensor | None:
         return raw[key] if key in raw else None
 
@@ -194,7 +176,6 @@ def load_cold_start_stats(checkpoint_dir: str | Path) -> ColdStartStats:
     out.state_q01 = _maybe("observation.state.q01")
     out.state_q99 = _maybe("observation.state.q99")
 
-    # Sanity check: warn if the declared mode's stats are missing.
     if out.action_norm_mode == "QUANTILES" and (out.action_q01 is None or out.action_q99 is None):
         logging.warning(f"action.q01/q99 missing in {stats_file} despite QUANTILES mode.")
     if out.action_norm_mode == "MEAN_STD" and (out.action_mean is None or out.action_std is None):
@@ -267,7 +248,6 @@ def compute_normalized_current_state_action(
         )
         return state
 
-    # (1) state_normalized → unnormalize with state stats → real qpos
     if stats.has_state:
         if stats.state_norm_mode == "QUANTILES":
             s_q01 = stats.state_q01[:action_dim].to(device=device, dtype=torch.float32)
@@ -278,10 +258,8 @@ def compute_normalized_current_state_action(
             s_std = stats.state_std[:action_dim].to(device=device, dtype=torch.float32).clamp(min=1e-8)
             state_real = state * s_std + s_mean
     else:
-        # No state stats — assume state is already in real units.
         state_real = state
 
-    # (2) real qpos → renormalize with action stats → fake action
     if stats.action_norm_mode == "QUANTILES":
         a_q01 = stats.action_q01[:action_dim].to(device=device, dtype=torch.float32)
         a_q99 = stats.action_q99[:action_dim].to(device=device, dtype=torch.float32)
@@ -331,9 +309,6 @@ def compute_cold_start_action(
     raise ValueError(f"Unknown cold_start_mode: {mode!r}")
 
 
-# ============================================================
-# Flow matching helpers
-# ============================================================
 
 
 def create_sinusoidal_pos_embedding(
@@ -373,14 +348,11 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    # Use float64 for precision, with device compatibility fallback
     dtype = get_safe_dtype(torch.float64, device.type)
     
-    # Create log-spaced frequencies from min to max period
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute sinusoidal embedding
     scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, :] * time[:, None]
     pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
@@ -415,9 +387,9 @@ def create_sinusoidal_pos_embedding_for_blocks(
         
     Returns:
         Positional embeddings [batch_size, num_blocks * block_size, dimension].
-        
+
     Raises:
-        ValueError: If dimension is odd or time is not 1D.
+        ValueError: If dimension is odd or time is not 2D.
     """
     if dimension % 2 != 0:
         raise ValueError(f"dimension ({dimension}) must be divisible by 2")
@@ -425,14 +397,11 @@ def create_sinusoidal_pos_embedding_for_blocks(
     if time.ndim != 2:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, num_blocks * block_size)`.")
 
-    # Use float64 for precision, with device compatibility fallback
     dtype = get_safe_dtype(torch.float64, device.type)
     
-    # Create log-spaced frequencies from min to max period
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute sinusoidal embedding
     scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, None, :] * time[:, :, None]
     pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=2)
@@ -503,27 +472,22 @@ def build_attention_mask_and_position_ids(
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
-    # Build block-causal mask: token i can attend to j if cumsum[j] <= cumsum[i]
     cumsum = torch.cumsum(att_masks, dim=1)
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
 
-    # Combine with padding mask
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
-    att_2d_masks = att_2d_masks & pad_2d_masks  # [B, N, N] bool
+    att_2d_masks = att_2d_masks & pad_2d_masks
 
-    # Position IDs: cumulative count of non-padding tokens
-    position_ids = torch.cumsum(pad_masks, dim=1) - 1  # [B, N]
+    position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-    # Convert to additive mask format (0 for attend, -inf for block)
     mask_value = torch.finfo(dtype).min
     attention_mask = torch.where(
         att_2d_masks,
         torch.zeros_like(att_2d_masks, dtype=dtype),
         torch.full_like(att_2d_masks, mask_value, dtype=dtype),
     )
-    attention_mask = attention_mask.unsqueeze(1)  # [B, 1, N, N]
+    attention_mask = attention_mask.unsqueeze(1)
 
-    # Extend kv dimension for StaticCache's unfilled future slots
     if extra_kv_length > 0:
         bsz, _, q_len, _ = attention_mask.shape
         extra = torch.full(
@@ -534,11 +498,11 @@ def build_attention_mask_and_position_ids(
         )
         attention_mask = torch.cat([attention_mask, extra], dim=-1)
 
-        last_token_position = position_ids[:, -1:]  # [B, 1] — preserve 2D for broadcasting
+        last_token_position = position_ids[:, -1:]
         extra_position_ids = last_token_position + torch.arange(
             1, extra_kv_length + 1, device=position_ids.device
-        )  # [B, 1] + [E] → [B, E]
-        position_ids = torch.cat([position_ids, extra_position_ids], dim=1)  # [B, N+E]
+        )
+        position_ids = torch.cat([position_ids, extra_position_ids], dim=1)
 
     return attention_mask, position_ids
 
@@ -572,7 +536,6 @@ def resize_with_pad(
 
     cur_height, cur_width = img.shape[2:]
 
-    # Scale to fit within target dimensions
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)
@@ -581,7 +544,6 @@ def resize_with_pad(
         img, size=(resized_height, resized_width), mode="bilinear", align_corners=False
     )
 
-    # Pad to reach exact target size (pad left and top)
     pad_height = max(0, int(height - resized_height))
     pad_width = max(0, int(width - resized_width))
     padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
@@ -623,75 +585,50 @@ def build_shared_obs_attention_mask_and_position_ids(
     device = prefix_pad_masks.device
     mask_value = torch.finfo(dtype).min
     
-    # Build combined pad_masks and att_masks for the full sequence (vectorized)
-    # Suffix is repeated for each offset
     full_pad_masks = torch.zeros(batch_size, total_length, dtype=torch.bool, device=device)
     full_att_masks = torch.zeros(batch_size, total_length, dtype=prefix_att_masks.dtype, device=device)
     
-    # Prefix part
     full_pad_masks[:, :prefix_length] = prefix_pad_masks
     full_att_masks[:, :prefix_length] = prefix_att_masks
     
-    # Suffix parts: tile suffix masks for all offsets at once
-    # [B, suffix_length] -> [B, num_offsets * suffix_length]
     suffix_pad_tiled = suffix_pad_masks.unsqueeze(1).expand(-1, num_offsets, -1).reshape(batch_size, -1)
     suffix_att_tiled = suffix_att_masks.unsqueeze(1).expand(-1, num_offsets, -1).reshape(batch_size, -1)
     full_pad_masks[:, prefix_length:] = suffix_pad_tiled
     full_att_masks[:, prefix_length:] = suffix_att_tiled
     
-    # Compute cumsum for block-causal structure
     cumsum = torch.cumsum(full_att_masks, dim=1)
     
-    # Build the base 2D attention mask using cumsum logic
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
     
-    # Apply padding mask
     pad_2d_masks = full_pad_masks[:, None, :] * full_pad_masks[:, :, None]
     att_2d_masks = att_2d_masks & pad_2d_masks
     
-    # Block cross-offset attention (vectorized)
-    # Create a mask that blocks attention between different offset branches
-    # For positions in suffix, determine which offset they belong to
     suffix_positions = torch.arange(num_offsets * suffix_length, device=device)
-    offset_ids = suffix_positions // suffix_length  # [num_offsets * suffix_length]
+    offset_ids = suffix_positions // suffix_length
     
-    # Create cross-offset blocking mask for suffix-to-suffix attention
-    # query_offset != key_offset should be blocked
-    query_offset_ids = offset_ids.unsqueeze(1)  # [S, 1]
-    key_offset_ids = offset_ids.unsqueeze(0)    # [1, S]
-    cross_offset_mask = (query_offset_ids == key_offset_ids)  # [S, S], True where same offset
+    query_offset_ids = offset_ids.unsqueeze(1)
+    key_offset_ids = offset_ids.unsqueeze(0)
+    cross_offset_mask = (query_offset_ids == key_offset_ids)
     
-    # Apply to the suffix-suffix part of att_2d_masks
     suffix_start = prefix_length
     att_2d_masks[:, suffix_start:, suffix_start:] = att_2d_masks[:, suffix_start:, suffix_start:] & cross_offset_mask
     
-    # Apply offset_mask (vectorized): invalid offsets should be fully masked
-    # Create per-position validity mask from offset_mask [B, num_offsets] -> [B, num_offsets * suffix_length]
-    offset_validity = offset_mask.unsqueeze(2).expand(-1, -1, suffix_length).reshape(batch_size, -1)  # [B, S]
+    offset_validity = offset_mask.unsqueeze(2).expand(-1, -1, suffix_length).reshape(batch_size, -1)
     
-    # Mask out invalid offset positions in att_2d_masks
-    # Invalid queries can't attend to anything
     att_2d_masks[:, suffix_start:, :] = att_2d_masks[:, suffix_start:, :] & offset_validity.unsqueeze(2)
-    # Nothing can attend to invalid keys
     att_2d_masks[:, :, suffix_start:] = att_2d_masks[:, :, suffix_start:] & offset_validity.unsqueeze(1)
     
-    # Compute position IDs (vectorized)
     position_ids = torch.zeros(batch_size, total_length, dtype=torch.long, device=device)
     
-    # Prefix position IDs
     prefix_pos = torch.cumsum(prefix_pad_masks.long(), dim=1) - 1
     position_ids[:, :prefix_length] = prefix_pos
     
-    # Get the last valid prefix position for each batch
-    last_prefix_pos = prefix_pos[:, -1]  # [B]
+    last_prefix_pos = prefix_pos[:, -1]
     
-    # Suffix position IDs: each branch continues from last_prefix_pos + 1
-    # Tile suffix positions for all offsets: [B, suffix_length] -> [B, num_offsets * suffix_length]
-    suffix_pos_base = torch.cumsum(suffix_pad_masks.long(), dim=1)  # [B, suffix_length]
+    suffix_pos_base = torch.cumsum(suffix_pad_masks.long(), dim=1)
     suffix_pos_tiled = suffix_pos_base.unsqueeze(1).expand(-1, num_offsets, -1).reshape(batch_size, -1)
     position_ids[:, prefix_length:] = last_prefix_pos[:, None] + suffix_pos_tiled
     
-    # Convert to additive mask
     attention_mask = torch.where(
         att_2d_masks,
         torch.zeros_like(att_2d_masks, dtype=dtype),

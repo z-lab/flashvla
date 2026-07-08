@@ -28,7 +28,6 @@ Buffer states during cold start (0=cleanest, 4=noisiest, P=padding):
   Step 5+: steady state streaming (single denoise step per call)
 """
 import builtins
-import logging
 import math
 import os
 from collections import deque
@@ -60,8 +59,6 @@ from flashvla.layers.linear import QKVLinear, MergedColumnLinear
 from flashvla.layers.rope import RotaryEmbedding
 
 
-# torch.compile / dynamo can't trace cuda.Event ops; wrap them in a
-# disabled function so compiled sample_actions still works under profile=True.
 @torch._dynamo.disable
 def _ev_record(ev):
     ev.record()
@@ -76,7 +73,6 @@ def _ev_elapsed_ms(start, end):
 def _cuda_sync():
     torch.cuda.synchronize()
 
-logger = logging.getLogger(__name__)
 
 def _rope_theta(text_cfg) -> float:
     """RoPE base frequency (config.rope_theta or config.rope_parameters)."""
@@ -87,9 +83,6 @@ def _rope_theta(text_cfg) -> float:
 
 
 
-# ============================================================
-# Reused classes (identical structure to baseline modeling_pi05.py)
-# ============================================================
 
 class PI05PrefixEmbedder(nn.Module):
     """Embed images and language tokens into prefix sequence."""
@@ -97,7 +90,6 @@ class PI05PrefixEmbedder(nn.Module):
     def __init__(self, config: PI05FlashVLAConfig, vlm: PaliGemmaForConditionalGeneration):
         super().__init__()
         self.config = config
-        # Held in a list so it is not registered as a submodule.
         self._paligemma_model = [vlm.model]
         self.lang_embedder = vlm.language_model.embed_tokens
 
@@ -109,8 +101,6 @@ class PI05PrefixEmbedder(nn.Module):
 
         for img, img_mask in zip(images, img_masks, strict=True):
             pg = self._paligemma_model[0]
-            # Run the SigLIP tower directly and use the unscaled projector
-            # output. Cast the float32 input embeddings to the encoder dtype.
             vt = pg.vision_tower.vision_model
             hidden = vt.embeddings(img)
             enc_dtype = vt.encoder.layers[0].self_attn.q_proj.weight.dtype
@@ -232,9 +222,6 @@ class PI05MLP(nn.Module):
         return outputs
 
 
-# ============================================================
-# Suffix embedder and layer classes
-# ============================================================
 
 class PI05SuffixEmbedder(nn.Module):
     """Embed noisy actions with per-token time conditioning for FlashVLA.
@@ -250,14 +237,11 @@ class PI05SuffixEmbedder(nn.Module):
         self.N = config.num_buffer_slots
         self.C = config.chunk_size
 
-        # Action projection
         self.action_in_proj = nn.Linear(config.max_action_dim, config.action_expert_config.hidden_size)
 
-        # Time MLP for flow matching timestep
         self.time_mlp_in = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
         self.time_mlp_out = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
 
-        # Optional state conditioning MLP
         if config.state_cond:
             self.state_proj = nn.Linear(config.max_state_dim, config.action_expert_config.hidden_size)
             self.state_mlp_in = nn.Linear(config.action_expert_config.hidden_size, config.action_expert_config.hidden_size)
@@ -307,7 +291,7 @@ class PI05SuffixEmbedder(nn.Module):
 
         adarms_cond = time_emb
 
-        suffix_embs = self.action_in_proj(noisy_actions)  # [B, L, D]
+        suffix_embs = self.action_in_proj(noisy_actions)
 
         if self.config.state_cond:
             if self.state_proj.weight.dtype == torch.float32:
@@ -319,10 +303,9 @@ class PI05SuffixEmbedder(nn.Module):
             state_emb = F.silu(state_emb)
             adarms_cond = adarms_cond + state_emb.unsqueeze(1)
 
-        # Block-causal: mark first token of each slot as boundary
         att_row = torch.zeros(num_slots, C, dtype=suffix_embs.dtype, device=device)
         att_row[:, 0] = 1
-        att_masks = att_row.flatten(0, 1).unsqueeze(0).expand(bsz, -1)  # [B, L]
+        att_masks = att_row.flatten(0, 1).unsqueeze(0).expand(bsz, -1)
 
         pad_masks = torch.ones(bsz, L, dtype=torch.bool, device=device)
 
@@ -409,54 +392,43 @@ class PI05ModelLayer(PI05ModelLayer):
         hidden_states,
         attention_mask,
         position_ids,
-        suffix_adarms_conds,  # [B, num_offsets, suffix_length, D] -- per-token
+        suffix_adarms_conds,
         num_offsets: int,
         suffix_length: int,
         use_cache: bool = False,
     ):
         batch_size = hidden_states[0].shape[0]
 
-        # ============ Pre-attention layernorm ============
         residuals = [hs.clone() if hs is not None else None for hs in hidden_states]
         gates = []
 
-        # Prefix: VLM layernorm without conditioning
         prefix = hidden_states[0]
         prefix_normed, prefix_gate = self.input_layernorm[0](prefix, cond=None)
         hidden_states[0] = prefix_normed
         gates.append(prefix_gate)
 
-        # Suffix: per-token conditioning (parallelized)
-        # Reshape: [B, num_offsets * suffix_length, D] -> [B * num_offsets, suffix_length, D]
         suffix = hidden_states[1]
         hidden_dim = suffix.shape[-1]
         suffix_flat = suffix.view(batch_size * num_offsets, suffix_length, hidden_dim)
 
-        # Reshape per-token cond: [B, num_offsets, suffix_length, D] -> [B * num_offsets, suffix_length, D]
         cond_flat = suffix_adarms_conds.view(batch_size * num_offsets, suffix_length, -1) if suffix_adarms_conds is not None else None
 
         suffix_normed_flat, suffix_gate_flat = self.input_layernorm[1](suffix_flat, cond=cond_flat)
 
-        # Reshape back
         suffix_normed = suffix_normed_flat.view(batch_size, num_offsets * suffix_length, hidden_dim)
         hidden_states[1] = suffix_normed
 
-        # Gate is already per-token [B * num_offsets, suffix_length, D]
-        # Reshape to [B, num_offsets * suffix_length, D]
         suffix_gates = suffix_gate_flat.view(batch_size, num_offsets * suffix_length, -1)
         gates.append(suffix_gates)
 
-        # ============ Self-attention ============
         hidden_states = self.self_attn(hidden_states, attention_mask, position_ids, use_cache=use_cache)
 
-        # ============ Gated residual connection ============
         for i in range(len(hidden_states)):
             hs = hidden_states[i]
             if hs is None:
                 continue
             hidden_states[i] = _gated_residual(residuals[i], hs, gates[i])
 
-        # ============ Pre-MLP layernorm ============
         residuals = [hs.clone() if hs is not None else None for hs in hidden_states]
         gates = []
 
@@ -478,10 +450,8 @@ class PI05ModelLayer(PI05ModelLayer):
         suffix_gates = suffix_gate_flat.view(batch_size, num_offsets * suffix_length, -1)
         gates.append(suffix_gates)
 
-        # ============ MLP ============
         hidden_states = self.mlp(hidden_states)
 
-        # ============ Gated residual connection ============
         for i in range(len(hidden_states)):
             hs = hidden_states[i]
             if hs is None:
@@ -491,9 +461,6 @@ class PI05ModelLayer(PI05ModelLayer):
         return hidden_states
 
 
-# ============================================================
-# Core Model
-# ============================================================
 
 class PI05FlashVLAModel(nn.Module):
     """Core model for FlashVLA with padded cold start."""
@@ -504,18 +471,13 @@ class PI05FlashVLAModel(nn.Module):
         self.N = config.num_buffer_slots
         self.C = config.chunk_size
 
-        # Initialize backbone models
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
 
-        # Note: patch_for_torch_compile is called after weight loading in from_pretrained,
-        # because the patched GemmaAttention fuses q/k/v proj which changes state_dict keys.
 
-        # Embedders
         self.prefix_embedder = PI05PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI05SuffixEmbedder(config)
 
-        # Shared transformer layers with per-token adaRMS
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
             PI05ModelLayer(
@@ -526,17 +488,10 @@ class PI05FlashVLAModel(nn.Module):
             for i in range(num_hidden_layers)
         ])
 
-        # Output projection
         self.action_out_proj = nn.Linear(config.action_expert_config.hidden_size, config.max_action_dim)
 
-        # Convert to bfloat16 for efficiency
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
 
-        # Persistent 0-d int64 tensor holding the current cold-start step. By
-        # passing the SAME tensor (fixed memory address) into _cold_start and
-        # in-place updating with .fill_() each call, dynamo+cudagraphs can
-        # capture ONE graph that handles every step_counter value via tensor
-        # arithmetic — instead of N-1 specialized graphs.
         self.register_buffer(
             "_cold_step_t",
             torch.zeros((), dtype=torch.int64),
@@ -545,12 +500,6 @@ class PI05FlashVLAModel(nn.Module):
 
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
-            # Both branches compiled. _cold_start uses a persistent 0-d tensor
-            # for step_counter (see _cold_step_t above) so dynamo produces a
-            # single graph instead of recompiling per int value. With dynamic
-            # ints, cudagraphs would skip capture (~300ms/call); with the
-            # fixed-address tensor input, cudagraph trees can capture once
-            # and replay across all N-1 cold-start calls per episode.
             self._steady_streaming = torch.compile(self._steady_streaming, mode=config.compile_mode)
             self._cold_start = torch.compile(self._cold_start, mode=config.compile_mode)
 
@@ -560,15 +509,11 @@ class PI05FlashVLAModel(nn.Module):
         self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
 
     def backbone_dtype(self):
-        # bf16 compute dtype from a Linear that survives mlp fusion (only
-        # gate_proj/up_proj deleted) AND detach_backbone_layer_aliases. Do NOT
-        # read a layernorm weight: FlashVLA keeps layernorms float32.
         return self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype
 
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
         modules = [self.vlm, self.action_expert]
         params_to_keep_float32 = [
-            # Keep the vision input embeddings, layernorms, and final norm in float32.
             "vision_tower.vision_model.embeddings.patch_embedding.weight",
             "vision_tower.vision_model.embeddings.patch_embedding.bias",
             "vision_tower.vision_model.embeddings.position_embedding.weight",
@@ -669,13 +614,10 @@ class PI05FlashVLAModel(nn.Module):
             self.config.time_sampling_beta_beta, device=device, dtype=torch.float32,
         )
         beta_dist = torch.distributions.Beta(concentration1=alpha, concentration0=beta)
-        # Sample one Beta per (B, config, slot) — independent across configs.
         samples = beta_dist.sample(
             (batch_size, N, num_slots_per_config),
         ).to(device=device, dtype=torch.float32)
 
-        # Build static segment-start matrix and is_real mask
-        # shared across batch elements.
         seg_start = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.float32)
         is_real = torch.zeros(N, num_slots_per_config, device=device, dtype=torch.bool)
         for k_idx in range(N):
@@ -684,7 +626,6 @@ class PI05FlashVLAModel(nn.Module):
                 seg_start[k_idx, i] = (N - num_real + i) / N
                 is_real[k_idx, i] = True
 
-        # time = seg_start + sample/N, then scale+offset; padding=1.
         time_per_slot = seg_start[None, :, :] + samples / N
         time_per_slot = (
             time_per_slot * self.config.time_sampling_scale
@@ -693,7 +634,6 @@ class PI05FlashVLAModel(nn.Module):
         time_per_slot = torch.where(
             is_real[None, :, :], time_per_slot, torch.ones_like(time_per_slot),
         )
-        # [B, N, num_slots_per_config] → expand to per-token [B, N*S*C]
         time_per_token = (
             time_per_slot.unsqueeze(-1)
             .expand(-1, -1, -1, C)
@@ -731,7 +671,6 @@ class PI05FlashVLAModel(nn.Module):
         device = prefix_pad_masks.device
         mask_value = torch.finfo(dtype).min
 
-        # Build full pad_masks with per-offset suffix padding
         full_pad_masks = torch.zeros(batch_size, total_length, dtype=torch.bool, device=device)
         full_att_masks = torch.zeros(batch_size, total_length, dtype=prefix_att_masks.dtype, device=device)
 
@@ -744,22 +683,18 @@ class PI05FlashVLAModel(nn.Module):
         full_pad_masks[:, prefix_length:] = suffix_pad_tiled
         full_att_masks[:, prefix_length:] = suffix_att_tiled
 
-        # Block-causal via cumsum
         cumsum = torch.cumsum(full_att_masks, dim=1)
         att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
 
-        # Apply padding
         pad_2d_masks = full_pad_masks[:, None, :] & full_pad_masks[:, :, None]
         att_2d_masks = att_2d_masks & pad_2d_masks
 
-        # Block cross-offset attention in suffix
         suffix_positions = torch.arange(num_offsets * suffix_length, device=device)
         offset_ids = suffix_positions // suffix_length
         cross_offset_mask = offset_ids.unsqueeze(1) == offset_ids.unsqueeze(0)
         suffix_start = prefix_length
         att_2d_masks[:, suffix_start:, suffix_start:] = att_2d_masks[:, suffix_start:, suffix_start:] & cross_offset_mask
 
-        # Position IDs
         position_ids = torch.zeros(batch_size, total_length, dtype=torch.long, device=device)
         prefix_pos = torch.cumsum(prefix_pad_masks.long(), dim=1) - 1
         position_ids[:, :prefix_length] = prefix_pos
@@ -769,7 +704,6 @@ class PI05FlashVLAModel(nn.Module):
         suffix_pos_tiled = suffix_pos_per_offset.reshape(batch_size, -1)
         position_ids[:, prefix_length:] = last_prefix_pos[:, None] + suffix_pos_tiled
 
-        # Convert to additive mask
         attention_mask = torch.where(
             att_2d_masks,
             torch.zeros_like(att_2d_masks, dtype=dtype),
@@ -810,18 +744,14 @@ class PI05FlashVLAModel(nn.Module):
 
         time_per_token = self._build_per_chunk_time(batch_size, device)
 
-        # x_t needs per-token times (each token gets its own noise sample).
-        time_expanded = time_per_token.unsqueeze(-1)  # [B, N*H, 1]
-        # For noisy slots: x_t = t*noise + (1-t)*actions (standard flow matching)
+        time_expanded = time_per_token.unsqueeze(-1)
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # Embed shared prefix once
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
             images, img_masks, tokens, masks
         )
 
-        # action_is_pad: True = padded; suffix embedder expects True = real
         real_mask = ~action_is_pad if action_is_pad is not None else None
         suffix_embs, suffix_pad_masks, suffix_att_masks, suffix_adarms_cond = self.suffix_embedder(
             states, x_t, time_per_token,
@@ -829,16 +759,12 @@ class PI05FlashVLAModel(nn.Module):
         )
         hidden_dim = suffix_embs.shape[-1]
 
-        # Per-config suffix pad masks for attention: [B, N, H]
         suffix_pad_masks_per_offset = suffix_pad_masks.view(batch_size, N, H)
 
-        # Representative att_masks (same block structure for all configs): [B, H]
         suffix_att_masks = suffix_att_masks[:, :H]
 
-        # adarms_cond reshaped for layers: [B, N, H, D]
         suffix_adarms_cond = suffix_adarms_cond.view(batch_size, N, H, -1)
 
-        # Compute dtype from a Linear weight (layernorms are kept float32).
         backbone_dtype = self.backbone_dtype()
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
@@ -852,7 +778,6 @@ class PI05FlashVLAModel(nn.Module):
             dtype=prefix_embs.dtype,
         )
 
-        # Forward through transformer layers
         hidden_states = [prefix_embs, suffix_embs]
 
         for layer in self.layers:
@@ -865,28 +790,24 @@ class PI05FlashVLAModel(nn.Module):
                 suffix_length=suffix_length,
             )
 
-        # Final layer norm with per-token conditioning
         norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
 
         prefix_out = hidden_states[0]
         prefix_out, _ = norms[0](prefix_out, cond=None)
 
-        suffix_out = hidden_states[1]  # [B, N*H, D]
+        suffix_out = hidden_states[1]
         suffix_out = suffix_out.view(batch_size * N, H, hidden_dim)
         cond = suffix_adarms_cond.view(batch_size * N, H, -1)
         suffix_out, _ = norms[1](suffix_out, cond=cond)
         suffix_out = suffix_out.view(batch_size, N * H, hidden_dim)
 
-        # Project to action space
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
-        v_t = self.action_out_proj(suffix_out)  # [B, N*H, action_dim]
+        v_t = self.action_out_proj(suffix_out)
 
-        # Compute MSE loss
-        losses = F.mse_loss(u_t, v_t, reduction="none")  # [B, N*H, action_dim]
+        losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        # Build loss mask: exclude padded positions
         if action_is_pad is not None:
-            loss_mask = ~action_is_pad  # [B, N*H]
+            loss_mask = ~action_is_pad
         else:
             loss_mask = torch.ones(batch_size, N * H, dtype=torch.bool, device=device)
 
@@ -921,7 +842,6 @@ class PI05FlashVLAModel(nn.Module):
             state, x_t, timestep, padding_mask=padding_mask
         )
 
-        # Compute dtype from a Linear weight (layernorms are kept float32).
         backbone_dtype = self.backbone_dtype()
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
@@ -973,7 +893,6 @@ class PI05FlashVLAModel(nn.Module):
             if profile else None
         )
 
-        # Encode: compute and cache prefix KV
         if profile:
             _ev_record(_evs[0])
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
@@ -982,7 +901,6 @@ class PI05FlashVLAModel(nn.Module):
         if profile:
             _ev_record(_evs[1])
 
-        # Prefill: compute and cache prefix KV
         for layer in self.layers:
             layer.self_attn.attn.reset_cache()
 
@@ -1000,15 +918,11 @@ class PI05FlashVLAModel(nn.Module):
         if profile:
             _ev_record(_evs[2])
 
-        # ===== Vectorized mask/time construction (no Python control flow) =====
-        # step_counter is a Python int; num_real specializes the graph per value.
         num_real = step_counter + 1
 
-        slot_idx = torch.arange(buf_slots, device=device)              # [buf_slots]
-        slot_idx_buf = torch.arange(buf_len, device=device) // C       # [buf_len]
+        slot_idx = torch.arange(buf_slots, device=device)
+        slot_idx_buf = torch.arange(buf_len, device=device) // C
 
-        # slot 0..num_real-1 = noisy real, time = (N - num_real + 1 + slot_idx)/N
-        # slot num_real..N-1 = padding, time = 1.0
         is_real = slot_idx < num_real
         time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
         time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
@@ -1022,11 +936,10 @@ class PI05FlashVLAModel(nn.Module):
         )
 
         dt = 1.0 / N
-        # New buffer assembled via masks instead of slice assignment.
         new_noise = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
         updated_buffer = buffer - dt * v_t
-        keep_mask = slot_idx_buf < num_real            # slot 0..num_real-1
-        noise_mask = slot_idx_buf == num_real          # slot num_real
+        keep_mask = slot_idx_buf < num_real
+        noise_mask = slot_idx_buf == num_real
 
         keep_mask = keep_mask.view(1, buf_len, 1)
         noise_mask = noise_mask.view(1, buf_len, 1)
@@ -1065,14 +978,11 @@ class PI05FlashVLAModel(nn.Module):
         bsz = tokens.shape[0]
         device = tokens.device
 
-        # Wall-clock total measurement (only meaningful under compile=True
-        # for the steady branch; cold-start also reports breakdown).
         _evs_total = (
             [torch.cuda.Event(enable_timing=True) for _ in range(4)]
             if profile else None
         )
         
-        # Encode: compute and cache prefix KV
         if profile:
             _ev_record(_evs_total[0])
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
@@ -1080,7 +990,6 @@ class PI05FlashVLAModel(nn.Module):
         )
         if profile:
             _ev_record(_evs_total[1])
-        # Prefill: compute and cache prefix KV
         for layer in self.layers:
             layer.self_attn.attn.reset_cache()
 
@@ -1097,7 +1006,6 @@ class PI05FlashVLAModel(nn.Module):
             )
         if profile:
             _ev_record(_evs_total[2])
-        # Steady-state time vector (all slots real)
         time_per_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
         time = time_per_slot.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
 
@@ -1154,14 +1062,10 @@ class PI05FlashVLAModel(nn.Module):
         bsz = tokens.shape[0]
         device = tokens.device
 
-        # Initialize buffer on first call
         if buffer is None:
             buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
 
         if step_counter < N - 1:
-            # Cold start. Write the current step into our persistent 0-d
-            # buffer so the compiled graph reads from a fixed address (enables
-            # cudagraph replay across all step_counter values).
             self._cold_step_t.fill_(step_counter)
             buffer, breakdown = self._cold_start(
                 images, img_masks, tokens, masks, state, buffer, self._cold_step_t,
@@ -1169,7 +1073,6 @@ class PI05FlashVLAModel(nn.Module):
             )
             actions_to_execute = None
         else:
-            # Steady streaming: compiled, single CUDA graph, non-blocking
             actions_to_execute, buffer, breakdown = self._steady_streaming(
                 images, img_masks, tokens, masks, state, buffer,
                 profile=profile,
@@ -1183,9 +1086,6 @@ class PI05FlashVLAModel(nn.Module):
         return actions_to_execute, buffer, step_counter + 1, profile_results
 
 
-# ============================================================
-# Policy wrapper
-# ============================================================
 
 class PI05FlashVLAPolicy(PreTrainedPolicy):
     """PI0.5 FlashVLA Policy wrapper."""
@@ -1201,11 +1101,9 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Normalization is handled by the external processor pipeline.
 
         self.model = PI05FlashVLAModel(config)
 
-        # Pre-allocate streaming buffer
         buf_len = config.total_buffer_length
         self.register_buffer(
             "action_buffer",
@@ -1214,9 +1112,6 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
         )
         self._step_counter = 0
 
-        # Cold-start normalization stats are filled in by from_pretrained().
-        # Default to an empty ColdStartStats so locally-constructed policies
-        # (e.g. unit tests) still have a valid attribute to read.
         self._cold_start_stats = ColdStartStats()
 
         self.reset()
@@ -1272,7 +1167,6 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
                 raise FileNotFoundError(f"Could not resolve 'model.safetensors' for {pretrained_name_or_path}")
             original_state_dict = load_file(resolved_file)
 
-        # Weight key mapping from OpenPI / FlashVLA base format
         prefix_rules: list[tuple[str, str]] = [
             ("model.action_in_proj.", "model.suffix_embedder.action_in_proj."),
             ("model.action_out_proj.", "model.action_out_proj."),
@@ -1318,8 +1212,6 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
                 f"Unexpected keys: {unexpected_fatal}"
             )
 
-        # Only patch GemmaRMSNorm (in-place class swap, no state_dict change).
-        # Skip GemmaAttention patching — PI05Attention accesses q/k/v_proj directly.
         from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
         from lerobot.policies.pi_gemma import PiGemmaRMSNorm as OriginalGemmaRMSNorm
         for module in instance.model.modules():
@@ -1336,8 +1228,6 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
 
         instance.model.detach_backbone_layer_aliases()
 
-        # Load action + state normalization stats for cold-start action
-        # computation (see flashvla.policies.pi05.utils.load_cold_start_stats).
         instance._cold_start_stats = load_cold_start_stats(pretrained_name_or_path)
 
         return instance
@@ -1352,7 +1242,7 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
         self.action_buffer.zero_()
         self.action_buffer[:, :C, :].normal_()
         self._step_counter = 0
-        self._cold_start_action = None  # will be set on first select_action
+        self._cold_start_action = None
 
     def get_optim_params(self) -> dict:
         return self.parameters()
@@ -1380,8 +1270,6 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
         self._step_counter = new_step
 
         if actions is None:
-            # Cold-start: chunk not yet ready. Still pass profile data through if requested
-            # (encode + prefill + cold-start denoise still consumed time worth measuring).
             if profile:
                 return None, profile_results
             return None
@@ -1415,7 +1303,6 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
                     state_normalized=batch[OBS_STATE] if mode == "current_state" else None,
                     cache=self._cold_start_action if mode == "zero_delta" else None,
                 )
-                # Cache the state-independent zero-delta action across calls.
                 if mode == "zero_delta":
                     self._cold_start_action = cold_action
                 for _ in range(self.config.n_action_steps):
@@ -1426,7 +1313,6 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor], noise=None) -> tuple[Tensor, dict[str, Tensor]]:
         """Training forward pass."""
-        # Batch arrives already normalized and tokenized by the preprocessor.
         images, img_masks = self.prepare_images(batch)
         states = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]

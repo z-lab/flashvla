@@ -99,7 +99,7 @@ def _pack_request(TASK_ENV, observation: dict) -> dict:
     }
 
 
-def encode_obs(observation):  # kept for API parity with other policies
+def encode_obs(observation):
     return observation
 
 
@@ -115,7 +115,6 @@ def eval(TASK_ENV, model, observation):
         action = model.call(func_name="get_cached_action")
     else:
         request = _pack_request(TASK_ENV, observation)
-        # Server unpacks this, runs the policy, returns a (14,) float32 np.array.
         action = model.call(func_name="get_action", obs=request)
     TASK_ENV.take_action(np.asarray(action).reshape(-1))
 

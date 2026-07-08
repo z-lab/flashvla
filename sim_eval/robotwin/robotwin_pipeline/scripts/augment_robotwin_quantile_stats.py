@@ -29,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]  # lerobot DEFAULT_QUANTILES
+QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 FEATURES = ["action", "observation.state"]
 
 
@@ -49,7 +49,7 @@ def augment_subset(subset_root: Path, overwrite: bool) -> str:
 
     df = pd.concat([pd.read_parquet(p, columns=FEATURES) for p in parquets])
     for ft in FEATURES:
-        values = np.stack(df[ft].to_numpy())  # [num_frames, dim]
+        values = np.stack(df[ft].to_numpy())
         qs = np.quantile(values, QUANTILES, axis=0)
         for q, q_key in zip(qs, q_keys):
             stats[ft][q_key] = q.tolist()

@@ -76,7 +76,6 @@ class PI0PrefixEmbedder(nn.Module):
     def __init__(self, config: PI0Config, vlm: PaliGemmaForConditionalGeneration):
         super().__init__()
         self.config = config
-        # Held in a list so it is not registered as a submodule.
         self._paligemma_model = [vlm.model]
         self.lang_embedder = vlm.language_model.embed_tokens
 
@@ -98,11 +97,8 @@ class PI0PrefixEmbedder(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # Embed each image
         for img, img_mask in zip(images, img_masks, strict=True):
             pg = self._paligemma_model[0]
-            # Run the SigLIP tower directly and use the unscaled projector
-            # output. Cast the float32 input embeddings to the encoder dtype.
             vt = pg.vision_tower.vision_model
             hidden = vt.embeddings(img)
             enc_dtype = vt.encoder.layers[0].self_attn.q_proj.weight.dtype
@@ -116,7 +112,6 @@ class PI0PrefixEmbedder(nn.Module):
             pad_masks.append(img_mask[:, None].expand(bsz, num_img_embs))
             att_masks += [0] * num_img_embs
 
-        # Embed language with sqrt(dim) scaling
         lang_emb = self.lang_embedder(tokens)
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
@@ -126,7 +121,6 @@ class PI0PrefixEmbedder(nn.Module):
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
 
-        # Concatenate all
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
@@ -149,7 +143,6 @@ class PI0SuffixEmbedder(nn.Module):
         self.action_in_proj = nn.Linear(config.max_action_dim, width)
         self.state_proj = nn.Linear(config.max_state_dim, width)
         
-        # Time embedding is concatenated with action embedding
         self.action_time_mlp_in = nn.Linear(width * 2, width)
         self.action_time_mlp_out = nn.Linear(width, width)
 
@@ -171,7 +164,6 @@ class PI0SuffixEmbedder(nn.Module):
         pad_masks = []
         att_masks = []
 
-        # State token (first token in suffix)
         state_emb = self.state_proj(state).to(dtype=torch.bfloat16)
         embs.append(state_emb[:, None, :])
         bsize = state_emb.shape[0]
@@ -179,10 +171,8 @@ class PI0SuffixEmbedder(nn.Module):
 
         state_mask = torch.ones(bsize, 1, dtype=torch.bool, device=device)
         pad_masks.append(state_mask)
-        # Mark boundary: prefix tokens don't attend to suffix
         att_masks.append(1)
 
-        # Time embedding (sinusoidal)
         time_emb = create_sinusoidal_pos_embedding(
             time,
             self.config.action_expert_config.hidden_size,
@@ -192,7 +182,6 @@ class PI0SuffixEmbedder(nn.Module):
         )
         time_emb = time_emb.to(dtype=time.dtype)
 
-        # Concatenate action and time, then MLP
         action_emb = self.action_in_proj(noisy_actions)
         time_emb = time_emb[:, None, :].expand_as(action_emb)
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
@@ -206,7 +195,6 @@ class PI0SuffixEmbedder(nn.Module):
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=time.device)
         pad_masks.append(action_time_mask)
 
-        # State token does not attend to action tokens
         att_masks += [1] + ([0] * (self.config.chunk_size - 1))
 
         embs = torch.cat(embs, dim=1)
@@ -214,7 +202,7 @@ class PI0SuffixEmbedder(nn.Module):
         att_masks = torch.tensor(att_masks, dtype=embs.dtype, device=embs.device)
         att_masks = att_masks[None, :].expand(bsize, len(att_masks))
 
-        adarms_cond = None  # PI0 doesn't use adaRMS
+        adarms_cond = None
         return embs, pad_masks, att_masks, adarms_cond
 
 
@@ -233,7 +221,6 @@ class PI0Attention(nn.Module):
         self.action_expert_attention = action_expert_attention
         text_cfg = config.vlm_config.text_config
 
-        # Custom RoPE implementation
         self.rotary_emb = RotaryEmbedding(
             head_size=text_cfg.head_dim,
             rotary_dim=text_cfg.head_dim,
@@ -256,7 +243,6 @@ class PI0Attention(nn.Module):
             if hs is None or hs.shape[1] == 0:
                 continue
 
-            # Support fused and unfused attention
             if hasattr(attn, "qkv_proj"):
                 q, k, v = attn.qkv_proj(hs)
             else:
@@ -273,17 +259,14 @@ class PI0Attention(nn.Module):
         k = torch.cat(k_states, dim=2)
         v = torch.cat(v_states, dim=2)
 
-        # Apply RoPE
         q, k = self.rotary_emb(position_ids, q, k)
 
         bsz = q.shape[0]
         attn_outputs = self.attn(q, k, v, attention_mask, use_cache=use_cache)
         
-        # Reshape: [B, H, L, D] -> [B, L, H*D]
         attn_outputs = attn_outputs.transpose(1, 2).contiguous()
         attn_outputs = attn_outputs.view(bsz, -1, self.num_heads * self.head_dim)
 
-        # Split back to each backbone
         outputs = []
         start_pos = 0
         for attn, hs in zip(attns, hidden_states):
@@ -314,7 +297,6 @@ class PI0MLP(nn.Module):
             if hs is None or hs.shape[1] == 0:
                 outputs.append(hs)
                 continue
-            # Support fused and unfused MLP
             if hasattr(mlp, "gate_up_proj"):
                 gate, up = mlp.gate_up_proj(hs)
             else:
@@ -349,7 +331,6 @@ class PI0ModelLayer(nn.Module):
 
     def forward(self, hidden_states, attention_mask, position_ids, conds, use_cache: bool = False):
         """Forward pass with gated residual connections."""
-        # Pre-attention layernorm
         residuals = [hs.clone() if hs is not None else None for hs in hidden_states]
         gates = []
         for i in range(len(hidden_states)):
@@ -360,17 +341,14 @@ class PI0ModelLayer(nn.Module):
             hidden_states[i], gate = self.input_layernorm[i](hs, conds[i])
             gates.append(gate)
 
-        # Attention
         hidden_states = self.self_attn(hidden_states, attention_mask, position_ids, conds, use_cache=use_cache)
         
-        # Gated residual
         for i in range(len(hidden_states)):
             hs = hidden_states[i]
             if hs is None:
                 continue
             hidden_states[i] = _gated_residual(residuals[i], hs, gates[i])
 
-        # Pre-MLP layernorm
         residuals = [hs.clone() if hs is not None else None for hs in hidden_states]
         gates = []
         for i in range(len(hidden_states)):
@@ -381,10 +359,8 @@ class PI0ModelLayer(nn.Module):
             hidden_states[i], gate = self.post_attention_layernorm[i](hs, conds[i])
             gates.append(gate)
 
-        # MLP
         hidden_states = self.mlp(hidden_states)
         
-        # Gated residual
         for i in range(len(hidden_states)):
             hs = hidden_states[i]
             if hs is None:
@@ -400,15 +376,12 @@ class PI0Model(nn.Module):
         super().__init__()
         self.config = config
 
-        # Backbone models
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
 
-        # Embedders
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI0SuffixEmbedder(config)
 
-        # Shared transformer layers
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList(
             [
@@ -421,7 +394,6 @@ class PI0Model(nn.Module):
             ]
         )
         
-        # Output projection
         self.action_out_proj = nn.Linear(config.action_expert_config.hidden_size, config.max_action_dim)
 
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
@@ -462,7 +434,6 @@ class PI0Model(nn.Module):
                 attn.qkv_proj = qkv
                 qkv.to(device=q_proj.weight.device, dtype=q_proj.weight.dtype)
 
-                # Pack weights
                 with torch.no_grad():
                     out_w = qkv.weight
                     q_w = q_proj.weight
@@ -526,7 +497,6 @@ class PI0Model(nn.Module):
         """Convert model to bfloat16, keeping critical params in float32."""
         modules = [self.vlm, self.action_expert]
         params_to_keep_float32 = [
-            # Keep the vision input embeddings, layernorms, and final norm in float32.
             "vision_tower.vision_model.embeddings.patch_embedding.weight",
             "vision_tower.vision_model.embeddings.patch_embedding.bias",
             "vision_tower.vision_model.embeddings.position_embedding.weight",
@@ -572,12 +542,10 @@ class PI0Model(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
-        # Interpolate between noise and actions
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions  # True velocity
+        u_t = noise - actions
 
-        # Embed prefix and suffix
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
             images, img_masks, tokens, masks
         )
@@ -601,7 +569,6 @@ class PI0Model(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=False)
 
-        # Final layer norm
         norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
         final_hidden_states: list[torch.Tensor | None] = []
         for i, hs in enumerate(hidden_states):
@@ -612,7 +579,6 @@ class PI0Model(nn.Module):
             final_hidden_states.append(hs)
         hidden_states = final_hidden_states
 
-        # Project to action space
         suffix_out = hidden_states[1][:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=self.action_out_proj.weight.dtype)
         v_t = self.action_out_proj(suffix_out)
@@ -660,49 +626,38 @@ class PI0Model(nn.Module):
             noise = self.sample_noise(actions.shape, actions.device)
         
         if time is None:
-            # Sample time for each offset branch
             time = self.sample_time(batch_size * num_offsets, actions.device)
             time = time.view(batch_size, num_offsets)
         
-        # Interpolate between noise and actions for each offset
-        time_expanded = time[:, :, None, None]  # [B, num_offsets, 1, 1]
+        time_expanded = time[:, :, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
-        u_t = noise - actions  # True velocity
+        u_t = noise - actions
         
-        # Embed shared prefix (images + language) - only once!
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
             images, img_masks, tokens, masks
         )
         prefix_length = prefix_embs.shape[1]
         
-        # Embed suffix for each offset branch
-        # Flatten batch and offset dimensions for suffix embedding
-        states_flat = states.view(batch_size * num_offsets, -1)  # [B*num_offsets, state_dim]
-        x_t_flat = x_t.view(batch_size * num_offsets, x_t.shape[2], -1)  # [B*num_offsets, T, action_dim]
-        time_flat = time.view(batch_size * num_offsets)  # [B*num_offsets]
+        states_flat = states.view(batch_size * num_offsets, -1)
+        x_t_flat = x_t.view(batch_size * num_offsets, x_t.shape[2], -1)
+        time_flat = time.view(batch_size * num_offsets)
         
         suffix_embs_flat, suffix_pad_masks_flat, suffix_att_masks_flat, suffix_adarms_cond = self.suffix_embedder(
             states_flat, x_t_flat, time_flat
         )
         suffix_length = suffix_embs_flat.shape[1]
         
-        # Get pad_masks and att_masks for one suffix (they're the same for all offsets)
-        # Take from first batch element since structure is the same
-        suffix_pad_masks = suffix_pad_masks_flat[:batch_size]  # [B, suffix_length]
-        suffix_att_masks = suffix_att_masks_flat[:batch_size]  # [B, suffix_length]
+        suffix_pad_masks = suffix_pad_masks_flat[:batch_size]
+        suffix_att_masks = suffix_att_masks_flat[:batch_size]
         
-        # Reshape suffix back to [B, num_offsets, suffix_length, hidden_dim]
         suffix_embs = suffix_embs_flat.view(batch_size, num_offsets, suffix_length, -1)
         
-        # Concatenate all suffix branches: [B, num_offsets * suffix_length, hidden_dim]
         suffix_embs_concat = suffix_embs.view(batch_size, num_offsets * suffix_length, -1)
         
-        # Build combined embeddings: prefix + all suffix branches
         backbone_dtype = self.vlm.model.language_model.layers[0].self_attn.o_proj.weight.dtype
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs_concat = suffix_embs_concat.to(dtype=backbone_dtype)
         
-        # Build shared observation attention mask and position IDs
         attention_mask, position_ids = build_shared_obs_attention_mask_and_position_ids(
             prefix_pad_masks=prefix_pad_masks,
             prefix_att_masks=prefix_att_masks,
@@ -714,12 +669,11 @@ class PI0Model(nn.Module):
         )
         
         hidden_states = [prefix_embs, suffix_embs_concat]
-        conds = [None, None]  # PI0 doesn't use adaRMS
+        conds = [None, None]
         
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=False)
         
-        # Final layer norm
         norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
         final_hidden_states: list[torch.Tensor | None] = []
         for i, hs in enumerate(hidden_states):
@@ -730,22 +684,15 @@ class PI0Model(nn.Module):
             final_hidden_states.append(hs)
         hidden_states = final_hidden_states
         
-        # Extract action predictions for each offset
-        # suffix_out: [B, num_offsets * suffix_length, hidden_dim]
         suffix_out = hidden_states[1]
         
-        # Reshape to [B, num_offsets, suffix_length, hidden_dim]
         suffix_out = suffix_out.view(batch_size, num_offsets, suffix_length, -1)
         
-        # Extract only action tokens (last chunk_size tokens of each suffix)
-        # suffix has: 1 state token + chunk_size action tokens
-        action_out = suffix_out[:, :, -self.config.chunk_size:, :]  # [B, num_offsets, chunk_size, hidden_dim]
+        action_out = suffix_out[:, :, -self.config.chunk_size:, :]
         
-        # Project to action space
         action_out = action_out.to(dtype=self.action_out_proj.weight.dtype)
-        v_t = self.action_out_proj(action_out)  # [B, num_offsets, chunk_size, action_dim]
+        v_t = self.action_out_proj(action_out)
         
-        # Compute MSE loss
         losses = F.mse_loss(u_t, v_t, reduction="none")
         
         return losses
@@ -811,7 +758,6 @@ class PI0Model(nn.Module):
             )
             noise = self.sample_noise(actions_shape, device)
 
-        # Prefill: compute and cache prefix KV
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
             images, img_masks, tokens, masks
         )
@@ -837,7 +783,6 @@ class PI0Model(nn.Module):
                 use_cache=True,
             )
 
-        # Denoising loop
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
@@ -877,7 +822,6 @@ class PI0Policy(PreTrainedPolicy):
         config.validate_features()
         self.config = config
 
-        # Normalization is handled by the external processor pipeline.
 
         self.model = PI0Model(config)
 
@@ -943,7 +887,6 @@ class PI0Policy(PreTrainedPolicy):
             else:
                 original_state_dict = load_file(resolved_file)
 
-        # Weight mapping from OpenPI format
         prefix_rules: list[tuple[str, str]] = [
             ("action_in_proj.", "model.suffix_embedder.action_in_proj."),
             ("action_out_proj.", "model.action_out_proj."),
@@ -955,13 +898,6 @@ class PI0Policy(PreTrainedPolicy):
         ]
 
         def map_key(key: str) -> str | None:
-            # Three checkpoint layouts in the wild:
-            #   1. OpenPI raw     → "action_in_proj.weight", "paligemma_with_expert..."
-            #   2. LeRobot pi0    → same as (1) but everything wrapped under "model."
-            #   3. flashvla-trained → already in target_sd convention ("model.suffix_embedder.*",
-            #                       "model.action_expert.*", "model.vlm.model.*")
-            # Try OpenPI prefix_rules both with and without a leading "model.";
-            # if neither matches, assume the key is already flashvla-native.
             candidates = [key]
             if key.startswith("model."):
                 candidates.append(key[len("model."):])
@@ -993,7 +929,6 @@ class PI0Policy(PreTrainedPolicy):
         instance.to(config.device)
         instance.eval()
 
-        # Apply fusion for faster inference
         if getattr(config, "fuse_qkv", True):
             instance.model.init_qkv_fusion_from_existing()
         if getattr(config, "fuse_gate_up", True):
@@ -1012,7 +947,6 @@ class PI0Policy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise: Tensor | None = None) -> Tensor:
         """Predict a chunk of actions."""
-        # Batch arrives already normalized and tokenized by the preprocessor.
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
 
@@ -1026,7 +960,6 @@ class PI0Policy(PreTrainedPolicy):
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
-        # Unnormalization is handled by the postprocessor.
         return actions[:, : self.config.n_action_steps, :]
 
     @torch.no_grad()
@@ -1039,7 +972,6 @@ class PI0Policy(PreTrainedPolicy):
 
     def forward(self, batch: dict[str, Tensor], noise=None, time=None) -> tuple[Tensor, dict[str, Tensor]]:
         """Training forward pass."""
-        # Batch arrives already normalized and tokenized by the preprocessor.
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
@@ -1130,56 +1062,38 @@ class PI0Policy(PreTrainedPolicy):
         Returns:
             Tuple of (loss, loss_dict).
         """
-        # Extract offset info
-        offset_mask = batch["offset_mask"]  # [B, num_offsets]
+        offset_mask = batch["offset_mask"]
         batch_size, num_offsets = offset_mask.shape
 
-        # Batch arrives already normalized and tokenized by the preprocessor.
-        # State: [B, num_offsets, state_dim] — pad to max_state_dim
         states_normalized = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
 
-        # Actions: [B, num_offsets, chunk_size, action_dim] — pad to max_action_dim
         actions_normalized = pad_vector(batch[ACTION], self.config.max_action_dim)
 
-        # Prepare images (shared across offsets)
         images, img_masks = self.prepare_images(batch)
 
-        # Language tokens (shared across offsets, pre-tokenized by preprocessor)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
         lang_masks = batch[OBS_LANGUAGE_ATTENTION_MASK]
         
-        # Get action padding mask
-        actions_is_pad = batch.get("action_is_pad")  # [B, num_offsets, chunk_size]
+        actions_is_pad = batch.get("action_is_pad")
         
         loss_dict: dict[str, Tensor | float] = {}
         
-        # Call model's shared observation forward
         losses = self.model.forward_shared_observation(
             images, img_masks, lang_tokens, lang_masks,
             states_normalized, actions_normalized, offset_mask,
             noise, time
-        )  # [B, num_offsets, chunk_size, action_dim]
+        )
         
-        # Apply action padding mask (same as regular forward)
-        # Padded action positions are zeroed but still count in the denominator,
-        # matching the regular forward behavior where mean() includes padding.
         if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad  # [B, num_offsets, chunk_size]
+            in_episode_bound = ~actions_is_pad
             losses = losses * in_episode_bound.unsqueeze(-1)
         
-        # Apply offset mask to zero out invalid offsets
         losses = losses * offset_mask[:, :, None, None]
         
-        # Truncate to actual action dim
         losses = losses[:, :, :, :self.config.max_action_dim]
         
-        # Average over valid offsets only
-        # Each offset's mean is: offset_losses.sum() / (chunk_size * action_dim)
-        # We want: sum(offset_i_mean for valid i) / num_valid_offsets
-        # = sum(offset_losses) / (num_valid_offsets * chunk_size * action_dim)
-        # This matches regular forward behavior where each offset is trained separately
         num_valid_offsets = offset_mask.sum()
-        num_elements_per_offset = losses.shape[2] * losses.shape[3]  # chunk_size * action_dim
+        num_elements_per_offset = losses.shape[2] * losses.shape[3]
         loss = losses.sum() / (num_valid_offsets * num_elements_per_offset).clamp(min=1)
         
         loss_dict["loss"] = loss.item()

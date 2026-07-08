@@ -28,7 +28,7 @@ from torch import nn
 class Attention(nn.Module):
     """Scaled dot-product attention with optional KV cache.
 
-    Computes: Attention(Q, K, V) = softmax(Q @ K^T / scale) @ V
+    Computes: Attention(Q, K, V) = softmax(Q @ K^T * scale) @ V
 
     The KV cache enables efficient inference by storing prefix K/V
     and reusing them across multiple forward passes.
@@ -46,7 +46,6 @@ class Attention(nn.Module):
         super().__init__()
         self.scale = scale
 
-        # KV cache buffers: [B, H, L_prefix, D]
         self.k_cache: Optional[torch.Tensor] = None
         self.v_cache: Optional[torch.Tensor] = None
 
@@ -62,7 +61,6 @@ class Attention(nn.Module):
         v: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         use_cache: bool = False,
-        return_attn_probs: bool = False,
     ) -> torch.Tensor:
         """Compute scaled dot-product attention.
 
@@ -73,30 +71,24 @@ class Attention(nn.Module):
             attention_mask: Additive mask [B, 1, L_q, L_k] or [B, H, L_q, L_k].
                            Use 0 for positions to attend, -inf for masked positions.
             use_cache: If True, use internal KV caching for prefix tokens.
-            return_attn_probs: If True, return attention weights along with output.
 
         Returns:
-            Output tensor [B, H_q, L_q, D], optionally with attention weights.
+            Output tensor [B, H_q, L_q, D].
         """
-        # Handle standard KV cache
         if use_cache:
             if self.k_cache is None:
-                # First call: initialize cache with prefix K/V
-                # Use copy_() to maintain tensor identity for CUDA graph compatibility
                 self.k_cache = k.clone()
                 self.v_cache = v.clone()
                 k_full = k
                 v_full = v
             else:
-                # Subsequent calls: concatenate cached prefix with new suffix
-                # Note: cache is not updated, always stores prefix only
                 k_full = torch.cat([self.k_cache, k], dim=2)
                 v_full = torch.cat([self.v_cache, v], dim=2)
         else:
             k_full = k
             v_full = v
 
-        return self._forward_sdpa(q, k_full, v_full, attention_mask, return_attn_probs)
+        return self._forward_sdpa(q, k_full, v_full, attention_mask)
 
     def _forward_sdpa(
         self,
@@ -104,33 +96,33 @@ class Attention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
-        return_attn_probs: bool = False,
     ) -> torch.Tensor:
-        """Scaled dot-product attention via PyTorch's memory-efficient backend.
+        """Scaled dot-product attention with explicit fp32 scores.
 
-        head_dim=256 exceeds Flash Attention's limit (128), so we force the
-        memory-efficient backend which supports it and uses O(N) memory
-        instead of materializing O(N²).
+        The additive float mask (0/masked) is converted to a boolean mask
+        (True=attend, False=masked). This keeps fully masked padding queries
+        finite even if an fp32 mask was cast to bf16 by FSDP.
 
-        The additive float mask (0/-inf) is converted to a boolean mask
-        (True=attend, False=masked) because float masks trigger the math
-        backend which materializes the full attention matrix in float32.
+        FSDP mixed precision casts floating-point forward inputs. An fp32
+        finfo.min mask therefore becomes -inf in bf16, and a fully masked
+        padding row would produce NaNs in softmax. Applying the mask as a
+        boolean to fp32 scores and explicitly zeroing masked probabilities
+        avoids the NaN and gives fully masked queries a zero attention output.
         """
         if attention_mask is not None and attention_mask.dim() == 3:
             attention_mask = attention_mask[:, None, :, :]
 
-        if return_attn_probs:
-            # Memory-efficient backend doesn't return attention weights.
-            attn_scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
-            if attention_mask is not None:
-                attn_scores = attn_scores + attention_mask.float()
-            attn_weights = torch.softmax(attn_scores, dim=-1).to(q.dtype)
-            out = torch.matmul(attn_weights, v)
-            return out, attn_weights
-
         attn_scores = torch.matmul(q.float(), k.float().transpose(-2, -1)) * self.scale
+        allowed = None
         if attention_mask is not None:
-            attn_scores = attn_scores + attention_mask.float()
-        attn_weights = torch.softmax(attn_scores, dim=-1).to(q.dtype)
+            allowed = attention_mask if attention_mask.dtype == torch.bool else attention_mask == 0
+            attn_scores = attn_scores.masked_fill(
+                ~allowed,
+                torch.finfo(attn_scores.dtype).min,
+            )
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        if allowed is not None:
+            attn_weights = attn_weights.masked_fill(~allowed, 0.0)
+        attn_weights = attn_weights.to(q.dtype)
         out = torch.matmul(attn_weights, v)
         return out

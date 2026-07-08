@@ -25,12 +25,13 @@ Usage:
 import logging
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from pprint import pformat
 from typing import Any
 
 import torch
+import accelerate as accelerate_lib
 from accelerate import Accelerator
 from termcolor import colored
 from torch.optim import Optimizer
@@ -60,12 +61,9 @@ from lerobot.utils.utils import (
 )
 from tqdm import tqdm
 
-from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
 from flashvla.configs.train_config import FlashVLATrainConfig
 from flashvla.datasets.flashvla_dataset import (
     FlashVLADataset,
-    MultiFlashVLADataset,
     flashvla_collate_fn,
     make_robotwin_multitask_flashvla_dataset,
 )
@@ -73,6 +71,7 @@ from flashvla.policies.factory import make_policy, make_pre_post_processors
 
 
 ACCELERATOR_STATE_DIR = "accelerator_state"
+REPLICATED_OPTIMIZER_STATE = "replicated_optimizer_state.pt"
 
 
 def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> int:
@@ -82,6 +81,291 @@ def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> in
         for p in model.parameters()
         if not only_trainable or p.requires_grad
     )
+
+
+def build_fsdp_mixed_precision_policy(mixed_precision: str, reduce_dtype: str):
+    """Build the FSDP2 policy without enabling global autocast.
+
+    Returns None for full-fp32 mode. In bf16 mode, parameters are gathered and
+    computed in bf16 while gradient reductions stay in ``reduce_dtype`` (fp32 by
+    default) and each module's natural output dtype is preserved so the fp32
+    flow-matching loss from action_out_proj is not downcast.
+    """
+    if mixed_precision == "no":
+        return None
+    if mixed_precision != "bf16":
+        raise ValueError(f"Unsupported FSDP mixed precision mode: {mixed_precision!r}")
+
+    dtype_by_name = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+    }
+    try:
+        resolved_reduce_dtype = dtype_by_name[reduce_dtype]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported fsdp.reduce_dtype={reduce_dtype!r}; expected 'bf16' or 'float32'."
+        ) from exc
+
+    from torch.distributed.fsdp import MixedPrecisionPolicy
+
+    return MixedPrecisionPolicy(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=resolved_reduce_dtype,
+        output_dtype=None,
+        cast_forward_inputs=True,
+    )
+
+
+class Fp32LayerNorm(torch.nn.LayerNorm):
+    """Run an ignored LayerNorm in fp32 and preserve its input dtype.
+
+    FSDP2's module-level policy does not cast the inputs of ignored modules, so
+    a bf16 activation would otherwise meet an fp32 LayerNorm weight. This casts
+    to the weight dtype for the computation and casts the result back.
+    """
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        output_dtype = inputs.dtype
+        compute_dtype = self.weight.dtype if self.weight is not None else torch.float32
+        outputs = torch.nn.functional.layer_norm(
+            inputs.to(dtype=compute_dtype),
+            self.normalized_shape,
+            self.weight,
+            self.bias,
+            self.eps,
+        )
+        return outputs.to(dtype=output_dtype)
+
+
+def install_fsdp_bf16_checkpoint_input_casts(policy: PreTrainedPolicy) -> list[str]:
+    """Cast inputs before checkpoint wrappers capture their recompute tensors.
+
+    Transformers' ``GradientCheckpointingLayer.__call__`` sits outside FSDP2's
+    forward pre-hook. The first SigLIP layer would otherwise checkpoint the
+    fp32 output of the ignored vision embeddings, even though FSDP casts the
+    initial computation to bf16. During backward FSDP is already in
+    PRE_BACKWARD and deliberately skips that input cast, causing fp32 inputs
+    to meet bf16 unsharded parameters on recompute.
+    """
+    path = "model.vlm.model.vision_tower.vision_model.encoder"
+    try:
+        encoder = policy.get_submodule(path)
+    except AttributeError:
+        return []
+
+    def cast_inputs(_module, args, kwargs):
+        args = list(args)
+        kwargs = dict(kwargs)
+        if args and isinstance(args[0], torch.Tensor) and args[0].is_floating_point():
+            args[0] = args[0].to(torch.bfloat16)
+        inputs_embeds = kwargs.get("inputs_embeds")
+        if isinstance(inputs_embeds, torch.Tensor) and inputs_embeds.is_floating_point():
+            kwargs["inputs_embeds"] = inputs_embeds.to(torch.bfloat16)
+        return tuple(args), kwargs
+
+    encoder.register_forward_pre_hook(cast_inputs, prepend=True, with_kwargs=True)
+    return [path]
+
+
+def _base_optimizer(optimizer: Optimizer) -> Optimizer:
+    """Unwrap Accelerate's AcceleratedOptimizer to the underlying torch optimizer."""
+    while hasattr(optimizer, "optimizer"):
+        optimizer = optimizer.optimizer
+    return optimizer
+
+
+@contextmanager
+def exclude_params_from_optimizer(
+    optimizer: Optimizer,
+    excluded_params: list[torch.nn.Parameter],
+):
+    """Temporarily hide replicated params from FSDP2 optimizer state APIs.
+
+    Accelerate's FSDP2 optimizer save/load only round-trips sharded DTensor
+    state. The fp32/ignored replicated params carry regular Tensor optimizer
+    state that is saved and loaded separately, so hide them here while the
+    sharded state is written or read.
+    """
+    base_optimizer = _base_optimizer(optimizer)
+    excluded_ids = {id(param) for param in excluded_params}
+    original_group_params = [list(group["params"]) for group in base_optimizer.param_groups]
+    excluded_state = {
+        param: base_optimizer.state.pop(param)
+        for param in excluded_params
+        if param in base_optimizer.state
+    }
+    for group in base_optimizer.param_groups:
+        group["params"] = [param for param in group["params"] if id(param) not in excluded_ids]
+    try:
+        yield
+    finally:
+        for group, params in zip(base_optimizer.param_groups, original_group_params, strict=True):
+            group["params"] = params
+        base_optimizer.state.update(excluded_state)
+
+
+def _replicated_optimizer_state_by_name(
+    policy: torch.nn.Module,
+    optimizer: Optimizer,
+    replicated_params: list[torch.nn.Parameter],
+) -> dict[str, dict[str, Any]]:
+    base_optimizer = _base_optimizer(optimizer)
+    name_by_id = {id(param): name for name, param in policy.named_parameters()}
+    state_by_name = {}
+    for param in replicated_params:
+        state = base_optimizer.state.get(param)
+        if not state:
+            continue
+        name = name_by_id.get(id(param))
+        if name is None:
+            raise KeyError("Replicated optimizer parameter has no stable model name")
+        serialized = {}
+        for key, value in state.items():
+            if isinstance(value, torch.Tensor):
+                serialized[key] = {
+                    "tensor": value.detach().cpu(),
+                    "device_type": value.device.type,
+                }
+            else:
+                serialized[key] = value
+        state_by_name[name] = serialized
+    return state_by_name
+
+
+def save_replicated_optimizer_state(
+    path: Path,
+    policy: torch.nn.Module,
+    optimizer: Optimizer,
+    replicated_params: list[torch.nn.Parameter],
+) -> None:
+    payload = {
+        "version": 1,
+        "state": _replicated_optimizer_state_by_name(
+            policy,
+            optimizer,
+            replicated_params,
+        ),
+    }
+    torch.save(payload, path)
+
+
+def load_replicated_optimizer_state(
+    path: Path,
+    policy: torch.nn.Module,
+    optimizer: Optimizer,
+    replicated_params: list[torch.nn.Parameter],
+) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"FSDP2 checkpoint is missing replicated optimizer state: {path}"
+        )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if payload.get("version") != 1:
+        raise ValueError(f"Unsupported replicated optimizer state version in {path}")
+
+    base_optimizer = _base_optimizer(optimizer)
+    param_by_name = {name: param for name, param in policy.named_parameters()}
+    replicated_ids = {id(param) for param in replicated_params}
+    unexpected = []
+    for name, state in payload["state"].items():
+        param = param_by_name.get(name)
+        if param is None or id(param) not in replicated_ids:
+            unexpected.append(name)
+            continue
+        restored = {}
+        for key, value in state.items():
+            if isinstance(value, dict) and "tensor" in value:
+                device = torch.device("cpu") if value["device_type"] == "cpu" else param.device
+                restored[key] = value["tensor"].to(device=device)
+            else:
+                restored[key] = value
+        base_optimizer.state[param] = restored
+    if unexpected:
+        raise KeyError(
+            "Replicated optimizer checkpoint contains parameters absent from the model: "
+            f"{unexpected[:20]}"
+        )
+
+
+def load_fsdp2_sharded_optimizer_allow_partial(
+    fsdp_plugin,
+    accelerator: Accelerator,
+    optimizer: Optimizer,
+    model: torch.nn.Module,
+    input_dir: str,
+    optimizer_index: int = 0,
+    adapter_only: bool = False,
+) -> None:
+    """Load FSDP2 optimizer state while allowing legitimately absent lazy state.
+
+    The sharded optimizer state omits entries for params whose optimizer state
+    has not been materialized yet (e.g. lazily on first step). Allowing a
+    partial load prevents a hard failure on resume.
+    """
+    from accelerate.utils.fsdp_utils import (
+        _prepare_sd_options,
+        load_fsdp_optimizer as default_load_fsdp_optimizer,
+    )
+    from torch.distributed.checkpoint import (
+        DefaultLoadPlanner,
+        FileSystemReader,
+        load,
+    )
+    from torch.distributed.checkpoint.state_dict import (
+        get_optimizer_state_dict,
+        set_optimizer_state_dict,
+    )
+    from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
+
+    if (
+        fsdp_plugin.fsdp_version != 2
+        or fsdp_plugin.state_dict_type != StateDictType.SHARDED_STATE_DICT
+    ):
+        default_load_fsdp_optimizer(
+            fsdp_plugin,
+            accelerator,
+            optimizer,
+            model,
+            input_dir,
+            optimizer_index,
+            adapter_only,
+        )
+        return
+
+    accelerator.wait_for_everyone()
+    checkpoint_dir = Path(input_dir) / f"optimizer_{optimizer_index}"
+    options = _prepare_sd_options(fsdp_plugin)
+    optimizer_state = get_optimizer_state_dict(model, optimizer, options=options)
+    state_dict = {"optimizer": optimizer_state}
+    load(
+        state_dict,
+        checkpoint_id=checkpoint_dir,
+        storage_reader=FileSystemReader(checkpoint_dir),
+        planner=DefaultLoadPlanner(allow_partial_load=True),
+    )
+    set_optimizer_state_dict(
+        model,
+        optimizer,
+        state_dict["optimizer"],
+        options=options,
+    )
+
+
+@contextmanager
+def patch_accelerate_fsdp_optimizer_loader():
+    """Use the partial optimizer loader only during one Accelerator load."""
+    import importlib
+
+    accelerator_module = importlib.import_module("accelerate.accelerator")
+    original_loader = accelerator_module.load_fsdp_optimizer
+    accelerator_module.load_fsdp_optimizer = load_fsdp2_sharded_optimizer_allow_partial
+    try:
+        yield
+    finally:
+        accelerator_module.load_fsdp_optimizer = original_loader
 
 
 def make_flashvla_dataset(cfg: FlashVLATrainConfig):
@@ -111,7 +395,6 @@ def make_flashvla_dataset(cfg: FlashVLATrainConfig):
                     dataset.meta.stats[key][stats_type] = torch.tensor(stats, dtype=torch.float32)
         return dataset
 
-    # Single-dataset path (unchanged)
     ds_meta = LeRobotDatasetMetadata(
         cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
     )
@@ -180,9 +463,14 @@ def update_policy(
             else:
                 grad_norm = accelerator.clip_grad_norm_(policy.parameters(), grad_clip_norm)
         else:
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                policy.parameters(), float("inf"), error_if_nonfinite=False
-            )
+            if replicated_params_to_sync:
+                grad_norm = clip_fsdp2_mixed_grad_norm_(
+                    list(policy.parameters()), float("inf"), accelerator
+                )
+            else:
+                grad_norm = torch.nn.utils.clip_grad_norm_(
+                    policy.parameters(), float("inf"), error_if_nonfinite=False
+                )
         grad_norm_value = grad_norm.item()
 
         with lock if lock is not None else nullcontext():
@@ -219,6 +507,24 @@ def sync_replicated_gradients(
             continue
         torch.distributed.all_reduce(param.grad, op=torch.distributed.ReduceOp.SUM)
         param.grad.div_(accelerator.num_processes)
+
+
+def broadcast_replicated_parameters(
+    params: list[torch.nn.Parameter],
+    accelerator: Accelerator,
+) -> None:
+    """Make the initial state of ignored trainable parameters identical.
+
+    Ignored (replicated) params are not managed by FSDP, so broadcast rank 0's
+    values to keep every rank's replica bit-identical before training.
+    """
+    if accelerator.num_processes <= 1:
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return
+
+    for param in params:
+        torch.distributed.broadcast(param.data, src=0)
 
 
 def clip_fsdp2_mixed_grad_norm_(
@@ -282,6 +588,8 @@ def save_fsdp2_checkpoint(
     step: int,
     cfg: FlashVLATrainConfig,
     policy: PreTrainedPolicy,
+    optimizer: Optimizer,
+    replicated_params: list[torch.nn.Parameter],
     preprocessor,
     postprocessor,
 ) -> None:
@@ -317,7 +625,16 @@ def save_fsdp2_checkpoint(
         save_training_step(step, training_state_dir)
 
     accelerator.wait_for_everyone()
-    accelerator.save_state(str(checkpoint_dir / ACCELERATOR_STATE_DIR), safe_serialization=True)
+    accelerator_state_dir = checkpoint_dir / ACCELERATOR_STATE_DIR
+    with exclude_params_from_optimizer(optimizer, replicated_params):
+        accelerator.save_state(str(accelerator_state_dir), safe_serialization=True)
+    if accelerator.is_main_process:
+        save_replicated_optimizer_state(
+            accelerator_state_dir / REPLICATED_OPTIMIZER_STATE,
+            policy,
+            optimizer,
+            replicated_params,
+        )
     accelerator.wait_for_everyone()
 
 
@@ -325,6 +642,9 @@ def load_fsdp2_checkpoint(
     *,
     accelerator: Accelerator,
     checkpoint_dir: Path,
+    policy: PreTrainedPolicy,
+    optimizer: Optimizer,
+    replicated_params: list[torch.nn.Parameter],
 ) -> int:
     """Load FSDP2 training state after `accelerator.prepare()`."""
     accelerator_state_dir = checkpoint_dir / ACCELERATOR_STATE_DIR
@@ -335,7 +655,17 @@ def load_fsdp2_checkpoint(
         )
 
     step = load_training_step(checkpoint_dir / TRAINING_STATE_DIR)
-    accelerator.load_state(str(accelerator_state_dir))
+    with (
+        exclude_params_from_optimizer(optimizer, replicated_params),
+        patch_accelerate_fsdp_optimizer_loader(),
+    ):
+        accelerator.load_state(str(accelerator_state_dir))
+    load_replicated_optimizer_state(
+        accelerator_state_dir / REPLICATED_OPTIMIZER_STATE,
+        policy,
+        optimizer,
+        replicated_params,
+    )
     return step
 
 
@@ -387,14 +717,26 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     fsdp_mixed_precision = getattr(cfg.fsdp, "mixed_precision", "auto")
     if fsdp_mixed_precision == "auto":
-        # Keep FSDP2 numerically conservative by default. bf16 remains available
-        # only via an explicit `fsdp.mixed_precision=bf16` override.
         fsdp_mixed_precision = "no"
     if fsdp_mixed_precision not in {"no", "bf16"}:
         raise ValueError(
             f"Unsupported fsdp.mixed_precision={fsdp_mixed_precision!r}. "
             "Supported values are 'auto', 'no', and 'bf16'."
         )
+    fsdp_reduce_dtype = getattr(cfg.fsdp, "reduce_dtype", "float32")
+    fsdp_precision_policy = (
+        build_fsdp_mixed_precision_policy(fsdp_mixed_precision, fsdp_reduce_dtype)
+        if cfg.fsdp.enable
+        else None
+    )
+    fsdp_wrap_layers = list(cfg.fsdp.wrap_layers)
+    if (
+        cfg.fsdp.enable
+        and fsdp_mixed_precision == "no"
+        and fsdp_wrap_layers
+        and "PI05SuffixEmbedder" not in fsdp_wrap_layers
+    ):
+        fsdp_wrap_layers.append("PI05SuffixEmbedder")
     fsdp_policy_dtype_override = None
     if cfg.fsdp.enable and fsdp_mixed_precision == "no" and cfg.policy.dtype != "float32":
         old_policy_dtype = cfg.policy.dtype
@@ -412,9 +754,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         fsdp_plugin = None
 
         if cfg.deepspeed.enable:
-            # DeepSpeed ZeRO: bf16/fp16 disabled so DeepSpeed does NOT touch
-            # parameter dtypes. The model keeps its mixed precision (most params
-            # bf16, sensitive params fp32). bf16 compute is handled by torch.autocast.
             from accelerate import DeepSpeedPlugin
 
             ds_config = {
@@ -440,20 +779,16 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
             ds_plugin = DeepSpeedPlugin(hf_ds_config=ds_config)
         elif cfg.fsdp.enable:
-            # FSDP2 still requires uniform original dtype within each parameter
-            # group. With mixed_precision='bf16', Accelerate upcasts trainable
-            # params to fp32 master weights before sharding, while FSDP2 uses
-            # bf16 all-gather/compute to keep activation and communication cost low.
             from accelerate import FullyShardedDataParallelPlugin
 
             fsdp_plugin = FullyShardedDataParallelPlugin(
                 fsdp_version=2,
                 reshard_after_forward=cfg.fsdp.reshard_after_forward,
                 cpu_offload=cfg.fsdp.cpu_offload,
-                mixed_precision_policy=fsdp_mixed_precision if fsdp_mixed_precision != "no" else None,
+                mixed_precision_policy=fsdp_precision_policy,
                 state_dict_type=cfg.fsdp.state_dict_type,
-                auto_wrap_policy="transformer_based_wrap" if cfg.fsdp.wrap_layers else "no_wrap",
-                transformer_cls_names_to_wrap=cfg.fsdp.wrap_layers or None,
+                auto_wrap_policy="transformer_based_wrap" if fsdp_wrap_layers else "no_wrap",
+                transformer_cls_names_to_wrap=fsdp_wrap_layers or None,
             )
         else:
             ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -464,7 +799,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             kwargs_handlers=kwargs_handlers,
             deepspeed_plugin=ds_plugin,
             fsdp_plugin=fsdp_plugin,
-            mixed_precision=fsdp_mixed_precision if cfg.fsdp.enable and fsdp_mixed_precision != "no" else None,
+            mixed_precision="no" if cfg.fsdp.enable else None,
         )
 
     init_logging(accelerator=accelerator)
@@ -480,11 +815,17 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             )
         if cfg.fsdp.enable:
             logging.info(
+                f"Runtime: torch={torch.__version__}, "
+                f"accelerate={accelerate_lib.__version__}, cuda={torch.version.cuda}"
+            )
+            logging.info(
                 f"FSDP2 enabled with reshard_after_forward={cfg.fsdp.reshard_after_forward}, "
                 f"mixed_precision={fsdp_mixed_precision}, "
+                f"reduce_dtype={fsdp_reduce_dtype}, global_autocast={accelerator.mixed_precision}, "
                 f"state_dict_type={cfg.fsdp.state_dict_type}, "
-                f"wrap_layers={cfg.fsdp.wrap_layers}, "
+                f"wrap_layers={fsdp_wrap_layers}, "
                 f"ignored_module_classes={cfg.fsdp.ignored_module_classes}, "
+                f"fp32_module_classes={getattr(cfg.fsdp, 'fp32_module_classes', [])}, "
                 f"ignored_module_name_suffixes={cfg.fsdp.ignored_module_name_suffixes}"
             )
             if fsdp_policy_dtype_override is not None:
@@ -512,7 +853,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
 
-    # === Create Dataset ===
     make_dataset_fn = make_flashvla_dataset
 
     if is_main_process:
@@ -524,15 +864,11 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     if not is_main_process:
         dataset = make_dataset_fn(cfg)
 
-    # === Create Policy ===
     if is_main_process:
         logging.info("Creating policy")
 
     policy_config_dtype = cfg.policy.dtype
     if cfg.fsdp.enable and fsdp_mixed_precision == "bf16" and cfg.policy.dtype == "bfloat16":
-        # FSDP2 mixed precision wants uniform fp32 original/master weights and
-        # casts to bf16 for compute/all-gather. Initializing directly in fp32
-        # avoids a bf16->fp32 upcast spike during accelerator.prepare().
         cfg.policy.dtype = "float32"
         if is_main_process:
             logging.info("FSDP2 bf16: initializing policy parameters as fp32 master weights")
@@ -546,13 +882,14 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         cfg.policy.dtype = policy_config_dtype
     policy.config.dtype = policy_config_dtype
 
-    # Freeze VLM if configured.
-    # Policy modules use different attribute paths:
-    #   pi0/pi05:        policy.model.vlm.model.vision_tower (SigLIP)
-    #   smolvla:         policy.model.vlm_with_expert.vlm.model.vision_model
-    #                    (smolvla also self-handles via train_expert_only/
-    #                     freeze_vision_encoder inside SmolVLMWithExpertModel,
-    #                     so the call below is idempotent for that policy.)
+    if cfg.fsdp.enable and fsdp_mixed_precision == "bf16":
+        checkpoint_input_casts = install_fsdp_bf16_checkpoint_input_casts(policy)
+        if is_main_process and checkpoint_input_casts:
+            logging.info(
+                "FSDP2 bf16: installed checkpoint-safe input casts on "
+                f"{checkpoint_input_casts}"
+            )
+
     if getattr(cfg.policy, "freeze_vlm", False):
         if hasattr(policy.model, "vlm"):
             vlm_module = policy.model.vlm
@@ -565,13 +902,9 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         if is_main_process:
             logging.info("VLM backbone frozen")
     elif getattr(cfg.policy, "freeze_vision_encoder", False):
-        # Freeze only the vision tower, keep language backbone trainable
         if hasattr(policy.model, "vlm") and hasattr(policy.model.vlm, "model") and hasattr(policy.model.vlm.model, "vision_tower"):
             vision_tower = policy.model.vlm.model.vision_tower
         elif hasattr(policy.model, "vlm_with_expert"):
-            # smolvla: SmolVLM2 vision tower lives at vlm.model.vision_model.
-            # Note: smolvla also freezes this inside its own set_requires_grad
-            # when freeze_vision_encoder=True, so this is a redundant safety net.
             vision_tower = policy.model.vlm_with_expert.vlm.model.vision_model
         else:
             raise AttributeError("Cannot find vision tower to freeze")
@@ -583,7 +916,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     accelerator.wait_for_everyone()
 
-    # === Create Preprocessor and Postprocessor ===
     if is_main_process:
         logging.info("Creating preprocessor and postprocessor")
     preprocessor, postprocessor = make_pre_post_processors(
@@ -592,18 +924,13 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         dataset_stats=dataset.meta.stats,
     )
 
-    # === Create Optimizer and Scheduler ===
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
 
-    # Optional: per-layer weight decay on suffix_embedder.time_mlp_{in,out} to
-    # bound σ_max growth at noise floor (alternative to RMSNorm). Splits the
-    # default param_group into two so AdamW applies a separate WD just to those
-    # ~2M params; non-time_mlp params keep the yaml's weight_decay (e.g. 1e-10).
     time_mlp_wd = float(getattr(cfg.policy, "time_mlp_weight_decay", 0.0) or 0.0)
     if time_mlp_wd > 0.0:
-        underlying = getattr(policy, "module", policy)  # unwrap DDP/FSDP
+        underlying = getattr(policy, "module", policy)
         time_mlp_params = []
         for n, p in underlying.named_parameters():
             if "suffix_embedder.time_mlp_in" in n or "suffix_embedder.time_mlp_out" in n:
@@ -611,24 +938,15 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         time_mlp_ids = {id(p) for p in time_mlp_params}
 
         new_groups = []
-        # Keep all original groups but strip out time_mlp params (they keep
-        # the yaml weight_decay etc.).
         for g in optimizer.param_groups:
             other = [p for p in g["params"] if id(p) not in time_mlp_ids]
             base = {k: v for k, v in g.items() if k != "params"}
             new_groups.append({**base, "params": other})
-        # Append a dedicated group for time_mlp params with override WD; inherit
-        # other settings (lr, betas, eps, ...) from the first group.
         base = {k: v for k, v in optimizer.param_groups[0].items()
                 if k != "params" and k != "weight_decay"}
         new_groups.append({**base, "params": time_mlp_params, "weight_decay": time_mlp_wd})
         optimizer.param_groups = new_groups
 
-        # The scheduler was built against the pre-split optimizer, so its
-        # base_lrs / lr_lambdas have the old group count. Rebuild it against the
-        # modified optimizer; otherwise torch's LRScheduler._update_lr hits
-        # `zip(param_groups, values, strict=True)` with mismatched lengths and
-        # crashes on the first scheduler.step() (torch >= 2.10).
         if cfg.scheduler is not None:
             lr_scheduler = cfg.scheduler.build(optimizer, cfg.steps)
 
@@ -640,13 +958,11 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     step = 0
 
-    # === Handle Checkpoint Resumption ===
     if cfg.resume and not cfg.fsdp.enable:
         step, optimizer, lr_scheduler = load_training_state(
             cfg.checkpoint_path, optimizer, lr_scheduler
         )
 
-    # === Log Training Configuration ===
     num_learnable_params = count_parameters(policy, only_trainable=True)
     num_total_params = count_parameters(policy, only_trainable=False)
 
@@ -668,7 +984,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # === Create DataLoader ===
     if hasattr(cfg.policy, "drop_n_last_frames"):
         shuffle = False
         sampler = EpisodeAwareSampler(
@@ -694,18 +1009,27 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         collate_fn=flashvla_collate_fn,
     )
 
-    # FSDP2 ignored_modules needs live module instances, so set it after model
-    # construction and before accelerator.prepare().
     fsdp_replicated_params_to_sync: list[torch.nn.Parameter] = []
-    if cfg.fsdp.enable and (cfg.fsdp.ignored_module_classes or cfg.fsdp.ignored_module_name_suffixes):
+    fp32_module_classes = (
+        set(getattr(cfg.fsdp, "fp32_module_classes", []))
+        if fsdp_mixed_precision == "bf16"
+        else set()
+    )
+    if cfg.fsdp.enable and (
+        cfg.fsdp.ignored_module_classes
+        or cfg.fsdp.ignored_module_name_suffixes
+        or fp32_module_classes
+    ):
         ignored_class_names = set(cfg.fsdp.ignored_module_classes)
+        all_ignored_class_names = ignored_class_names | fp32_module_classes
         ignored_name_suffixes = tuple(cfg.fsdp.ignored_module_name_suffixes)
         ignored = []
         seen_module_ids = set()
         matched_names = []
+        patched_fp32_layernorm_names = []
 
         for name, module in policy.named_modules():
-            class_match = type(module).__name__ in ignored_class_names
+            class_match = type(module).__name__ in all_ignored_class_names
             name_match = ignored_name_suffixes and name.endswith(ignored_name_suffixes)
             if not (class_match or name_match):
                 continue
@@ -713,6 +1037,9 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             if module_id in seen_module_ids:
                 continue
             seen_module_ids.add(module_id)
+            if fsdp_mixed_precision == "bf16" and isinstance(module, torch.nn.LayerNorm):
+                module.__class__ = Fp32LayerNorm
+                patched_fp32_layernorm_names.append(name or "<root>")
             ignored.append(module)
             matched_names.append(name or "<root>")
 
@@ -731,40 +1058,55 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             num_replicated_params = sum(param.numel() for param in fsdp_replicated_params_to_sync)
             logging.info(
                 f"FSDP2: ignoring {len(ignored)} module(s); "
-                f"classes={sorted(ignored_class_names)}, "
+                f"structural_classes={sorted(ignored_class_names)}, "
+                f"fp32_classes={sorted(fp32_module_classes)}, "
                 f"name_suffixes={list(ignored_name_suffixes)}, "
                 f"matches={preview}{suffix}, "
                 f"replicated_trainable_params_to_sync={num_replicated_params:,}"
             )
+            if patched_fp32_layernorm_names:
+                logging.info(
+                    "FSDP2: patched ignored LayerNorm modules for explicit fp32 compute: "
+                    f"{patched_fp32_layernorm_names}"
+                )
 
         if fsdp_replicated_params_to_sync:
             disable_optimizer_foreach(optimizer)
             if is_main_process:
                 logging.info("FSDP2: disabled optimizer foreach/fused kernels for mixed Tensor+DTensor params")
 
-    # === Prepare for Distributed Training ===
     accelerator.wait_for_everyone()
     policy, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         policy, optimizer, dataloader, lr_scheduler
     )
 
     if cfg.resume and cfg.fsdp.enable:
-        step = load_fsdp2_checkpoint(accelerator=accelerator, checkpoint_dir=Path(cfg.checkpoint_path))
+        step = load_fsdp2_checkpoint(
+            accelerator=accelerator,
+            checkpoint_dir=Path(cfg.checkpoint_path),
+            policy=policy,
+            optimizer=optimizer,
+            replicated_params=fsdp_replicated_params_to_sync,
+        )
         if is_main_process:
             logging.info(f"Loaded FSDP2 accelerator state from {cfg.checkpoint_path} at step {step}")
+
+    if fsdp_replicated_params_to_sync:
+        broadcast_replicated_parameters(fsdp_replicated_params_to_sync, accelerator)
+        if is_main_process:
+            logging.info("FSDP2: synchronized ignored trainable parameters from rank 0")
 
     dl_iter = cycle(dataloader)
 
     policy.train()
 
-    # When DeepSpeed runs with bf16/fp16 disabled (to preserve mixed-precision
-    # params), accelerator.autocast() is a no-op. Use torch.autocast explicitly.
     if cfg.deepspeed.enable and cfg.policy.dtype == "bfloat16":
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    elif cfg.fsdp.enable:
+        autocast_ctx = nullcontext()
     else:
-        autocast_ctx = None  # fall back to accelerator.autocast() in update_policy
+        autocast_ctx = None
 
-    # === Setup Metrics Tracking ===
     train_metrics = {
         "loss": AverageMeter("loss", ":.3f"),
         "grad_norm": AverageMeter("grdn", ":.3f"),
@@ -793,7 +1135,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             leave=True,
         )
 
-    # === Main Training Loop ===
     for _ in range(step, cfg.steps):
         step_compute_time = 0.0
 
@@ -831,7 +1172,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
 
-        # === Logging ===
         if is_log_step:
             logging.info(train_tracker)
             if wandb_logger:
@@ -847,7 +1187,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
 
-        # === Checkpointing ===
         if cfg.save_checkpoint and is_saving_step:
             checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
 
@@ -858,6 +1197,8 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                     step=step,
                     cfg=cfg,
                     policy=policy,
+                    optimizer=optimizer,
+                    replicated_params=fsdp_replicated_params_to_sync,
                     preprocessor=preprocessor,
                     postprocessor=postprocessor,
                 )
@@ -869,8 +1210,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                     logging.info(f"FSDP2 policy checkpointed at step {step}")
                 accelerator.wait_for_everyone()
             else:
-                # unwrap_model must be called on ALL ranks so that DeepSpeed can
-                # gather the full state_dict collectively (it's a NCCL all-gather).
                 unwrapped_policy = accelerator.unwrap_model(policy)
 
                 if is_main_process:
@@ -893,7 +1232,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
                 accelerator.wait_for_everyone()
 
-    # === Training Complete ===
     if is_main_process:
         progbar.close()
         logging.info("End of FlashVLA training")

@@ -49,11 +49,11 @@ def make_flashvla_smolvla_pre_post_processors(
 
     The pre-processing pipeline prepares input data for the model by:
     1.  Renaming features to match pretrained configurations.
-    2.  Normalizing input and output features based on dataset statistics.
-    3.  Adding a batch dimension.
-    4.  Ensuring the language task description ends with a newline character.
-    5.  Tokenizing the language task description.
-    6.  Moving all data to the specified device.
+    2.  Adding a batch dimension.
+    3.  Ensuring the language task description ends with a newline character.
+    4.  Tokenizing the language task description.
+    5.  Moving all data to the specified device.
+    6.  Normalizing input and output features based on dataset statistics.
 
     The post-processing pipeline handles the model's output by:
     1.  Moving data to the CPU.
@@ -68,7 +68,7 @@ def make_flashvla_smolvla_pre_post_processors(
     """
 
     input_steps = [
-        RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
+        RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
         SmolVLANewLineProcessor(),
         TokenizerProcessorStep(
@@ -124,15 +124,11 @@ class SmolVLANewLineProcessor(ComplementaryDataProcessorStep):
 
         new_complementary_data = dict(complementary_data)
 
-        # Handle both string and list of strings
         if isinstance(task, str):
-            # Single string: add newline if not present
             if not task.endswith("\n"):
                 new_complementary_data["task"] = f"{task}\n"
         elif isinstance(task, list) and all(isinstance(t, str) for t in task):
-            # List of strings: add newline to each if not present
             new_complementary_data["task"] = [t if t.endswith("\n") else f"{t}\n" for t in task]
-        # If task is neither string nor list of strings, leave unchanged
 
         return new_complementary_data
 

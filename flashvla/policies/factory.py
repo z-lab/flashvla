@@ -54,9 +54,6 @@ from lerobot.processor.converters import (
     transition_to_policy_action,
 )
 
-# Register each policy's custom ProcessorStep classes with ProcessorStepRegistry.
-# These modules register on import (decorator side-effect); we use importlib
-# to keep static checkers from flagging them as unused.
 import importlib as _importlib
 for _mod in (
     "flashvla.policies.pi0.processor",
@@ -121,7 +118,9 @@ def make_policy(
     Args:
         cfg: Policy configuration with type, device, pretrained_path, etc.
         ds_meta: Dataset metadata containing feature definitions and stats.
-        
+        env_cfg: Environment config used to derive features when ds_meta is None.
+        rename_map: Optional feature-rename map for visual-feature validation.
+
     Returns:
         Initialized policy ready for training or inference.
     """
@@ -140,21 +139,16 @@ def make_policy(
             raise ValueError("env_cfg cannot be None when ds_meta is not provided")
         features = env_to_policy_features(env_cfg)
 
-    # Normalization is now handled externally by the processor pipeline.
-    # Dataset stats are passed to make_pre_post_processors() instead of the policy.
 
-    # Set output features (actions) if not already configured
     cfg.output_features = {
         key: ft for key, ft in features.items() if ft.type is FeatureType.ACTION
     }
-    # Set input features (observations) if not already configured
     if not cfg.input_features:
         cfg.input_features = {
             key: ft for key, ft in features.items() if key not in cfg.output_features
         }
     kwargs["config"] = cfg
 
-    # Create policy: either from pretrained or fresh
     if cfg.pretrained_path:
         policy = policy_cls.from_pretrained(
             pretrained_name_or_path=cfg.pretrained_path,
@@ -163,7 +157,6 @@ def make_policy(
     else:
         policy = policy_cls(**kwargs)
 
-    # Move to target device and set to eval mode
     policy.to(cfg.device)
     policy.eval()
 
@@ -200,7 +193,6 @@ def make_pre_post_processors(
     Returns:
         A tuple of (preprocessor, postprocessor) pipelines.
     """
-    # If processor JSON files exist, use standard lerobot loading
     if pretrained_path:
         preprocessor_json = Path(pretrained_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
         postprocessor_json = Path(pretrained_path) / f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
@@ -223,7 +215,6 @@ def make_pre_post_processors(
                 ),
             )
 
-    # Create full processor pipelines based on policy type
     policy_type = policy_cfg.type
     if policy_type.startswith("pi05"):
         from flashvla.policies.pi05.processor import make_flashvla_pi05_pre_post_processors

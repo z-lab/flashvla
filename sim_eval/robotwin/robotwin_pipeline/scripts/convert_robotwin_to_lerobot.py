@@ -44,7 +44,6 @@ MOTORS = [
     "right_wrist_angle", "right_wrist_rotate", "right_gripper",
 ]
 
-# RoboTwin raw camera name -> LeRobot/pi05 camera key
 CAM_MAP = {
     "head_camera": "cam_high",
     "left_camera": "cam_left_wrist",
@@ -68,11 +67,11 @@ def decode_camera(ep: h5py.File, raw_cam: str) -> np.ndarray:
 def load_episode(ep_path: Path):
     """Return (state[T-1,14], action[T-1,14], {cam: imgs[T-1,H,W,3]})."""
     with h5py.File(ep_path, "r") as ep:
-        ja = ep["joint_action/vector"][:].astype(np.float32)  # (T, 14)
+        ja = ep["joint_action/vector"][:].astype(np.float32)
         imgs = {lr: decode_camera(ep, raw) for raw, lr in CAM_MAP.items()}
     state = ja[:-1]
     action = ja[1:]
-    imgs = {k: v[:-1] for k, v in imgs.items()}  # align to state (drop last)
+    imgs = {k: v[:-1] for k, v in imgs.items()}
     return state, action, imgs
 
 
@@ -105,7 +104,6 @@ def convert(task: str, setting: str, raw_root: Path, out_root: Path,
     if not hdf5_files:
         raise FileNotFoundError(f"No episode*.hdf5 under {raw_dir/'data'}")
 
-    # Peek first episode for image dims.
     _, _, imgs0 = load_episode(hdf5_files[0])
     h, w = imgs0["cam_high"].shape[1:3]
 

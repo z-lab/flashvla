@@ -51,14 +51,11 @@ def patched_get_safe_version(repo_id: str, revision: str | None) -> str:
     api = HfApi()
     dataset_info = api.list_repo_refs(repo_id, repo_type="dataset")
     
-    # Get all version tags
     versions = [tag.name for tag in dataset_info.tags if tag.name.startswith("v")]
     
     if not versions:
-        # No version tags, use main/revision
         return revision or "main"
     
-    # Parse and sort versions
     parsed_versions = []
     for v in versions:
         try:
@@ -71,14 +68,12 @@ def patched_get_safe_version(repo_id: str, revision: str | None) -> str:
     
     parsed_versions.sort(key=lambda x: x[0], reverse=True)
     
-    # If revision specified, try to use it
     if revision:
-        for pv, v in parsed_versions:
+        for _pv, v in parsed_versions:
             if v == revision:
                 logging.warning(f"Dataset {repo_id} is {v}, loading with v2.1 compatibility.")
                 return v
     
-    # Use latest version (even if it's v2.x)
     latest_parsed, latest_tag = parsed_versions[0]
     codebase_parsed = packaging.version.parse(CODEBASE_VERSION)
     
@@ -103,12 +98,10 @@ def patched_load_episodes(local_dir: Path):
     
     jsonl_path = local_dir / LEGACY_EPISODES_PATH
     
-    # v3.0 format: use original loader
     if not jsonl_path.exists():
         episodes = load_nested_dataset(local_dir / EPISODES_DIR)
         return episodes.select_columns([k for k in episodes.features if not k.startswith("stats/")])
     
-    # v2.1 format: parse jsonl and add required fields
     with open(jsonl_path) as f:
         episodes_list = sorted([json.loads(line) for line in f], key=lambda x: x["episode_index"])
     
@@ -117,22 +110,18 @@ def patched_load_episodes(local_dir: Path):
     chunks_size = info.get("chunks_size", 1000)
     fps = info.get("fps", 30)
     
-    # Add v3.0-style fields to each episode
     cumulative = 0
     for ep in episodes_list:
         ep_idx = ep["episode_index"]
         ep_chunk = ep_idx // chunks_size
         
-        # Dataset indices (global frame indices)
         ep["dataset_from_index"] = cumulative
         cumulative += ep["length"]
         ep["dataset_to_index"] = cumulative
         
-        # Data file indices
         ep["data/chunk_index"] = ep_chunk
         ep["data/file_index"] = ep_idx
         
-        # Video file indices and timestamps (v2.1: one video per episode)
         for vid_key in video_keys:
             ep[f"videos/{vid_key}/chunk_index"] = ep_chunk
             ep[f"videos/{vid_key}/file_index"] = ep_idx
@@ -163,14 +152,11 @@ def aggregate_stats(stats_list: list[dict]) -> dict:
         counts = np.stack([s["count"] for s in stats_ft_list])
         total_count = counts.sum(axis=0)
         
-        # Broadcast counts to match mean dimensions
         while counts.ndim < means.ndim:
             counts = np.expand_dims(counts, axis=-1)
         
-        # Weighted mean
         total_mean = (means * counts).sum(axis=0) / total_count
         
-        # Parallel variance: σ² = Σ(σ²_i + δ²_i) * n_i / N
         delta_means = means - total_mean
         total_variance = ((variances + delta_means ** 2) * counts).sum(axis=0) / total_count
         
@@ -182,7 +168,6 @@ def aggregate_stats(stats_list: list[dict]) -> dict:
             "count": total_count,
         }
     
-    # Aggregate each feature key
     data_keys = {key for stats in stats_list for key in stats}
     return {key: aggregate_feature([s[key] for s in stats_list if key in s]) for key in data_keys}
 
@@ -199,11 +184,9 @@ def patched_load_stats(local_dir: Path):
     """
     from lerobot.datasets.io_utils import STATS_PATH, load_json, cast_stats_to_numpy
     
-    # v3.0 format: single global stats file
     if (local_dir / STATS_PATH).exists():
         return cast_stats_to_numpy(load_json(local_dir / STATS_PATH))
     
-    # v2.1 format: aggregate per-episode stats
     episodes_stats_path = local_dir / "meta/episodes_stats.jsonl"
     if not episodes_stats_path.exists():
         return None
@@ -214,7 +197,6 @@ def patched_load_stats(local_dir: Path):
     if not episodes_stats:
         return None
     
-    # Convert to numpy and aggregate
     stats_list = [
         {k: {sk: np.array(sv) for sk, sv in v.items()} for k, v in ep["stats"].items()}
         for ep in episodes_stats
@@ -233,11 +215,9 @@ def patched_load_tasks(local_dir: Path):
     
     jsonl_path = local_dir / LEGACY_TASKS_PATH
     
-    # v3.0 format
     if not jsonl_path.exists():
         return pd.read_parquet(local_dir / DEFAULT_TASKS_PATH)
     
-    # v2.1 format
     with open(jsonl_path) as f:
         tasks_list = sorted([json.loads(line) for line in f], key=lambda x: x["task_index"])
     return pd.DataFrame({"task_index": [t["task_index"] for t in tasks_list]}, index=[t["task"] for t in tasks_list])
@@ -286,19 +266,16 @@ def apply_patches():
     import lerobot.datasets.utils as utils_module
     import lerobot.datasets.lerobot_dataset as dataset_module
     
-    # Patch get_safe_version in BOTH modules (lerobot_dataset imports it from utils)
     utils_module.get_safe_version = patched_get_safe_version
     dataset_module.get_safe_version = patched_get_safe_version
     
     
-    # Patch loading functions in both modules
     for module in [utils_module, dataset_module]:
         module.check_version_compatibility = patched_check_version
         module.load_episodes = patched_load_episodes
         module.load_tasks = patched_load_tasks
         module.load_stats = patched_load_stats
     
-    # Patch path methods on metadata class
     meta_cls = dataset_module.LeRobotDatasetMetadata
     meta_cls.get_data_file_path = make_patched_path_method(meta_cls.get_data_file_path, for_video=False)
     meta_cls.get_video_file_path = make_patched_path_method(meta_cls.get_video_file_path, for_video=True)
@@ -306,5 +283,4 @@ def apply_patches():
     logging.info("FlashVLA: Applied v2.1 compatibility patches to lerobot")
 
 
-# Apply patches on import
 apply_patches()

@@ -82,15 +82,12 @@ class FlashVLAPi05PrepareLanguageProcessorStep(ProcessorStep):
 
             state = deepcopy(state)
 
-            # State should already be normalized to [-1, 1] by NormalizerProcessorStep
             state_np = state.cpu().numpy()
             discretized_states = np.digitize(state_np, bins=np.linspace(-1, 1, 256 + 1)[:-1]) - 1
 
             full_prompts = []
             for i, task in enumerate(tasks):
                 cleaned_text = task.strip().replace("_", " ").replace("\n", " ")
-                # Multi-frame state [B, K, state_dim] → flatten to K*state_dim in
-                # temporal order (oldest → newest). Single-frame stays [B, state_dim].
                 per_sample = discretized_states[i]
                 if per_sample.ndim == 2:
                     per_sample = per_sample.reshape(-1)
@@ -137,8 +134,6 @@ def make_flashvla_pi05_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),
         AddBatchDimensionProcessorStep(),
-        # NOTE: NormalizerProcessorStep MUST come before language preparation
-        # because state discretization expects normalized state in [-1, 1] range
         NormalizerProcessorStep(
             features={**config.input_features, **config.output_features},
             norm_map=config.normalization_mapping,

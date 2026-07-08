@@ -64,9 +64,6 @@ from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.utils import init_logging
 from lerobot.utils.constants import OBS_PREFIX
 
-# benchmark_config sits next to this script (repo-root benchmarks/, not part of
-# the installed package); running `python benchmarks/benchmark_latency.py` puts
-# this directory on sys.path[0].
 from benchmark_config import BenchmarkConfig
 
 import flashvla.configs  # noqa: F401 — registers PI05 configs with draccus
@@ -76,9 +73,6 @@ logger = logging.getLogger(__name__)
 VALID_VARIANTS = ["baseline", "flashvla"]
 
 
-# ---------------------------------------------------------------------------
-# Shared utilities
-# ---------------------------------------------------------------------------
 
 
 def compute_latency_stats(latencies: list[float]) -> dict:
@@ -122,9 +116,6 @@ def compute_breakdown_stats(breakdowns: list[dict]) -> dict:
     return stats
 
 
-# ---------------------------------------------------------------------------
-# Dataset loading
-# ---------------------------------------------------------------------------
 
 def load_dataset(cfg: BenchmarkConfig) -> tuple[LeRobotDataset, LeRobotDatasetMetadata]:
     """Load dataset for benchmarking.
@@ -154,9 +145,6 @@ def load_dataset(cfg: BenchmarkConfig) -> tuple[LeRobotDataset, LeRobotDatasetMe
 
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
     n_frames = getattr(cfg.policy, "num_frames_per_view", 1)
-    # Only inject image delta_timestamps when actually stacking history.
-    # n_frames=1 with [0.0] makes dataset return (T=1, C, H, W); the policy's
-    # prepare_images expects (B, C, H, W), so leave images alone for n=1.
     if n_frames > 1:
         for key in ds_meta.features:
             if key.startswith(OBS_PREFIX + "images."):
@@ -173,9 +161,6 @@ def load_dataset(cfg: BenchmarkConfig) -> tuple[LeRobotDataset, LeRobotDatasetMe
     return dataset, ds_meta
 
 
-# ---------------------------------------------------------------------------
-# Policy loading
-# ---------------------------------------------------------------------------
 
 def _setup_features(cfg, ds_meta):
     """Common feature setup for policy loading.
@@ -230,9 +215,6 @@ def load_policy(variant: str, cfg: BenchmarkConfig, ds_meta: LeRobotDatasetMetad
     """Load the appropriate policy for the given variant."""
     _setup_features(cfg, ds_meta)
 
-    # Hardcode short language token length for latency benchmarking — the
-    # default 200 is wasteful (prefill is O(L_prefix^2)) and most prompts
-    # tokenize to <20.
     if hasattr(cfg.policy, "tokenizer_max_length"):
         if cfg.policy.tokenizer_max_length != 20:
             logger.info(
@@ -274,9 +256,6 @@ def load_policy(variant: str, cfg: BenchmarkConfig, ds_meta: LeRobotDatasetMetad
     return policy
 
 
-# ---------------------------------------------------------------------------
-# Batch preparation
-# ---------------------------------------------------------------------------
 
 def prepare_batch_dataloader(batch: dict, device: torch.device, preprocessor=None) -> dict:
     """Move a DataLoader batch to device + run policy preprocessor.
@@ -297,10 +276,6 @@ def prepare_batch_dataloader(batch: dict, device: torch.device, preprocessor=Non
     return prepared
 
 
-# ---------------------------------------------------------------------------
-# Benchmark loop (used by both baseline and flashvla — pure profiling,
-# we don't care about per-episode semantics, just throughput / per-stage cost)
-# ---------------------------------------------------------------------------
 
 def warmup_non_streaming(
     policy: PreTrainedPolicy,
@@ -367,7 +342,6 @@ def benchmark_non_streaming(
             start_time = perf_counter()
 
             if use_internal_breakdown:
-                # profile=True returns (actions, profile_results dict from torch.cuda.Event timing)
                 actions, profile_results = policy.predict_action_chunk(batch, profile=True)
             else:
                 actions = policy.predict_action_chunk(batch)
@@ -377,9 +351,6 @@ def benchmark_non_streaming(
                 torch.cuda.synchronize()
             latency = (perf_counter() - start_time) * 1000
 
-            # flashvla returns None during the rolling-buffer cold start
-            # (first num_buffer_slots-1 calls). Don't count those toward steady-state
-            # latency; just keep iterating until we have num_samples real samples.
             if actions is None:
                 cold_start_skipped += 1
                 continue
@@ -387,8 +358,6 @@ def benchmark_non_streaming(
             latencies.append(latency)
 
             if profile_results:
-                # 'total' is the sum of encode+prefill+action; exclude to avoid
-                # double-counting in the breakdown table.
                 breakdowns.append({k: v for k, v in profile_results.items() if k != "total"})
 
             if len(latencies) % 10 == 0:
@@ -405,9 +374,6 @@ def benchmark_non_streaming(
     return stats, bd_stats
 
 
-# ---------------------------------------------------------------------------
-# Console output
-# ---------------------------------------------------------------------------
 
 def print_results(variant: str, results: dict):
     """Print a uniform results table."""
@@ -433,9 +399,6 @@ def print_results(variant: str, results: dict):
     print("=" * 80 + "\n")
 
 
-# ---------------------------------------------------------------------------
-# Save results
-# ---------------------------------------------------------------------------
 
 def save_results(results: dict, cfg: BenchmarkConfig, variant: str):
     """Save benchmark results to JSON file."""
@@ -473,9 +436,6 @@ def save_results(results: dict, cfg: BenchmarkConfig, variant: str):
     logger.info(f"Results saved to: {output_path}")
 
 
-# ---------------------------------------------------------------------------
-# Main entry point
-# ---------------------------------------------------------------------------
 
 @parser.wrap()
 def benchmark_latency(cfg: BenchmarkConfig):
@@ -495,13 +455,9 @@ def benchmark_latency(cfg: BenchmarkConfig):
     if cfg.num_views == 3:
         cfg.policy.empty_cameras = 1
 
-    # Load dataset and policy
     dataset, ds_meta = load_dataset(cfg)
     policy = load_policy(variant, cfg, ds_meta)
 
-    # Build the policy's preprocessor (handles language tokenization,
-    # state/action normalization, device placement). Without this,
-    # predict_action_chunk fails on KeyError 'observation.language.tokens'.
     from flashvla.policies.factory import make_pre_post_processors
     preprocessor, _ = make_pre_post_processors(
         policy_cfg=cfg.policy,
@@ -510,9 +466,6 @@ def benchmark_latency(cfg: BenchmarkConfig):
         preprocessor_overrides={"device_processor": {"device": cfg.policy.device}},
     )
 
-    # Both variants use the same dataloader-based path. For flashvla,
-    # the rolling buffer is filled during warmup (set warmup_steps >=
-    # num_buffer_slots so cold-start is absorbed before measurement starts).
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,

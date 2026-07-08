@@ -31,23 +31,18 @@ class FlashVLARMSNorm(PiGemmaRMSNorm):
     """``PiGemmaRMSNorm`` with per-token adaRMS conditioning support."""
 
     def forward(self, x, cond=None):
-        dtype = x.dtype  # original dtype, could be half-precision
+        dtype = x.dtype
         normed_inputs = self._norm(x)
 
         if cond is None or self.dense is None:
-            # regular RMSNorm
-            # scale by learned parameter in float32 (matches source implementation)
             normed_inputs = normed_inputs * (1.0 + self.weight.float())
-            return normed_inputs.to(dtype), None  # return in original dtype with None gate
+            return normed_inputs.to(dtype), None
 
-        # adaptive RMSNorm (if cond is provided and dense layer exists)
         if cond.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dimension {self.cond_dim}, got {cond.shape[-1]}")
 
         modulation = self.dense(cond.to(self.dense.weight.dtype))
-        # Reshape modulation to broadcast properly: [batch, 1, features] for [batch, seq, features].
-        # Per-token cond ([B, L, D] -> modulation [B, L, 3D]) is left as-is.
-        if len(x.shape) == 3 and modulation.ndim == 2:  # [batch, seq, features]
+        if len(x.shape) == 3 and modulation.ndim == 2:
             modulation = modulation.unsqueeze(1)
 
         scale, shift, gate = torch.chunk(modulation, 3, dim=-1)

@@ -37,11 +37,9 @@ class PI0VLMConfig(PaliGemmaConfig):
     
     def __init__(self):
         super().__init__()
-        # Vocabulary configuration
         self._vocab_size = 257152
         self.image_token_index = 257152
         
-        # Text encoder (Gemma) configuration
         self.text_config.hidden_size = 2048
         self.text_config.intermediate_size = 16_384
         self.text_config.num_attention_heads = 8
@@ -51,10 +49,9 @@ class PI0VLMConfig(PaliGemmaConfig):
         self.text_config.hidden_activation = "gelu_pytorch_tanh"
         self.text_config.torch_dtype = "float32"
         self.text_config.vocab_size = 257152
-        self.text_config.use_adarms = False  # PI0 doesn't use adaRMS
+        self.text_config.use_adarms = False
         self.text_config.adarms_cond_dim = None
         
-        # Vision encoder (SigLIP) configuration
         self.vision_config.intermediate_size = 4304
         self.vision_config.projection_dim = 2048
         self.vision_config.projector_hidden_act = "gelu_fast"
@@ -78,9 +75,6 @@ class PI0ActionExpertConfig(GemmaConfig):
             hidden_activation="gelu_pytorch_tanh",
             torch_dtype="float32",
         )
-        # No adaRMS by default (key difference from PI0.5). pi0-flashvla flips
-        # use_adarms=True and sets adarms_cond_dim=hidden_size when
-        # use_adarms_time_cond is enabled.
         self.use_adarms = False
         self.adarms_cond_dim = None
 
@@ -89,21 +83,17 @@ class PI0ActionExpertConfig(GemmaConfig):
 class PI0Config(PreTrainedConfig):
     """Main configuration for PI0 policy."""
 
-    # === Model Architecture ===
     paligemma_variant: str = "gemma_2b"
     action_expert_variant: str = "gemma_300m"
     dtype: str = "bfloat16"
 
-    # === Action Prediction ===
     n_obs_steps: int = 1
-    chunk_size: int = 50  # Number of actions to predict
-    n_action_steps: int = 50  # Number of actions to execute
+    chunk_size: int = 50
+    n_action_steps: int = 50
 
-    # Padding dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
 
-    # === Flow Matching Parameters ===
     num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
     time_sampling_beta_beta: float = 1.0
@@ -112,15 +102,11 @@ class PI0Config(PreTrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
 
-    # === Image Processing ===
     image_resolution: tuple[int, int] = (224, 224)
     empty_cameras: int = 0
 
-    # === Tokenization ===
     tokenizer_max_length: int = 200
 
-    # === Normalization ===
-    # Training with MEAN_STD will be a lot smoother and more stable than QUANTILES
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -129,34 +115,26 @@ class PI0Config(PreTrainedConfig):
         }
     )
 
-    # === Training Settings ===
-    # NOTE: gradient_checkpointing is not read anywhere at runtime. Kept only
-    # because existing checkpoints serialized it into config.json and draccus
-    # rejects unknown fields when loading.
     gradient_checkpointing: bool = False
     compile_model: bool = False
     compile_mode: str = "max-autotune"
     device: str | None = None
 
-    # Attention/MLP fusion
     fuse_qkv: bool = False
     fuse_gate_up: bool = False
 
-    # === Optimizer Settings ===
     optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
 
-    # === Scheduler Settings ===
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
     tokenizer_max_length: int = 200
 
-    # === Sub-model Configurations ===
     vlm_config: PI0VLMConfig = field(default_factory=PI0VLMConfig)
     action_expert_config: PI0ActionExpertConfig = field(default_factory=PI0ActionExpertConfig)
 
@@ -180,7 +158,6 @@ class PI0Config(PreTrainedConfig):
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
-        # Add empty camera placeholders
         for i in range(self.empty_cameras):
             key = f"observation.images.empty_camera_{i}"
             empty_camera = PolicyFeature(
@@ -189,7 +166,6 @@ class PI0Config(PreTrainedConfig):
             )
             self.input_features[key] = empty_camera
 
-        # Ensure state feature exists
         if "observation.state" not in self.input_features:
             state_feature = PolicyFeature(
                 type=FeatureType.STATE,
@@ -197,7 +173,6 @@ class PI0Config(PreTrainedConfig):
             )
             self.input_features["observation.state"] = state_feature
 
-        # Ensure action feature exists
         if "action" not in self.output_features:
             action_feature = PolicyFeature(
                 type=FeatureType.ACTION,
@@ -249,46 +224,15 @@ class PI0FlashVLAConfig(PI0Config):
     (``action_time_mlp_in/out``) — no FiLM, no adaRMS, no GemmaRMSNorm patching.
     """
 
-    chunk_size: int = 10           # Actions per slot (fixed)
-    num_buffer_slots: int = 5      # N = number of slots in buffer
-    n_action_steps: int = 10       # Execute one full slot per step
+    chunk_size: int = 10
+    num_buffer_slots: int = 5
+    n_action_steps: int = 10
 
-    # Cold-start action source for the N-1 buffer warm-up calls.
-    #   "zero_delta"    — postprocessor(action) == 0 (safe for delta-action envs).
-    #   "current_state" — postprocessor(action) == current qpos (required for absolute-qpos envs).
     cold_start_mode: str = "zero_delta"
 
-    # Freeze the VLM backbone, train only action expert + suffix embedder.
     freeze_vlm: bool = False
 
-    # NOTE: `time_mlp_weight_decay` is deliberately not exposed. pi05 needs it to
-    # bound σ_max growth at the noise floor caused by the FiLM amplification cascade
-    # through 18 adaRMS layers. pi0 has no FiLM — time only feeds one mixing layer
-    # (action_time_mlp_in concat). If empirical instability appears, expose later
-    # and adapt train_flashvla.py:511's name selector for "action_time_mlp_*".
 
-    # When True, add pi05-style per-layer FiLM (adaRMS) conditioning ON TOP OF
-    # pi0's existing concat-time token path. Purely additive — no pi0_base
-    # weight is dropped or repurposed:
-    #   [reused from pi0_base, unchanged role]
-    #     * ``action_in_proj``       — actions → D.
-    #     * ``state_proj``           — state → D.
-    #     * ``action_time_mlp_in``   — Linear[2D→D] over cat(action, time);
-    #     * ``action_time_mlp_out``  — Linear[D→D]; together they still produce
-    #                                  the suffix token embedding (exactly as
-    #                                  baseline pi0).
-    #   [new, parallel cond paths]
-    #     * ``time_mlp_in/out``      — sin/cos(time) → cond (silu'd D→D twice).
-    #     * ``state_mlp_in/out``     — state_proj output → cond. ``state_mlp_out``
-    #                                  is zero-init for DiT-style start.
-    #     * Patched ``GemmaRMSNorm`` — per-norm ``dense`` Linear (FiLM scale,
-    #                                  shift, gate); zero-init weight+bias.
-    # State suffix token is dropped (state now enters only via cond). Suffix
-    # contains only the N*C action tokens.
-    # At step 0, ``dense.weight = state_mlp_out = 0`` ⇒ FiLM is identity, state
-    # cond is 0 ⇒ the model is mathematically equivalent to pi0_base with
-    # concat-time on the per-slot time schedule. Training learns FiLM
-    # modulation and state-via-cond from there.
     use_adarms_time_cond: bool = False
 
     @property

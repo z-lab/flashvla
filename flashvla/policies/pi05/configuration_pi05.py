@@ -43,11 +43,9 @@ class PI05VLMConfig(PaliGemmaConfig):
 
     def __init__(self):
         super().__init__()
-        # Vocabulary configuration
         self._vocab_size = 257152
         self.image_token_index = 257152
 
-        # Text encoder (Gemma) configuration
         self.text_config.hidden_size = 2048
         self.text_config.intermediate_size = 16_384
         self.text_config.num_attention_heads = 8
@@ -60,7 +58,6 @@ class PI05VLMConfig(PaliGemmaConfig):
         self.text_config.use_adarms = False
         self.text_config.adarms_cond_dim = None
 
-        # Vision encoder (SigLIP) configuration
         self.vision_config.intermediate_size = 4304
         self.vision_config.projection_dim = 2048
         self.vision_config.projector_hidden_act = "gelu_fast"
@@ -87,7 +84,6 @@ class PI05ActionExpertConfig(GemmaConfig):
             hidden_activation="gelu_pytorch_tanh",
             torch_dtype="float32",
         )
-        # Adaptive RMS conditioning; cond_dim must equal the expert hidden size.
         self.use_adarms = True
         self.adarms_cond_dim = 1024
 
@@ -96,25 +92,20 @@ class PI05ActionExpertConfig(GemmaConfig):
 class PI05Config(PreTrainedConfig):
     """Main configuration for PI0.5 policy."""
 
-    # === Model Architecture ===
-    paligemma_variant: str = "gemma_2b"  # VLM backbone: "gemma_300m" or "gemma_2b"
-    action_expert_variant: str = "gemma_300m"  # Action expert: "gemma_300m" or "gemma_2b"
-    dtype: str = "bfloat16"  # Compute dtype: "bfloat16" or "float32"
+    paligemma_variant: str = "gemma_2b"
+    action_expert_variant: str = "gemma_300m"
+    dtype: str = "bfloat16"
 
-    # === Action Prediction ===
-    n_obs_steps: int = 1  # Number of observation frames to use
-    chunk_size: int = 50  # Number of actions to predict per inference
-    n_action_steps: int = 50  # Number of actions to execute before re-inference
+    n_obs_steps: int = 1
+    chunk_size: int = 50
+    n_action_steps: int = 50
 
-    # Shorter state and action vectors will be padded to these dimensions
     max_state_dim: int = 32
     max_action_dim: int = 32
 
-    # State conditioning: use robot state in adarmsnorm
     state_cond: bool = False
 
-    # === Flow Matching Parameters ===
-    num_inference_steps: int = 10  # Denoising steps during inference
+    num_inference_steps: int = 10
     time_sampling_beta_alpha: float = 1.5
     time_sampling_beta_beta: float = 1.0
     time_sampling_scale: float = 0.999
@@ -122,15 +113,12 @@ class PI05Config(PreTrainedConfig):
     min_period: float = 4e-3
     max_period: float = 4.0
 
-    # === Image Processing ===
     image_resolution: tuple[int, int] = (224, 224)
     empty_cameras: int = 0
     num_frames_per_view: int = 1
 
-    # === Tokenization ===
     tokenizer_max_length: int = 200
 
-    # === Normalization ===
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
             "VISUAL": NormalizationMode.IDENTITY,
@@ -139,34 +127,26 @@ class PI05Config(PreTrainedConfig):
         }
     )
 
-    # === Training Settings ===
-    # NOTE: attention_backend / gradient_checkpointing are not read anywhere at
-    # runtime. They are kept only because existing checkpoints serialized them
-    # into config.json and draccus rejects unknown fields when loading.
     attention_backend: str = "sdpa"
     gradient_checkpointing: bool = False
-    freeze_vision_encoder: bool = False  # Freeze SigLIP vision tower only (keep language backbone trainable)
+    freeze_vision_encoder: bool = False
     compile_model: bool = False
     compile_mode: str = "max-autotune"
     device: str | None = None
 
-    # Attention/MLP fusion (for inference optimization)
     fuse_qkv: bool = False
     fuse_gate_up: bool = False
 
-    # === Optimizer Settings ===
     optimizer_lr: float = 2.5e-5
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
     optimizer_weight_decay: float = 0.01
     optimizer_grad_clip_norm: float = 1.0
 
-    # === Scheduler Settings ===
     scheduler_warmup_steps: int = 1_000
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
-    # === Sub-model Configurations ===
     vlm_config: PI05VLMConfig = field(default_factory=PI05VLMConfig)
     action_expert_config: PI05ActionExpertConfig = field(default_factory=PI05ActionExpertConfig)
 
@@ -247,22 +227,13 @@ class PI05FlashVLAConfig(PI05Config):
     and padding-based warmup instead of full ODE cold start.
     """
 
-    chunk_size: int = 10           # Actions per slot (fixed)
-    num_buffer_slots: int = 5      # N = number of slots in buffer
-    n_action_steps: int = 10       # Execute one full slot per step
-    freeze_vlm: bool = False        # Freeze VLM backbone, only train action expert + suffix embedder
+    chunk_size: int = 10
+    num_buffer_slots: int = 5
+    n_action_steps: int = 10
+    freeze_vlm: bool = False
 
-    # Optional weight-decay applied ONLY to the suffix embedder's time_mlp_in /
-    # time_mlp_out parameters (weight + bias). Direct attack on the cascade
-    # root cause (σ_max growth at noise floor) without changing forward pass
-    # like RMSNorm did. Default 0.0 = no decay (matches old training setup).
-    # Recommended starting value for 50k cosine: 1e-4.
     time_mlp_weight_decay: float = 0.0
 
-    # Cold start action source (for the N-1 steps before the buffer is full).
-    #   "zero_delta":   return -mean/std so postprocessor(action) = 0 (safe for delta-action envs).
-    #   "current_state": return the current robot state as the action (required for absolute-qpos
-    #                    envs like RoboTwin, where zero joints would crash the robot).
     cold_start_mode: str = "zero_delta"
 
     @property

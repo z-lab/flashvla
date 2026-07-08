@@ -30,8 +30,6 @@ Protocol exposed to ``RoboTwin/script/policy_model_server.py``:
 
 from __future__ import annotations
 
-import os
-import sys
 from typing import Any
 
 import numpy as np
@@ -60,12 +58,7 @@ class PI05FlashVLAModel:
             device = "cpu"
         self.device = torch.device(device)
 
-        # Use PreTrainedConfig (ChoiceRegistry base) so the "type" discriminator
-        # in config.json dispatches correctly via draccus.
         cfg = PreTrainedConfig.from_pretrained(policy_path)
-        # RoboTwin actions are absolute qpos → zero-delta cold start would
-        # send the arm to joint zero. Force current_state mode regardless of
-        # what the checkpoint was trained with.
         cfg.cold_start_mode = cold_start_mode
         cfg.device = str(self.device)
         if n_action_steps is not None:
@@ -101,11 +94,6 @@ class PI05FlashVLAModel:
             f"compile_model={getattr(self.policy.config, 'compile_model', False)}"
         )
 
-        # Eager warmup: run compile + CUDA-graph capture at server boot with a
-        # fabricated obs so the first real get_action call returns fast. RoboTwin's
-        # ModelClient socket has a finite timeout; lazy warmup with
-        # compile_mode='max-autotune' (this ckpt's default) can take 5-10 min
-        # and reliably blows past it.
         self._eager_warmup()
 
     def _eager_warmup(self) -> None:
@@ -145,16 +133,9 @@ class PI05FlashVLAModel:
             print(f"[pi05_flashvla] eager warmup done in {_time.perf_counter()-t0:.1f}s — "
                   "first real get_action will be fast")
         finally:
-            # Wipe the dummy instruction so the first real get_action treats
-            # itself as new-episode-start.
             self._current_instruction = None
-            # Belt-and-suspenders cleanup: manager.warmup already calls
-            # manager.reset() (→ policy.reset() which zeroes action_buffer +
-            # _step_counter), but call it again here so it's impossible for
-            # the dummy obs to leak into episode 1's state.
             self.manager.reset()
 
-    # ── dispatcher (optional — server also uses direct getattr) ───────
 
     def call(self, func_name: str, obs: Any = None):
         method = getattr(self, func_name, None)
@@ -164,7 +145,6 @@ class PI05FlashVLAModel:
             return method()
         return method(obs)
 
-    # ── RPC surface exposed to the client ──────────────────────────────
 
     def reset_model(self, *_args, **_kwargs) -> None:
         """Clear episode state. Called at the start of every rollout.
@@ -178,8 +158,6 @@ class PI05FlashVLAModel:
         self._current_instruction = None
         print("[pi05_flashvla] model reset")
 
-    # Alias — RoboTwin local mode calls `reset()` on some policy classes,
-    # and it's a more idiomatic Python name. Both route to the same cleanup.
     def reset(self, *args, **kwargs) -> None:
         self.reset_model(*args, **kwargs)
 
@@ -195,7 +173,6 @@ class PI05FlashVLAModel:
         """
         instruction = obs_dict["instruction"]
         if instruction != self._current_instruction:
-            # First call of a new episode after reset: set the instruction.
             self._current_instruction = instruction
             print(f"[pi05_flashvla] instruction: {instruction[:80]}")
 
@@ -203,8 +180,8 @@ class PI05FlashVLAModel:
         batch = self.preprocessor(batch)
 
         with torch.inference_mode():
-            action = self.manager.act(batch)              # [1, 14] normalized GPU
-        action = self.postprocessor(action)               # [1, 14] real qpos
+            action = self.manager.act(batch)
+        action = self.postprocessor(action)
 
         return action.detach().to("cpu").numpy().reshape(-1).astype(np.float32)
 
@@ -239,7 +216,6 @@ class PI05FlashVLAModel:
         action = self.postprocessor(action)
         return action.detach().to("cpu").numpy().reshape(-1).astype(np.float32)
 
-    # ── helpers ───────────────────────────────────────────────────────
 
     def _encode_batch(self, obs_dict: dict) -> dict[str, Any]:
         def _to_chw_float(hwc_uint8: np.ndarray) -> torch.Tensor:

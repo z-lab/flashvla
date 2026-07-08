@@ -84,7 +84,6 @@ def create_sinusoidal_pos_embedding(
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute the outer product
     scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, :] * time[:, None]
     pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
@@ -108,8 +107,8 @@ def make_att_2d_masks(pad_masks, att_masks):
           block can attend all previous blocks and all tokens on the same block.
 
     Args:
-      input_mask: bool[B, N] true if its part of the input, false if padding.
-      mask_ar: int32[B, N] mask that's 1 where previous tokens cannot depend on
+      pad_masks: bool[B, N] true if its part of the input, false if padding.
+      att_masks: int32[B, N] mask that's 1 where previous tokens cannot depend on
         it and 0 where it shares the same attention mask as the previous token.
     """
     if att_masks.ndim != 2:
@@ -125,7 +124,6 @@ def make_att_2d_masks(pad_masks, att_masks):
 
 
 def resize_with_pad(img, width, height, pad_value=-1):
-    # assume no-op when width height fits already
     if img.ndim != 4:
         raise ValueError(f"(b,c,h,w) expected, but {img.shape}")
 
@@ -141,7 +139,6 @@ def resize_with_pad(img, width, height, pad_value=-1):
     pad_height = max(0, int(height - resized_height))
     pad_width = max(0, int(width - resized_width))
 
-    # pad on left and top of image
     padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
     return padded_img
 
@@ -169,47 +166,29 @@ def unnormalize(x, min_val, max_val):
 
 
 def safe_arcsin(value):
-    # This ensures that the input stays within
-    # [−1,1] to avoid invalid values for arcsin
     return torch.arcsin(torch.clamp(value, -1.0, 1.0))
 
 
 def aloha_gripper_to_angular(value):
-    # Aloha transforms the gripper positions into a linear space. The following code
-    # reverses this transformation to be consistent with smolvla which is pretrained in
-    # angular space.
-    #
-    # These values are coming from the Aloha code:
-    # PUPPET_GRIPPER_POSITION_OPEN, PUPPET_GRIPPER_POSITION_CLOSED
     value = unnormalize(value, min_val=0.01844, max_val=0.05800)
 
-    # This is the inverse of the angular to linear transformation inside the Interbotix code.
     def linear_to_radian(linear_position, arm_length, horn_radius):
         value = (horn_radius**2 + linear_position**2 - arm_length**2) / (2 * horn_radius * linear_position)
         return safe_arcsin(value)
 
-    # The constants are taken from the Interbotix code.
     value = linear_to_radian(value, arm_length=0.036, horn_radius=0.022)
 
-    # Normalize to [0, 1].
-    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
     return normalize(value, min_val=0.4, max_val=1.5)
 
 
 def aloha_gripper_from_angular(value):
-    # Convert from the gripper position used by smolvla to the gripper position that is used by Aloha.
-    # Note that the units are still angular but the range is different.
 
-    # The values 0.4 and 1.5 were measured on an actual Trossen robot.
     value = unnormalize(value, min_val=0.4, max_val=1.5)
 
-    # These values are coming from the Aloha code:
-    # PUPPET_GRIPPER_JOINT_OPEN, PUPPET_GRIPPER_JOINT_CLOSE
     return normalize(value, min_val=-0.6213, max_val=1.4910)
 
 
 def aloha_gripper_from_angular_inv(value):
-    # Directly inverts the gripper_from_angular function.
     value = unnormalize(value, min_val=-0.6213, max_val=1.4910)
     return normalize(value, min_val=0.4, max_val=1.5)
 
@@ -227,8 +206,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
     ):
         """
         Args:
-            config: Policy configuration class instance or None, in which case the default instantiation of
-                    the configuration class is used.
+            config: Policy configuration class instance.
         """
 
         super().__init__(config)
@@ -249,11 +227,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _get_action_chunk(
         self, batch: dict[str, Tensor], noise: Tensor | None = None,
     ) -> Tensor:
-        # TODO: Check if this for loop is needed.
-        # Context: In fact, self.queues contains only ACTION field, and in inference, we don't have action in the batch
-        # In the case of offline inference, we have the action in the batch
-        # that why without the k != ACTION check, it will raise an error because we are trying to stack
-        # on an empty container.
         for k in batch:
             if k in self._queues and k != ACTION:
                 batch[k] = torch.stack(list(self._queues[k]), dim=1)
@@ -267,7 +240,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
             images, img_masks, lang_tokens, lang_masks, state, noise=noise,
         )
 
-        # Unpad actions
         original_action_dim = self.config.action_feature.shape[0]
         actions = actions[:, :, :original_action_dim]
 
@@ -300,8 +272,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
     ) -> Tensor:
         """Select a single action given environment observations.
 
-        This method wraps `select_actions` in order to return one action at a time for execution in the
-        environment. It works by managing the actions in a queue and only calling `select_actions` when the
+        This method wraps `_get_action_chunk` in order to return one action at a time for execution in the
+        environment. It works by managing the actions in a queue and only calling `_get_action_chunk` when the
         queue is empty.
         """
         self.eval()
@@ -311,8 +283,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if len(self._queues[ACTION]) == 0:
             actions = self._get_action_chunk(batch, noise)
 
-            # `self.predict_action_chunk` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-            # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
 
         return self._queues[ACTION].popleft()
@@ -351,23 +321,21 @@ class SmolVLAPolicy(PreTrainedPolicy):
             losses = losses * in_episode_bound.unsqueeze(-1)
             loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
-        # Remove padding
         losses = losses[:, :, : self.config.max_action_dim]
         loss_dict["losses_after_rm_padding"] = losses.clone().mean().item()
 
         if reduction == "none":
-            # Return per-sample losses (B,) by averaging over time and action dims
             per_sample_loss = losses.mean(dim=(1, 2))
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
-            # Default: return scalar mean loss
             loss = losses.mean()
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
 
     def prepare_images(self, batch):
-        """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
+        """Apply SmolVLA preprocessing to the images, like resizing to the configured
+        resize_imgs_with_padding size (default 512x512) and padding to keep aspect ratio, and
         convert pixel range from [0.0, 1.0] to [-1.0, 1.0] as requested by SigLIP.
         """
         images = []
@@ -379,13 +347,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
             )
-        # Preprocess image features present in the batch
         for key in present_img_keys:
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
 
-            # Normalize from range [0,1] to [-1,1] as expacted by siglip
             img = img * 2.0 - 1.0
 
             bsize = img.shape[0]
@@ -397,8 +363,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
             images.append(img)
             img_masks.append(mask)
 
-        # Create image features not present in the batch
-        # as fully 0 padded images.
         for num_empty_cameras in range(len(missing_img_keys)):
             if num_empty_cameras >= self.config.empty_cameras:
                 break
@@ -409,28 +373,22 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return images, img_masks
 
     def _pi_aloha_decode_state(self, state):
-        # Flip the joints.
         for motor_idx in [1, 2, 8, 9]:
             state[:, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
         for motor_idx in [6, 13]:
             state[:, motor_idx] = aloha_gripper_to_angular(state[:, motor_idx])
         return state
 
     def _pi_aloha_encode_actions(self, actions):
-        # Flip the joints.
         for motor_idx in [1, 2, 8, 9]:
             actions[:, :, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
         for motor_idx in [6, 13]:
             actions[:, :, motor_idx] = aloha_gripper_from_angular(actions[:, :, motor_idx])
         return actions
 
     def _pi_aloha_encode_actions_inv(self, actions):
-        # Flip the joints again.
         for motor_idx in [1, 2, 8, 9]:
             actions[:, :, motor_idx] *= -1
-        # Reverse the gripper transformation that is being applied by the Aloha runtime.
         for motor_idx in [6, 13]:
             actions[:, :, motor_idx] = aloha_gripper_from_angular_inv(actions[:, :, motor_idx])
         return actions
@@ -460,11 +418,10 @@ def pad_tensor(tensor, max_len, pad_value=0):
     """
     b, d = tensor.shape[:2]
 
-    # Create a padded tensor of max_len and copy the existing values
     padded_tensor = torch.full(
         (b, max_len, *tensor.shape[2:]), pad_value, dtype=tensor.dtype, device=tensor.device
     )
-    padded_tensor[:, :d] = tensor  # Efficient in-place copy
+    padded_tensor[:, :d] = tensor
 
     return padded_tensor
 
@@ -535,7 +492,6 @@ class VLAFlowMatching(nn.Module):
         self.image_end_token = torch.tensor([self.fake_image_token], dtype=torch.long)
         self.prefix_length = self.config.prefix_length
 
-        # Compile model if requested
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
@@ -590,9 +546,7 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_start_mask)
 
             img_emb = self.vlm_with_expert.embed_image(img)
-            img_emb = img_emb
 
-            # Normalize image embeddings
             img_emb_dim = img_emb.shape[-1]
             img_emb = img_emb * torch.tensor(img_emb_dim**0.5, dtype=img_emb.dtype, device=img_emb.device)
 
@@ -618,7 +572,6 @@ class VLAFlowMatching(nn.Module):
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
-        # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
         lang_emb = lang_emb * math.sqrt(lang_emb_dim)
 
@@ -638,7 +591,6 @@ class VLAFlowMatching(nn.Module):
         state_mask = torch.ones(bsize, states_seq_len, dtype=torch.bool, device=device)
         pad_masks.append(state_mask)
 
-        # Set attention masks so that image and language inputs do not attend to state or actions
         att_masks += [1] * (states_seq_len)
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -656,17 +608,15 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def embed_suffix(self, noisy_actions, timestep):
-        """Embed state, noisy_actions, timestep to prepare for Expert Gemma processing."""
+        """Embed noisy_actions and timestep to prepare for Expert Gemma processing."""
         embs = []
         pad_masks = []
         att_masks = []
 
-        # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions)
         device = action_emb.device
         bsize = action_emb.shape[0]
         dtype = action_emb.dtype
-        # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
             self.vlm_with_expert.expert_hidden_size,
@@ -680,17 +630,15 @@ class VLAFlowMatching(nn.Module):
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
         action_time_emb = self.action_time_mlp_in(action_time_emb)
-        action_time_emb = F.silu(action_time_emb)  # swish == silu
+        action_time_emb = F.silu(action_time_emb)
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
-        # Add to input tokens
         embs.append(action_time_emb)
 
         bsize, action_time_dim = action_time_emb.shape[:2]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_time_mask)
 
-        # Set attention masks so that image, language and state inputs do not attend to action tokens
         att_masks += [1] * self.config.chunk_size
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
@@ -730,7 +678,6 @@ class VLAFlowMatching(nn.Module):
             fill_kv_cache=False,
         )
         suffix_out = suffix_out[:, -self.config.chunk_size :]
-        # Original openpi code, upcast attention output
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
@@ -758,7 +705,6 @@ class VLAFlowMatching(nn.Module):
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        # Compute image and language key value cache
         _, past_key_values = self.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,

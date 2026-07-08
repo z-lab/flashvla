@@ -61,7 +61,6 @@ class QKVLinear(nn.Module):
         self.num_heads = total_num_heads
         self.num_kv_heads = total_num_kv_heads
 
-        # Output size: Q heads + K heads + V heads
         output_size = (self.num_heads + 2 * self.num_kv_heads) * self.head_size
         self.weight = nn.Parameter(torch.empty(output_size, hidden_size))
         if bias:
@@ -85,13 +84,11 @@ class QKVLinear(nn.Module):
 
         bsz, seqlen, _ = x.shape
         
-        # Single fused projection
         out = F.linear(x, self.weight, self.bias)
 
-        # Reshape and split into Q, K, V
         total_heads = self.num_heads + 2 * self.num_kv_heads
         out = out.view(bsz, seqlen, total_heads, self.head_size)
-        out = out.permute(0, 2, 1, 3).contiguous()  # [B, H_total, L, D]
+        out = out.permute(0, 2, 1, 3).contiguous()
 
         q = out[:, : self.num_heads]
         k = out[:, self.num_heads : self.num_heads + self.num_kv_heads]

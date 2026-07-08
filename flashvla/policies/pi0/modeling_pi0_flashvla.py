@@ -60,10 +60,6 @@ from flashvla.policies.pi0.utils import (
     pad_vector,
     resize_with_pad,
 )
-# Cross-import the cold-start helpers and sinusoidal-block helper from pi05.
-# These are policy-agnostic (they only consume the postprocessor safetensors
-# format which pi0 emits identically). Avoids duplicating ~250 lines of
-# norm-mode handling and serialization logic.
 from flashvla.policies.pi05.utils import (
     ColdStartStats,
     compute_cold_start_action,
@@ -90,9 +86,6 @@ def _cuda_sync():
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# Suffix embedder with per-slot time
-# ============================================================
 
 
 class PI0StreamingSuffixEmbedder(nn.Module):
@@ -130,18 +123,14 @@ class PI0StreamingSuffixEmbedder(nn.Module):
         width = config.action_expert_config.hidden_size
         self.action_in_proj = nn.Linear(config.max_action_dim, width)
         self.state_proj = nn.Linear(config.max_state_dim, width)
-        # Token-embedding path (kept in BOTH modes). In adaRMS mode the
-        # output is still the suffix token embedding — same use as baseline.
         self.action_time_mlp_in = nn.Linear(width * 2, width)
         self.action_time_mlp_out = nn.Linear(width, width)
 
         if config.use_adarms_time_cond:
-            # New cond paths in parallel — additive, not replacing baseline.
             self.time_mlp_in = nn.Linear(width, width)
             self.time_mlp_out = nn.Linear(width, width)
             self.state_mlp_in = nn.Linear(width, width)
             self.state_mlp_out = nn.Linear(width, width)
-            # state_mlp_out zero-init → state contributes 0 to cond at step 0.
             nn.init.zeros_(self.state_mlp_out.weight)
             nn.init.zeros_(self.state_mlp_out.bias)
 
@@ -186,8 +175,7 @@ class PI0StreamingSuffixEmbedder(nn.Module):
         state = state.to(dtype=proj_dtype)
         noisy_actions = noisy_actions.to(dtype=proj_dtype)
 
-        # Per-token time via repeat_interleave + sinusoidal positional emb
-        time_per_token = time_per_slot.repeat_interleave(C, dim=1)  # [B, L_act]
+        time_per_token = time_per_slot.repeat_interleave(C, dim=1)
         time_emb = create_sinusoidal_pos_embedding_for_blocks(
             time_per_token,
             self.config.action_expert_config.hidden_size,
@@ -195,35 +183,29 @@ class PI0StreamingSuffixEmbedder(nn.Module):
             max_period=self.config.max_period,
             device=device,
         )
-        time_emb = time_emb.to(dtype=proj_dtype)  # [B, L_act, D]
+        time_emb = time_emb.to(dtype=proj_dtype)
 
-        action_emb = self.action_in_proj(noisy_actions)  # [B, L_act, D]
+        action_emb = self.action_in_proj(noisy_actions)
 
-        # ===== Token embedding (same in BOTH modes — pi0 baseline path) =====
         action_time_emb = torch.cat([action_emb, time_emb], dim=-1)
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)
-        action_time_emb = self.action_time_mlp_out(action_time_emb)  # [B, L_act, D]
+        action_time_emb = self.action_time_mlp_out(action_time_emb)
 
         if self.config.use_adarms_time_cond:
-            # ===== adaRMS path: additive on top of baseline =====
-            # Time cond: separate pi05-style MLP off the same sin/cos time_emb.
             time_cond = self.time_mlp_in(time_emb)
             time_cond = F.silu(time_cond)
             time_cond = self.time_mlp_out(time_cond)
-            time_cond = F.silu(time_cond)  # [B, L_act, D]
+            time_cond = F.silu(time_cond)
 
-            # State cond: state_proj → state_mlp_in/out (out zero-init).
-            state_emb = self.state_proj(state)  # [B, D]
+            state_emb = self.state_proj(state)
             state_emb = self.state_mlp_in(state_emb)
             state_emb = F.silu(state_emb)
             state_emb = self.state_mlp_out(state_emb)
-            state_emb = F.silu(state_emb)  # [B, D]
+            state_emb = F.silu(state_emb)
 
-            adarms_cond = time_cond + state_emb.unsqueeze(1)  # [B, L_act, D]
+            adarms_cond = time_cond + state_emb.unsqueeze(1)
 
-            # Token embedding is the same as baseline pi0 (action_time_emb).
-            # State is no longer a suffix token — it enters only via cond.
             embs = action_time_emb
 
             if padding_mask is not None:
@@ -234,40 +216,35 @@ class PI0StreamingSuffixEmbedder(nn.Module):
             else:
                 pad_masks = torch.ones(bsize, L_act, dtype=torch.bool, device=device)
 
-            # Block-causal across slots (slot first token = boundary).
             slot_att = torch.zeros(num_slots, C, dtype=embs.dtype, device=device)
             slot_att[:, 0] = 1
-            att_masks = slot_att.flatten(0, 1).unsqueeze(0).expand(bsize, -1)  # [B, L_act]
+            att_masks = slot_att.flatten(0, 1).unsqueeze(0).expand(bsize, -1)
 
             return embs, pad_masks, att_masks, adarms_cond
 
-        # ===== concat path (default, no FiLM) =====
         if padding_mask is not None:
             action_time_emb = action_time_emb * padding_mask.unsqueeze(-1).to(action_time_emb.dtype)
 
-        state_emb = self.state_proj(state)[:, None, :]  # [B, 1, D]
-        embs = torch.cat([state_emb, action_time_emb], dim=1)  # [B, 1+L_act, D]
+        state_emb = self.state_proj(state)[:, None, :]
+        embs = torch.cat([state_emb, action_time_emb], dim=1)
 
         if padding_mask is not None:
             action_pad = padding_mask
         else:
             action_pad = torch.ones(bsize, L_act, dtype=torch.bool, device=device)
         state_pad = torch.ones(bsize, 1, dtype=torch.bool, device=device)
-        pad_masks = torch.cat([state_pad, action_pad], dim=1)  # [B, 1+L_act]
+        pad_masks = torch.cat([state_pad, action_pad], dim=1)
 
         slot_att = torch.zeros(num_slots, C, dtype=embs.dtype, device=device)
         slot_att[:, 0] = 1
         action_att = slot_att.flatten(0, 1)
         state_att = torch.ones(1, dtype=embs.dtype, device=device)
-        full_att = torch.cat([state_att, action_att], dim=0)  # [1+L_act]
+        full_att = torch.cat([state_att, action_att], dim=0)
         att_masks = full_att.unsqueeze(0).expand(bsize, -1)
 
         return embs, pad_masks, att_masks, None
 
 
-# ============================================================
-# Core model
-# ============================================================
 
 
 class PI0FlashVLAModel(nn.Module):
@@ -279,23 +256,15 @@ class PI0FlashVLAModel(nn.Module):
         self.N = config.num_buffer_slots
         self.C = config.chunk_size
 
-        # Backbone models. When use_adarms_time_cond=True, flip the action
-        # expert's config so lerobot's PiGemma modules build
-        # RMSNorms WITH ``dense`` FiLM layers (cond_dim=hidden_size). The
-        # dense layers are zero-init in weight, but bias is NOT — we zero
-        # bias post-hoc in from_pretrained to get true DiT identity at step 0.
         if config.use_adarms_time_cond:
             config.action_expert_config.use_adarms = True
             config.action_expert_config.adarms_cond_dim = config.action_expert_config.hidden_size
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
 
-        # Embedders
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI0StreamingSuffixEmbedder(config)
 
-        # Shared transformer layers — reuse baseline pi0 layer (no per-token
-        # adaRMS, conds[1]=None throughout)
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
             PI0ModelLayer(
@@ -306,33 +275,21 @@ class PI0FlashVLAModel(nn.Module):
             for i in range(num_hidden_layers)
         ])
 
-        # Output projection
         self.action_out_proj = nn.Linear(config.action_expert_config.hidden_size, config.max_action_dim)
 
-        # bf16 conversion (mirrors baseline pi0)
         self.to_bfloat16_for_selected_params(getattr(config, "dtype", "float32"))
 
-        # Persistent 0-d int64 buffer for cold-start step counter — same
-        # trick as pi05 streaming to enable single CUDA-graph capture across
-        # all cold-start step values.
         self.register_buffer("_cold_step_t", torch.zeros((), dtype=torch.int64), persistent=False)
 
         if config.compile_model:
             torch.set_float32_matmul_precision("high")
-            # Only the steady-state branch has static shapes; cold-start uses
-            # _cold_step_t indirection but still varies in mask layout, so we
-            # leave it eager.
             self._cold_start = torch.compile(self._cold_start, mode=config.compile_mode)
             self._steady_streaming = torch.compile(self._steady_streaming, mode=config.compile_mode)
 
-    # ------------------------------------------------------------------
-    # bf16 + fusion helpers (mirror baseline pi0)
-    # ------------------------------------------------------------------
 
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
         modules = [self.vlm, self.action_expert]
         params_to_keep_float32 = [
-            # Keep the vision input embeddings, layernorms, and final norm in float32.
             "vision_tower.vision_model.embeddings.patch_embedding.weight",
             "vision_tower.vision_model.embeddings.patch_embedding.bias",
             "vision_tower.vision_model.embeddings.position_embedding.weight",
@@ -353,7 +310,6 @@ class PI0FlashVLAModel(nn.Module):
             raise ValueError(f"Invalid precision: {precision}")
 
     def init_qkv_fusion_from_existing(self) -> None:
-        # Lazy import to avoid circular dependency
         from flashvla.layers.linear import QKVLinear
 
         backbones = [self.vlm.model.language_model, self.action_expert.model]
@@ -413,9 +369,6 @@ class PI0FlashVLAModel(nn.Module):
     def sample_noise(self, shape, device):
         return torch.normal(mean=0.0, std=1.0, size=shape, dtype=torch.float32, device=device)
 
-    # ------------------------------------------------------------------
-    # Shared-obs time sampling (per-chunk)
-    # ------------------------------------------------------------------
 
     def _build_per_chunk_time(
         self,
@@ -451,13 +404,10 @@ class PI0FlashVLAModel(nn.Module):
         time_per_slot = torch.where(
             is_real[None, :, :], time_per_slot, torch.ones_like(time_per_slot),
         )
-        time_per_slot = time_per_slot.reshape(batch_size, -1)  # [B, N*S]
+        time_per_slot = time_per_slot.reshape(batch_size, -1)
         time_per_token = time_per_slot.repeat_interleave(C, dim=1)
         return time_per_slot, time_per_token
 
-    # ------------------------------------------------------------------
-    # Training: shared-observation forward
-    # ------------------------------------------------------------------
 
     def forward_shared_observation(
         self, images, img_masks, tokens, masks,
@@ -484,17 +434,14 @@ class PI0FlashVLAModel(nn.Module):
             batch_size, device,
         )
 
-        # x_t needs per-token times
         time_expanded = time_per_token.unsqueeze(-1)
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # Shared VLM prefix — encode once
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.prefix_embedder(
             images, img_masks, tokens, masks,
         )
 
-        # Per-config suffix: flatten (B, N) into the batch axis for the embedder.
         num_slots_per_config = N
         states_flat = states.unsqueeze(1).expand(batch_size, N, -1).reshape(batch_size * N, -1)
         x_t_flat = x_t.view(batch_size * N, H_cfg, -1)
@@ -507,8 +454,6 @@ class PI0FlashVLAModel(nn.Module):
         embs_flat, pad_flat, att_flat, cond_flat = self.suffix_embedder(
             states_flat, x_t_flat, time_per_slot_flat, padding_mask=real_mask_flat,
         )
-        # concat mode: embs_flat [B*N, 1+H_cfg, D], cond_flat=None
-        # adaRMS mode: embs_flat [B*N, H_cfg, D],   cond_flat [B*N, H_cfg, D]
         L_suf = embs_flat.shape[1]
         use_adarms = self.config.use_adarms_time_cond
 
@@ -517,7 +462,6 @@ class PI0FlashVLAModel(nn.Module):
         suffix_att_masks = att_flat[:batch_size]
 
         if cond_flat is not None:
-            # Reshape per-token cond to match concatenated suffix: [B, N*L_suf, D]
             suffix_adarms_cond = cond_flat.view(batch_size, N, L_suf, -1).reshape(batch_size, N * L_suf, -1)
         else:
             suffix_adarms_cond = None
@@ -545,31 +489,25 @@ class PI0FlashVLAModel(nn.Module):
         _, _ = self.vlm.language_model.norm(hidden_states[0], cond=None)
         suffix_out, _ = self.action_expert.model.norm(hidden_states[1], cond=suffix_adarms_cond)
 
-        # Reshape; in concat mode slice off per-config state token, in adaRMS the
-        # suffix is already action-only.
         suffix_out = suffix_out.view(batch_size, N, L_suf, -1)
         if use_adarms:
-            action_out = suffix_out  # [B, N, H_cfg, D]
+            action_out = suffix_out
         else:
-            action_out = suffix_out[:, :, 1:, :]  # [B, N, H_cfg, D]
+            action_out = suffix_out[:, :, 1:, :]
         action_out = action_out.reshape(batch_size, N * H_cfg, -1)
         action_out = action_out.to(dtype=self.action_out_proj.weight.dtype)
-        v_t = self.action_out_proj(action_out)  # [B, N*H_cfg, action_dim]
+        v_t = self.action_out_proj(action_out)
 
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        # Build loss mask: exclude padded positions
         if action_is_pad is not None:
-            loss_mask = ~action_is_pad  # [B, N*H_cfg]
+            loss_mask = ~action_is_pad
         else:
             loss_mask = torch.ones(batch_size, N * H_cfg, dtype=torch.bool, device=device)
 
         losses = losses[loss_mask]
         return losses
 
-    # ------------------------------------------------------------------
-    # Inference: denoise_step + cold start + steady streaming
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def denoise_step(
@@ -601,7 +539,7 @@ class PI0FlashVLAModel(nn.Module):
             pad_masks, att_masks, suffix_embs.dtype,
         )
 
-        L_suf = suffix_embs.shape[1]  # concat: 1+buf_len; adaRMS: buf_len
+        L_suf = suffix_embs.shape[1]
         attention_mask = full_attention_mask[:, :, -L_suf:, :]
         position_ids = full_position_ids[:, -L_suf:]
 
@@ -613,13 +551,12 @@ class PI0FlashVLAModel(nn.Module):
         suffix_hidden = hidden_states[1]
         suffix_hidden, _ = self.action_expert.model.norm(suffix_hidden, cond=suffix_adarms_cond)
 
-        # Slice off state token (idx 0) in concat mode; adaRMS suffix is action-only.
         if self.config.use_adarms_time_cond:
             action_hidden = suffix_hidden
         else:
             action_hidden = suffix_hidden[:, 1:, :]
         action_hidden = action_hidden.to(dtype=self.action_out_proj.weight.dtype)
-        return self.action_out_proj(action_hidden)  # [B, buf_len, action_dim]
+        return self.action_out_proj(action_hidden)
 
     @torch.no_grad()
     def _cold_start(self, images, img_masks, tokens, masks, state, buffer, step_counter, profile=False):
@@ -662,7 +599,6 @@ class PI0FlashVLAModel(nn.Module):
         if profile:
             _ev_record(_evs[2])
 
-        # Vectorized mask/time construction (mirrors pi05 streaming exactly)
         num_real = step_counter + 1
 
         slot_idx = torch.arange(buf_slots, device=device)
@@ -672,7 +608,7 @@ class PI0FlashVLAModel(nn.Module):
         time_slot = (N - num_real + 1 + slot_idx).to(torch.float32) / N
         time_slot = torch.where(is_real, time_slot, torch.ones_like(time_slot))
 
-        time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)  # [B, buf_slots]
+        time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)
         padding_mask = is_real.unsqueeze(0).unsqueeze(2).expand(bsz, -1, C).reshape(bsz, buf_len)
 
         v_t = self.denoise_step(
@@ -738,7 +674,6 @@ class PI0FlashVLAModel(nn.Module):
                 conds_prefill, use_cache=True,
             )
 
-        # Steady-state time vector
         time_slot = torch.arange(1, N + 1, device=device, dtype=torch.float32) / N
         time_per_slot = time_slot.unsqueeze(0).expand(bsz, -1)
 
@@ -803,9 +738,6 @@ class PI0FlashVLAModel(nn.Module):
         return actions_to_execute, buffer, step_counter + 1, profile_results
 
 
-# ============================================================
-# Policy wrapper
-# ============================================================
 
 
 class PI0FlashVLAPolicy(PreTrainedPolicy):
@@ -824,7 +756,6 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
 
         self.model = PI0FlashVLAModel(config)
 
-        # Pre-allocate streaming buffer (action slots only — state is per-call)
         buf_len = config.total_buffer_length
         self.register_buffer(
             "action_buffer",
@@ -886,9 +817,6 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
                 raise FileNotFoundError(f"Could not resolve 'model.safetensors' for {pretrained_name_or_path}")
             original_state_dict = load_file(resolved_file)
 
-        # Weight key mapping — same prefix_rules as baseline pi0; new
-        # suffix embedder preserves the action_in_proj / state_proj /
-        # action_time_mlp_in/out names so no remapping needed.
         prefix_rules: list[tuple[str, str]] = [
             ("model.action_in_proj.", "model.suffix_embedder.action_in_proj."),
             ("model.action_out_proj.", "model.action_out_proj."),
@@ -916,27 +844,12 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
         mapped_sd: dict[str, Tensor] = {}
         for old_key, value in original_state_dict.items():
             new_key = map_key(old_key)
-            # Skip keys that don't exist in the target (e.g. when adaRMS mode
-            # drops ``action_time_mlp_out`` — pi0_base has those weights but
-            # we don't create the layer).
             if new_key not in target_sd:
                 continue
             if target_sd[new_key].shape != value.shape:
                 continue
             mapped_sd[new_key] = value
 
-        # adaRMS mode: swap action expert's RMSNorms to flashvla's per-token-aware
-        # patched class, and zero out FiLM dense layers + state_mlp_out that
-        # the ckpt did NOT provide (i.e. fresh-init from pi0_base). For layers
-        # the ckpt DOES contain (continuing from a flashvla-trained adaRMS ckpt),
-        # leave the zero-init alone — load_state_dict below will overwrite
-        # with the trained weights.
-        # Why zero BEFORE load: PiGemmaRMSNorm.__init__ already
-        # zero-inits dense.weight, but GemmaPreTrainedModel.post_init() (run
-        # inside cls(config)) calls _init_weights on every nn.Linear which
-        # overwrites that with N(0, initializer_range). So we re-zero post-
-        # __init__; doing it pre-load_state_dict makes "ckpt missing → DiT
-        # identity, ckpt present → trained weights" both work automatically.
         if getattr(config, "use_adarms_time_cond", False):
             from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
             from lerobot.policies.pi_gemma import (
@@ -986,7 +899,6 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
         if getattr(config, "fuse_gate_up", True):
             instance.model.init_mlp_fusion_from_existing()
 
-        # Cold-start stats for the N-1 warm-up calls.
         instance._cold_start_stats = load_cold_start_stats(pretrained_name_or_path)
 
         return instance

@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Compute EXACT pooled normalization stats over RoboTwin sub-datasets.
 
-When MultiActionStreamingDataset pools per-subset stats via lerobot's
+When MultiFlashVLADataset pools per-subset stats via lerobot's
 aggregate_stats(), min/max/mean/std are exact but quantiles (q01/q99 — the
 only stats QUANTILES normalization actually reads) are approximated by a
 count-weighted average of per-subset quantiles. This script instead computes
@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]  # lerobot DEFAULT_QUANTILES
+QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 FEATURES = ["action", "observation.state"]
 
 
@@ -71,7 +71,6 @@ def main():
     subsets = [args.root / t / sd for t in tasks for sd in args.subdirs]
     print(f"{len(tasks)} tasks x {len(args.subdirs)} subdirs = {len(subsets)} subsets")
 
-    # Accumulate raw frames + per-subset stats.json quantiles (for comparison)
     chunks: dict[str, list[np.ndarray]] = {ft: [] for ft in FEATURES}
     sub_stats: list[dict] = []
     for subset in subsets:
@@ -87,7 +86,6 @@ def main():
         pooled[ft] = exact_stats(values)
         print(f"\n=== {ft}: {values.shape[0]} frames ===")
 
-        # How far off is aggregate_stats' count-weighted quantile average?
         counts = np.array([s[ft]["count"][0] for s in sub_stats], dtype=np.float64)
         exact_range = np.array(pooled[ft]["q99"]) - np.array(pooled[ft]["q01"])
         for qk in ("q01", "q99"):

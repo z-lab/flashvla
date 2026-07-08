@@ -23,14 +23,8 @@ from lerobot.optim.schedulers import (
 from lerobot.utils.constants import OBS_IMAGES
 
 
-# NOTE: deliberately NOT decorated with ``@PreTrainedConfig.register_subclass("smolvla")``.
-# lerobot's own ``SmolVLAConfig`` already registers that name with draccus.
-# flashvla dispatches via ``flashvla.policies.factory.get_policy_class`` instead, so
-# callers must pass an explicit ``config=SmolVLAConfig(...)`` when loading hub
-# checkpoints to avoid the registry resolving to lerobot's class.
 @dataclass
 class SmolVLAConfig(PreTrainedConfig):
-    # Input / output structure.
     n_obs_steps: int = 1
     chunk_size: int = 50
     n_action_steps: int = 50
@@ -43,40 +37,27 @@ class SmolVLAConfig(PreTrainedConfig):
         }
     )
 
-    # Shorter state and action vectors will be padded
     max_state_dim: int = 32
     max_action_dim: int = 32
 
-    # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
 
-    # Add empty images. Used by smolvla_aloha_sim which adds the empty
-    # left and right wrist cameras in addition to the top camera.
     empty_cameras: int = 0
 
-    # Converts the joint and gripper values from the standard Aloha space to
-    # the space used by the pi internal runtime which was used to train the base model.
     adapt_to_pi_aloha: bool = False
 
-    # Converts joint dimensions to deltas with respect to the current state before passing to the model.
-    # Gripper dimensions will remain in absolute values.
     use_delta_joint_actions_aloha: bool = False
 
-    # Tokenizer
     tokenizer_max_length: int = 48
 
-    # Decoding
     num_steps: int = 10
 
-    # Attention utils
     use_cache: bool = True
 
-    # Finetuning settings
     freeze_vision_encoder: bool = True
     train_expert_only: bool = True
     train_state_proj: bool = True
 
-    # Training presets
     optimizer_lr: float = 1e-4
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
     optimizer_eps: float = 1e-8
@@ -87,27 +68,27 @@ class SmolVLAConfig(PreTrainedConfig):
     scheduler_decay_steps: int = 30_000
     scheduler_decay_lr: float = 2.5e-6
 
-    vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"  # Select the VLM backbone.
-    load_vlm_weights: bool = False  # Set to False in case of training the expert from scratch. True when init from pretrained SmolVLA weights
+    vlm_model_name: str = "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"
+    load_vlm_weights: bool = False
 
-    add_image_special_tokens: bool = False  # Whether to use special image tokens around image features.
+    add_image_special_tokens: bool = False
 
     attention_mode: str = "cross_attn"
 
     prefix_length: int = -1
 
-    pad_language_to: str = "longest"  # "max_length"
+    pad_language_to: str = "longest"
 
-    num_expert_layers: int = -1  # Less or equal to 0 is the default where the action expert has the same number of layers of VLM. Otherwise the expert have less layers.
-    num_vlm_layers: int = 16  # Number of layers used in the VLM (first num_vlm_layers layers)
-    self_attn_every_n_layers: int = 2  # Interleave SA layers each self_attn_every_n_layers
-    expert_width_multiplier: float = 0.75  # The action expert hidden size (wrt to the VLM)
+    num_expert_layers: int = -1
+    num_vlm_layers: int = 16
+    self_attn_every_n_layers: int = 2
+    expert_width_multiplier: float = 0.75
 
-    min_period: float = 4e-3  # sensitivity range for the timestep used in sine-cosine positional encoding
+    min_period: float = 4e-3
     max_period: float = 4.0
 
-    compile_model: bool = False  # Whether to use torch.compile for model optimization
-    compile_mode: str = "max-autotune"  # Torch compile mode
+    compile_model: bool = False
+    compile_mode: str = "max-autotune"
 
     def __post_init__(self):
         super().__post_init__()
@@ -174,46 +155,17 @@ class SmolVLAFlashVLAConfig(SmolVLAConfig):
     - State stays in the prefix (smolvla's native layout — unlike pi0/lingbot
       which would put state at suffix index 0). Shared-observation training
       reuses one prefix encoding across all N buffer configs.
-    - The suffix's per-token AR causal pattern (``att_masks=[1]*L_act``) is
-      preserved; slot-block-causal structure emerges automatically.
+    - The suffix uses pi05/pi0-style block-causal ``att_masks=[1]+[0]*(C-1)`` per
+      slot (replacing the baseline's per-token AR ``[1]*L_act``); slot-block-causal
+      structure emerges.
     """
 
-    # Buffer / chunking — same as pi0 streaming defaults
     chunk_size: int = 10
     num_buffer_slots: int = 5
     n_action_steps: int = 10
 
-    # Cold-start action source for the N-1 warm-up calls
-    cold_start_mode: str = "zero_delta"  # or "current_state"
+    cold_start_mode: str = "zero_delta"
 
-    # When True, add pi05-style per-layer FiLM (adaRMS) conditioning ON TOP OF
-    # smolvla_base's existing concat-time token path. Purely additive — no
-    # baseline weight is dropped or repurposed:
-    #   [reused from smolvla_base, unchanged role]
-    #     * ``action_in_proj``       — actions → D.
-    #     * ``state_proj``           — state → D (stays in PREFIX, not suffix).
-    #     * ``action_time_mlp_in``   — Linear[2D→D] over cat(action, time).
-    #     * ``action_time_mlp_out``  — Linear[D→D]; together they still produce
-    #                                  the suffix token embedding (exactly as
-    #                                  baseline smolvla).
-    #   [new, parallel cond path]
-    #     * ``time_mlp_in/out``      — sin/cos(time) → cond (silu'd D→D twice,
-    #                                  random init; matches pi0 design).
-    #     * Patched ``LlamaAdaRMSNorm`` — per-norm ``dense`` Linear (FiLM scale +
-    #                                  shift; no gate since SmolVLMWithExpert's
-    #                                  layer doesn't use a gated residual).
-    #                                  Zero-init weight + bias.
-    # State stays in the PREFIX (smolvla's native layout); option-A — state is
-    # NOT routed through cond. Suffix contains only the N*C action tokens.
-    # At step 0, ``dense.weight = 0`` ⇒ FiLM is identity ⇒ the model is
-    # mathematically equivalent to smolvla_base with concat-time on the
-    # per-slot time schedule. Training learns FiLM modulation from there.
-    #
-    # NOTE: smolvla's expert is SmolLM2 (Llama 3-style architecture, uses
-    # ``LlamaRMSNorm`` — formula ``normed * weight`` with weight init 1.0).
-    # We patch by SWAPPING the expert's LlamaRMSNorm instances with our own
-    # ``LlamaAdaRMSNorm`` that reuses the loaded ``weight`` and adds
-    # ``(1+scale)*normed + shift`` on top via the FiLM dense layer.
     use_adarms_time_cond: bool = False
 
     @property

@@ -26,7 +26,6 @@ where θ depends on position and dimension index.
 Reference: https://arxiv.org/abs/2104.09864
 """
 
-# TODO: use flashinfer kernel
 
 import torch
 from torch import nn
@@ -50,10 +49,8 @@ def apply_rotary_emb(
     Returns:
         Rotated tensor [..., D].
     """
-    # Split into two halves for rotation
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
     
-    # Apply rotation
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
     
@@ -86,18 +83,14 @@ class RotaryEmbedding(nn.Module):
         self.head_size = head_size
         assert rotary_dim == head_size, "rotary_dim must equal head_size"
         
-        # Compute inverse frequencies: 1 / (base^(2i/d))
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         
-        # Compute position embeddings for all positions
         t = torch.arange(max_position_embeddings, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)  # [max_pos, rotary_dim/2]
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
         
-        # Precompute cos and sin
         cos = freqs.cos()
         sin = freqs.sin()
         
-        # Cache as [max_pos, rotary_dim]
         cache = torch.cat((cos, sin), dim=-1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
@@ -117,15 +110,12 @@ class RotaryEmbedding(nn.Module):
         Returns:
             Tuple of (rotated_query, rotated_key).
         """
-        # Look up cos/sin for each position
-        cos_sin = self.cos_sin_cache[positions]  # [B, L, D]
-        cos, sin = cos_sin.chunk(2, dim=-1)  # [B, L, D/2] each
+        cos_sin = self.cos_sin_cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
 
-        # Reshape for broadcasting across heads: [B, 1, L, D/2]
         cos = cos.unsqueeze(1)
         sin = sin.unsqueeze(1)
 
-        # Apply rotation to Q and K
         query = apply_rotary_emb(query, cos, sin)
         key = apply_rotary_emb(key, cos, sin)
         

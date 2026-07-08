@@ -113,25 +113,13 @@ class AsyncStreamingActionManager:
 
         self.device = next(self.policy.parameters()).device
 
-        # Streaming policies need a cold-start fallback when
-        # predict_action_chunk returns None. Baseline pi05 always returns a
-        # chunk, so we just bypass the fallback for it.
         self._is_streaming = policy.config.type in (
             "pi05-flashvla",
             "pi0-flashvla",
             "smolvla-flashvla",
         )
-        # Cold-start stats are pre-loaded on the policy by
-        # PI05FlashVLAPolicy.from_pretrained. May be absent for
-        # non-streaming policies or policies built from scratch.
         self.cold_start_stats = getattr(policy, "_cold_start_stats", None)
 
-        # Rolling chunk state:
-        #   current_chunk: [B, n_action_steps, action_dim] numpy, the chunk
-        #     whose indices we're currently consuming.
-        #   next_chunk:    [B, n_action_steps, action_dim] GPU tensor,
-        #     pre-computed via async launch, pending the sync at transition.
-        #   chunk_index:   position within current_chunk (0..n_action_steps).
         self.current_chunk: Optional[np.ndarray] = None
         self.next_chunk: Optional[torch.Tensor] = None
         self.chunk_index = 0
@@ -172,7 +160,6 @@ class AsyncStreamingActionManager:
         if chunk is not None:
             return chunk
 
-        # Cold-start fallback (streaming only).
         if not self._is_streaming:
             raise RuntimeError(
                 "predict_action_chunk returned None for non-streaming policy "
@@ -187,14 +174,12 @@ class AsyncStreamingActionManager:
             device=self.device,
             state_normalized=processed_obs.get("observation.state"),
         )
-        # cold: [1, action_dim] (zero_delta) or [B, action_dim] (current_state)
         if cold.shape[0] == 1 and bsz > 1:
             cold = cold.expand(bsz, -1)
         if cold.shape[0] != bsz:
             raise ValueError(
                 f"cold-start chunk batch {cold.shape[0]} != env batch {bsz}"
             )
-        # tile per-step: [B, action_dim] -> [B, n_action_steps, action_dim]
         chunk = cold.unsqueeze(1).expand(bsz, self.n_action_steps, self.action_dim).contiguous()
         return chunk
 
@@ -210,15 +195,9 @@ class AsyncStreamingActionManager:
             Action tensor ``[B, action_dim]`` on ``self.device``. Caller is
             responsible for postprocessing (unnormalize) and moving to CPU.
         """
-        # ---- Chunk boundary management ----
         if not self.is_running():
-            # First call (or after reset): no precomputed chunk available,
-            # launch synchronously. This is the unavoidable first-frame cost.
             self.current_chunk = self._launch_inference(processed_obs).detach().cpu().numpy()
         elif self.chunk_index == 0:
-            # Wrapped to 0 last call → transition. In async mode the next
-            # chunk was pre-launched; sync it now (cheap if GPU has finished).
-            # In sync mode (overlap_steps=0) we fall back to a blocking launch.
             if self.next_chunk is not None:
                 self.current_chunk = self.next_chunk.detach().cpu().numpy()
                 self.next_chunk = None
@@ -230,23 +209,14 @@ class AsyncStreamingActionManager:
                     "transition. Did _launch_inference fail silently?"
                 )
 
-        # ---- Async launch of the *next* chunk ----
-        # This call is dispatch-only under compile+cuda-graph; the GPU work
-        # runs in the background while we consume current_chunk[8..9].
         if self._should_launch_next():
             self.next_chunk = self._launch_inference(processed_obs)
 
-        # ---- Pull current action ----
-        # current_chunk: [B, n_action_steps, action_dim] (numpy CPU)
         action_np = self.current_chunk[:, self.chunk_index, :]
         action_t = torch.from_numpy(action_np).to(self.device)
 
-        # ---- Advance index; signal transition on wrap ----
         self.chunk_index = (self.chunk_index + 1) % self.n_action_steps
         if self.chunk_index == 0:
-            # Setting current_chunk to None lets next call detect transition
-            # (is_running stays True because next_chunk has the pending GPU
-            # tensor in async mode).
             self.current_chunk = None
 
         return action_t
@@ -291,8 +261,6 @@ class AsyncStreamingActionManager:
             torch.cuda.synchronize()
         elapsed = time.perf_counter() - t0
 
-        # Reset streaming state — buffer should not carry warmup obs into
-        # the real eval.
         self.reset()
 
         logging.info(

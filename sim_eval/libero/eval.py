@@ -15,7 +15,7 @@
 # limitations under the License.
 """Evaluate an FlashVLA policy with async chunk-overlap inference.
 
-Async variant of ``lerobot_eval_flashvla.py``. The control loop
+Async variant of the synchronous FlashVLA eval loop. The control loop
 launches the NEXT inference ``inference_overlap_steps`` steps before the
 current chunk ends; under torch.compile + CUDA graphs that launch is
 non-blocking and the GPU work runs in parallel with the remaining
@@ -167,8 +167,6 @@ def rollout(
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
 
-    # Build the async manager. .reset() resets both manager state and the
-    # underlying policy's streaming buffer.
     action_manager = AsyncStreamingActionManager(
         policy=policy,
         overlap_steps=inference_overlap_steps,
@@ -183,16 +181,10 @@ def rollout(
     all_rewards = []
     all_successes = []
     all_dones = []
-    # Step timing for async-overlap verification. We log each manager.act
-    # wall-clock and tag it by whether the call would have triggered a
-    # blocking sync in sync-mode (chunk_index == 0 OR chunk_index == n - overlap).
-    # If async is truly working, transition-step latency should NOT be much
-    # higher than internal-step latency.
     step_latencies_ms: list[float] = []
-    step_is_transition: list[bool] = []  # True if a launch_next or transition happened
+    step_is_transition: list[bool] = []
 
     step = 0
-    # Keep track of which environments are done.
     done = np.array([False] * env.num_envs)
     max_steps = env.call("_max_episode_steps")[0]
     progbar = trange(
@@ -203,34 +195,16 @@ def rollout(
     )
     check_env_attributes_and_types(env)
     while not np.all(done) and step < max_steps:
-        # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
         if return_observations:
             all_observations.append(deepcopy(observation))
 
-        # Infer "task" from attributes of environments.
         observation = add_envs_task(env, observation)
 
-        # Apply environment-specific preprocessing (e.g., LiberoProcessorStep for LIBERO)
         observation = env_preprocessor(observation)
 
         observation = preprocessor(observation)
 
-        # Per-step timing: wall-clock of manager.act() WITHOUT any forced
-        # cuda.synchronize(), so the async overlap is preserved and the
-        # measured wall-clock reflects real deployment throughput. What each
-        # kind of step then measures:
-        #   - internal step: pure numpy index → sub-ms.
-        #   - launch step (chunk_index == n_action_steps - overlap): a
-        #     non-blocking predict_action_chunk dispatch → sub-ms; the GPU
-        #     runs the chunk in the background during the following env steps.
-        #   - transition step (chunk_index == 0): act() does next_chunk.cpu(),
-        #     which blocks ONLY on whatever inference the overlap window did
-        #     not already hide → the real async stall (≈0 if fully hidden).
-        # Do NOT add torch.cuda.synchronize() around act() here: it would
-        # force each pre-launched inference to finish in-band, serialize
-        # GPU/CPU, and collapse async wall-clock back to sync. The action is
-        # still correctly materialized before env.step by the .to("cpu") below.
         will_trigger_inference = (
             action_manager.chunk_index == 0
             or (
@@ -250,17 +224,13 @@ def rollout(
         action_transition = env_postprocessor(action_transition)
         action = action_transition[ACTION]
 
-        # Convert to CPU / numpy.
         action_numpy: np.ndarray = action.to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
-        # Apply the next action.
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
             render_callback(env)
 
-        # VectorEnv stores is_success in `info["final_info"][env_index]["is_success"]`. "final_info" isn't
-        # available if none of the envs finished.
         if "final_info" in info:
             final_info = info["final_info"]
             if not isinstance(final_info, dict):
@@ -272,7 +242,6 @@ def rollout(
         else:
             successes = [False] * env.num_envs
 
-        # Keep track of which environments are done so far.
         done = terminated | truncated | done
         if step + 1 == max_steps:
             done = np.ones_like(done, dtype=bool)
@@ -289,12 +258,10 @@ def rollout(
         progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
         progbar.update()
 
-    # Track the final observation.
     if return_observations:
         observation = preprocess_observation(observation)
         all_observations.append(deepcopy(observation))
 
-    # Stack the sequence along the first dimension so that we have (batch, sequence, *) tensors.
     ret = {
         ACTION: torch.stack(all_actions, dim=1),
         "reward": torch.stack(all_rewards, dim=1),
@@ -312,14 +279,10 @@ def rollout(
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
 
-    # Step-latency summary for async-overlap verification.
     if step_latencies_ms:
         lat = np.asarray(step_latencies_ms)
         is_trans = np.asarray(step_is_transition, dtype=bool)
-        # Skip the very first few steps (compile/capture jitter) when computing
-        # transition-step stats so we don't conflate first-call cost with
-        # steady-state behaviour.
-        skip = action_manager.n_action_steps  # one full chunk
+        skip = action_manager.n_action_steps
         trans_mask = is_trans & (np.arange(len(lat)) >= skip)
         intern_mask = ~is_trans & (np.arange(len(lat)) >= skip)
         def _stats(name, x):
@@ -445,7 +408,6 @@ def eval_policy(
 
         if max_episodes_rendered > 0 and len(ep_frames) > 0:
             batch_stacked_frames = np.stack(ep_frames, axis=1)
-            # batch_successes was computed above from this batch
             for env_idx, (stacked_frames, done_index) in enumerate(zip(
                 batch_stacked_frames, done_indices.flatten().tolist(), strict=False
             )):
@@ -602,12 +564,6 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
-        # One-shot CUDA-graph warmup. Pulls a real observation from the
-        # first available env, runs N+1 inferences to trigger torch.compile
-        # autotune + graph capture, then resets policy state so the buffer
-        # is pristine going into the actual eval. Without this, episode 1
-        # would eat a 10-30s pause on the first chunk transition into
-        # _steady_streaming.
         first_task_group = next(iter(envs))
         first_task_id = next(iter(envs[first_task_group]))
         warmup_env = envs[first_task_group][first_task_id]
@@ -630,10 +586,6 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
             inference_overlap_steps=cfg.inference_overlap_steps,
-            # Per-step EGL rendering dominates wall-clock, and successful episodes
-            # are discarded anyway (only_record_failures), so rendering every step
-            # to keep ~1% of failure videos is mostly wasted work. Default OFF; set
-            # EVAL_MAX_RENDERED=N to capture up to N failure videos for debugging.
             max_episodes_rendered=int(os.environ.get("EVAL_MAX_RENDERED", "0")),
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
@@ -654,7 +606,6 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
     logging.info("End of eval")
 
 
-# ---- typed payload returned by one task eval ----
 class TaskMetrics(TypedDict):
     sum_rewards: list[float]
     max_rewards: list[float]

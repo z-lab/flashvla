@@ -71,10 +71,6 @@ class FlashVLAPi0PrepareLanguageProcessorStep(ProcessorStep):
         if isinstance(tasks, str):
             tasks = [tasks]
 
-        # Match lerobot/pi0_base training: only append a trailing newline if
-        # missing. Do NOT strip whitespace or replace underscores — those
-        # transforms would diverge from the prompt format the hub checkpoint
-        # was trained on (see lerobot.policies.pi0.processor_pi0.Pi0NewLineProcessor).
         full_prompts = [task if task.endswith("\n") else f"{task}\n" for task in tasks]
 
         transition[TransitionKey.COMPLEMENTARY_DATA][self.task_key] = full_prompts

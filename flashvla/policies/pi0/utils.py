@@ -48,11 +48,9 @@ def get_safe_dtype(dtype: torch.dtype, device: str | torch.device) -> torch.dtyp
     if isinstance(device, torch.device):
         device = device.type
         
-    # MPS doesn't support float64
     if device == "mps" and dtype == torch.float64:
         return torch.float32
     
-    # Some Intel XPU devices lack FP64
     if device == "xpu" and dtype == torch.float64:
         if hasattr(torch.xpu, "get_device_capability"):
             device_capability = torch.xpu.get_device_capability()
@@ -100,14 +98,11 @@ def create_sinusoidal_pos_embedding(
     if time.ndim != 1:
         raise ValueError("The time tensor is expected to be of shape `(batch_size, )`.")
 
-    # Use float64 for precision, with device compatibility fallback
     dtype = get_safe_dtype(torch.float64, device.type)
     
-    # Create log-spaced frequencies
     fraction = torch.linspace(0.0, 1.0, dimension // 2, dtype=dtype, device=device)
     period = min_period * (max_period / min_period) ** fraction
 
-    # Compute sinusoidal embedding
     scaling_factor = 1.0 / period * 2 * math.pi
     sin_input = scaling_factor[None, :] * time[:, None]
     pos_emb = torch.cat([torch.sin(sin_input), torch.cos(sin_input)], dim=1)
@@ -163,16 +158,13 @@ def build_attention_mask_and_position_ids(
     if pad_masks.ndim != 2:
         raise ValueError(pad_masks.ndim)
 
-    # Build block-causal mask
     cumsum = torch.cumsum(att_masks, dim=1)
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
     pad_2d_masks = pad_masks[:, None, :] * pad_masks[:, :, None]
     att_2d_masks = att_2d_masks & pad_2d_masks
 
-    # Position IDs
     position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-    # Convert to additive mask
     mask_value = torch.finfo(dtype).min
     attention_mask = torch.where(
         att_2d_masks,
@@ -206,7 +198,6 @@ def resize_with_pad(
 
     cur_height, cur_width = img.shape[2:]
 
-    # Scale to fit
     ratio = max(cur_width / width, cur_height / height)
     resized_height = int(cur_height / ratio)
     resized_width = int(cur_width / ratio)
@@ -215,7 +206,6 @@ def resize_with_pad(
         img, size=(resized_height, resized_width), mode="bilinear", align_corners=False
     )
 
-    # Pad left and top
     pad_height = max(0, int(height - resized_height))
     pad_width = max(0, int(width - resized_width))
     padded_img = F.pad(resized_img, (pad_width, 0, pad_height, 0), value=pad_value)
@@ -257,75 +247,50 @@ def build_shared_obs_attention_mask_and_position_ids(
     device = prefix_pad_masks.device
     mask_value = torch.finfo(dtype).min
     
-    # Build combined pad_masks and att_masks for the full sequence (vectorized)
-    # Suffix is repeated for each offset
     full_pad_masks = torch.zeros(batch_size, total_length, dtype=torch.bool, device=device)
     full_att_masks = torch.zeros(batch_size, total_length, dtype=prefix_att_masks.dtype, device=device)
     
-    # Prefix part
     full_pad_masks[:, :prefix_length] = prefix_pad_masks
     full_att_masks[:, :prefix_length] = prefix_att_masks
     
-    # Suffix parts: tile suffix masks for all offsets at once
-    # [B, suffix_length] -> [B, num_offsets * suffix_length]
     suffix_pad_tiled = suffix_pad_masks.unsqueeze(1).expand(-1, num_offsets, -1).reshape(batch_size, -1)
     suffix_att_tiled = suffix_att_masks.unsqueeze(1).expand(-1, num_offsets, -1).reshape(batch_size, -1)
     full_pad_masks[:, prefix_length:] = suffix_pad_tiled
     full_att_masks[:, prefix_length:] = suffix_att_tiled
     
-    # Compute cumsum for block-causal structure
     cumsum = torch.cumsum(full_att_masks, dim=1)
     
-    # Build the base 2D attention mask using cumsum logic
     att_2d_masks = cumsum[:, None, :] <= cumsum[:, :, None]
     
-    # Apply padding mask
     pad_2d_masks = full_pad_masks[:, None, :] * full_pad_masks[:, :, None]
     att_2d_masks = att_2d_masks & pad_2d_masks
     
-    # Block cross-offset attention (vectorized)
-    # Create a mask that blocks attention between different offset branches
-    # For positions in suffix, determine which offset they belong to
     suffix_positions = torch.arange(num_offsets * suffix_length, device=device)
-    offset_ids = suffix_positions // suffix_length  # [num_offsets * suffix_length]
+    offset_ids = suffix_positions // suffix_length
     
-    # Create cross-offset blocking mask for suffix-to-suffix attention
-    # query_offset != key_offset should be blocked
-    query_offset_ids = offset_ids.unsqueeze(1)  # [S, 1]
-    key_offset_ids = offset_ids.unsqueeze(0)    # [1, S]
-    cross_offset_mask = (query_offset_ids == key_offset_ids)  # [S, S], True where same offset
+    query_offset_ids = offset_ids.unsqueeze(1)
+    key_offset_ids = offset_ids.unsqueeze(0)
+    cross_offset_mask = (query_offset_ids == key_offset_ids)
     
-    # Apply to the suffix-suffix part of att_2d_masks
     suffix_start = prefix_length
     att_2d_masks[:, suffix_start:, suffix_start:] = att_2d_masks[:, suffix_start:, suffix_start:] & cross_offset_mask
     
-    # Apply offset_mask (vectorized): invalid offsets should be fully masked
-    # Create per-position validity mask from offset_mask [B, num_offsets] -> [B, num_offsets * suffix_length]
-    offset_validity = offset_mask.unsqueeze(2).expand(-1, -1, suffix_length).reshape(batch_size, -1)  # [B, S]
+    offset_validity = offset_mask.unsqueeze(2).expand(-1, -1, suffix_length).reshape(batch_size, -1)
     
-    # Mask out invalid offset positions in att_2d_masks
-    # Invalid queries can't attend to anything
     att_2d_masks[:, suffix_start:, :] = att_2d_masks[:, suffix_start:, :] & offset_validity.unsqueeze(2)
-    # Nothing can attend to invalid keys
     att_2d_masks[:, :, suffix_start:] = att_2d_masks[:, :, suffix_start:] & offset_validity.unsqueeze(1)
     
-    # Compute position IDs (vectorized)
     position_ids = torch.zeros(batch_size, total_length, dtype=torch.long, device=device)
     
-    # Prefix position IDs
     prefix_pos = torch.cumsum(prefix_pad_masks.long(), dim=1) - 1
     position_ids[:, :prefix_length] = prefix_pos
     
-    # Get the last valid prefix position for each batch
-    last_prefix_pos = prefix_pos[:, -1]  # [B]
+    last_prefix_pos = prefix_pos[:, -1]
     
-    # Suffix position IDs: each branch continues from last_prefix_pos + 1
-    # Tile suffix positions for all offsets: [B, suffix_length] -> [B, num_offsets * suffix_length]
-    suffix_pos_base = torch.cumsum(suffix_pad_masks.long(), dim=1)  # [B, suffix_length]
+    suffix_pos_base = torch.cumsum(suffix_pad_masks.long(), dim=1)
     suffix_pos_tiled = suffix_pos_base.unsqueeze(1).expand(-1, num_offsets, -1).reshape(batch_size, -1)
     position_ids[:, prefix_length:] = last_prefix_pos[:, None] + suffix_pos_tiled
     
-    # Convert to additive mask
     attention_mask = torch.where(
         att_2d_masks,
         torch.zeros_like(att_2d_masks, dtype=dtype),
@@ -377,7 +342,6 @@ def build_flashvla_attention_mask_and_position_ids(
     pad_2d_masks = full_pad_masks[:, None, :] & full_pad_masks[:, :, None]
     att_2d_masks = att_2d_masks & pad_2d_masks
 
-    # Block cross-config attention within the suffix portion only.
     suffix_positions = torch.arange(num_offsets * suffix_length, device=device)
     offset_ids = suffix_positions // suffix_length
     cross_offset_mask = offset_ids.unsqueeze(1) == offset_ids.unsqueeze(0)

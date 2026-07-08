@@ -16,7 +16,7 @@ Architecture adaptations vs pi0 streaming:
     token of each slot is a boundary (``att_masks=[1]+[0]*(C-1)`` per slot).
     Within a slot (C action tokens): full attention. Across slots: causal
     at the block level. Diverges from baseline smolvla's per-token AR within
-    the action chunk (``modeling_smolvla.py:717``) — empirical results on
+    the action chunk (see ``modeling_smolvla.embed_suffix``) — empirical results on
     pi05 ([[project_flashvla_outlier_amplification]]) recommend
     this pattern for streaming.
   * Cross-attention mode (default in smolvla): the action expert cross-attends
@@ -60,8 +60,6 @@ from flashvla.policies.smolvla.modeling_smolvla import (
     pad_vector,
     resize_with_pad,
 )
-# Cross-import policy-agnostic cold-start helpers + per-token sinusoidal embed
-# (already used by pi0/pi05 streaming; same postprocessor safetensors format).
 from flashvla.policies.pi05.utils import (
     ColdStartStats,
     compute_cold_start_action,
@@ -76,31 +74,6 @@ from flashvla.policies.pi0.utils import (
 logger = logging.getLogger(__name__)
 
 
-# ============================================================
-# adaRMS for the Llama-based action expert
-# ============================================================
-#
-# SmolVLA's action expert is SmolLM2 (Llama 3-style architecture), so its
-# RMSNorm class is ``transformers.models.llama.modeling_llama.LlamaRMSNorm``,
-# NOT Gemma's. Unlike pi05's setup — where the Gemma decoder is flashvla-patched
-# at install time to bake ``use_adarms`` / ``cond_dim`` / ``dense`` into the
-# constructor — we leave ``transformers`` untouched and SWAP RMSNorm instances
-# in ``SmolVLAFlashVLAPolicy.from_pretrained`` (right before
-# ``load_state_dict``).
-#
-# Llama RMSNorm formula: ``normed * weight`` (weight init 1.0). Our
-# ``LlamaAdaRMSNorm`` preserves the original weight (so smolvla_base's learned
-# scale survives) and stacks FiLM ``(1 + scale) + shift`` modulation on top:
-#
-#     out = normed * weight * (1 + scale) + shift
-#
-# With zero-init ``dense`` (scale = shift = 0 at step 0), this collapses to
-# the baseline Llama RMSNorm — i.e. DiT identity at training start.
-#
-# No gate: ``SmolVLMWithExpertModel.forward``'s residual connection is a plain
-# ``+=`` (smolvlm_with_expert.py:487, 497) with no per-block gating, so a gate
-# would be discarded. ``dense`` is sized ``2*D`` (scale + shift) instead of
-# pi05's ``3*D``.
 
 
 class LlamaAdaRMSNorm(nn.Module):
@@ -117,17 +90,15 @@ class LlamaAdaRMSNorm(nn.Module):
 
     def __init__(self, weight: nn.Parameter, variance_epsilon: float, cond_dim: int):
         super().__init__()
-        self.weight = weight  # reused nn.Parameter from baseline LlamaRMSNorm
+        self.weight = weight
         self.variance_epsilon = variance_epsilon
         self.cond_dim = cond_dim
         dim = weight.numel()
-        # 2*D: scale + shift (no gate; see module-level note above).
         self.dense = nn.Linear(cond_dim, dim * 2, bias=True)
         nn.init.zeros_(self.dense.weight)
         nn.init.zeros_(self.dense.bias)
 
     def _norm(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # fp32 norm (matches LlamaRMSNorm.forward and pi05's GemmaRMSNorm._norm).
         h = hidden_states.to(torch.float32)
         variance = h.pow(2).mean(-1, keepdim=True)
         return h * torch.rsqrt(variance + self.variance_epsilon)
@@ -139,7 +110,7 @@ class LlamaAdaRMSNorm(nn.Module):
     ) -> torch.Tensor:
         input_dtype = hidden_states.dtype
         normed = self._norm(hidden_states)
-        normed = normed * self.weight.float()  # standard Llama scale
+        normed = normed * self.weight.float()
 
         if cond is None:
             return normed.to(input_dtype)
@@ -150,8 +121,6 @@ class LlamaAdaRMSNorm(nn.Module):
             )
 
         modulation = self.dense(cond.to(self.dense.weight.dtype))
-        # Cond may be per-batch [B, D] or per-token [B, L, D]. Broadcast the
-        # per-batch case to match the token axis of normed [B, L, D].
         if hidden_states.ndim == 3 and modulation.ndim == 2:
             modulation = modulation.unsqueeze(1)
         scale, shift = torch.chunk(modulation, 2, dim=-1)
@@ -159,9 +128,6 @@ class LlamaAdaRMSNorm(nn.Module):
         return normed.to(input_dtype)
 
 
-# ============================================================
-# Core model
-# ============================================================
 
 
 class VLAFlowMatchingFlashVLA(VLAFlowMatching):
@@ -172,13 +138,8 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         self.N = config.num_buffer_slots
         self.C = config.chunk_size
 
-        # Persistent 0-d int64 buffer for cold-start step counter — same
-        # trick as pi05/pi0 streaming. Enables single CUDA-graph capture
-        # across all cold-start step values.
         self.register_buffer("_cold_step_t", torch.zeros((), dtype=torch.int64), persistent=False)
 
-        # adaRMS — purely additive on top of smolvla_base's concat-time path.
-        # See ``SmolVLAFlashVLAConfig.use_adarms_time_cond`` docstring.
         if config.use_adarms_time_cond:
             D = self.vlm_with_expert.expert_hidden_size
             self.time_mlp_in = nn.Linear(D, D)
@@ -189,9 +150,6 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         if compile_model:
             self._cold_start = torch.compile(self._cold_start, mode=config.compile_mode)
             self._steady_streaming = torch.compile(self._steady_streaming, mode=config.compile_mode)
-    # ------------------------------------------------------------------
-    # Suffix embedder: per-slot time, pi05/pi0-style block-causal across slots
-    # ------------------------------------------------------------------
 
     def embed_suffix(  # type: ignore[override]
         self,
@@ -229,10 +187,8 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         num_slots = L_act // C
         assert num_slots * C == L_act, f"L_act={L_act} not divisible by C={C}"
 
-        # Per-token time via repeat_interleave
-        time_per_token = time_per_slot.repeat_interleave(C, dim=1)  # [B, L_act]
+        time_per_token = time_per_slot.repeat_interleave(C, dim=1)
 
-        # Sinusoidal embedding (per-token, 2D input)
         time_emb = create_sinusoidal_pos_embedding_for_blocks(
             time_per_token,
             self.vlm_with_expert.expert_hidden_size,
@@ -244,51 +200,35 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         dtype = action_emb.dtype
         time_emb = time_emb.to(dtype=dtype)
 
-        # ===== Token embedding (same in BOTH modes — smolvla baseline path) =====
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
         action_time_emb = self.action_time_mlp_in(action_time_emb)
         action_time_emb = F.silu(action_time_emb)
         action_time_emb = self.action_time_mlp_out(action_time_emb)
 
-        # Zero out padded action tokens; pad_masks reflects that
         if padding_mask is not None:
             action_time_emb = action_time_emb * padding_mask.unsqueeze(-1).to(action_time_emb.dtype)
             pad_masks = padding_mask
         else:
             pad_masks = torch.ones(bsize, L_act, dtype=torch.bool, device=device)
 
-        embs = action_time_emb  # [B, L_act, expert_hidden_size]
+        embs = action_time_emb
 
-        # pi05/pi0-style block-causal across slots: only the first token of each
-        # slot is a block boundary (att_mask=1), the remaining C-1 tokens are
-        # non-boundary (att_mask=0). Combined with ``make_att_2d_masks`` /
-        # ``build_flashvla_attention_mask_and_position_ids`` which both
-        # do ``cumsum -> cumsum[None,:] <= cumsum[:,None]``:
-        #   * within a slot (C tokens) — same cumsum value, full attention.
-        #   * across slots — slot k+1 has higher cumsum, sees slot k (block-causal).
-        # Departs from baseline smolvla's per-token AR within the action chunk
-        # (``modeling_smolvla.py:717``) but matches the established pi05 streaming
-        # recipe ([[project_flashvla_outlier_amplification]]).
         slot_att = torch.zeros(num_slots, C, dtype=torch.bool, device=device)
         slot_att[:, 0] = True
         att_masks = slot_att.flatten(0, 1).unsqueeze(0).expand(bsize, -1).contiguous()
 
-        # ===== adaRMS cond (option A: time-only) =====
         adarms_cond = None
         if self.config.use_adarms_time_cond:
             time_cond = self.time_mlp_in(time_emb)
             time_cond = F.silu(time_cond)
             time_cond = self.time_mlp_out(time_cond)
-            time_cond = F.silu(time_cond)  # [B, L_act, D]
+            time_cond = F.silu(time_cond)
             if padding_mask is not None:
                 time_cond = time_cond * padding_mask.unsqueeze(-1).to(time_cond.dtype)
             adarms_cond = time_cond
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    # ------------------------------------------------------------------
-    # Shared-obs time sampling (per-chunk) — same as pi0 streaming
-    # ------------------------------------------------------------------
 
     def _build_per_chunk_time(
         self, batch_size: int, device: torch.device,
@@ -316,13 +256,10 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         time_per_slot = seg_start[None, :, :] + samples / N
         time_per_slot = time_per_slot * 0.999 + 0.001
         time_per_slot = torch.where(is_real[None, :, :], time_per_slot, torch.ones_like(time_per_slot))
-        time_per_slot = time_per_slot.reshape(batch_size, -1)  # [B, N*S]
+        time_per_slot = time_per_slot.reshape(batch_size, -1)
         time_per_token = time_per_slot.repeat_interleave(C, dim=1)
         return time_per_slot, time_per_token
 
-    # ------------------------------------------------------------------
-    # Training: shared-observation forward (N configs side-by-side)
-    # ------------------------------------------------------------------
 
     def forward_shared_observation(
         self,
@@ -357,12 +294,10 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         x_t = time_expanded * noise + (1 - time_expanded) * actions
         u_t = noise - actions
 
-        # Shared prefix — encode once
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state,
         )
 
-        # Per-config suffix: flatten (B, N) into batch dim for the embedder
         num_slots_per_config = N
         x_t_flat = x_t.view(bsize * N, H_cfg, -1)
         time_per_slot_flat = time_per_slot_all.view(bsize * N, num_slots_per_config)
@@ -374,25 +309,14 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         embs_flat, pad_flat, att_flat, cond_flat = self.embed_suffix(
             x_t_flat, time_per_slot_flat, padding_mask=real_mask_flat,
         )
-        # embs_flat: [B*N, H_cfg, D]; reshape to [B, N*H_cfg, D]
         suffix_embs = embs_flat.view(bsize, N, H_cfg, -1).reshape(bsize, N * H_cfg, -1)
         suffix_pad_per_offset = pad_flat.view(bsize, N, H_cfg)
-        suffix_att_masks = att_flat[:bsize]  # representative (same pattern for all configs)
-        # adaRMS cond — flatten [B*N, H_cfg, D] → [B, N*H_cfg, D] mirroring suffix_embs.
+        suffix_att_masks = att_flat[:bsize]
         if cond_flat is not None:
             suffix_adarms_cond = cond_flat.view(bsize, N, H_cfg, -1).reshape(bsize, N * H_cfg, -1)
         else:
             suffix_adarms_cond = None
 
-        # Attention mask: pi0 streaming helper handles cumsum-based block-causal
-        # + cross-config blocking. With our att=[1,0,0,...]_C pattern (boundary
-        # only at each slot's first token), cumsum gives block-causal across
-        # slots while keeping full intra-slot attention — pi05/pi0 streaming
-        # semantics, replicated N times with cross-config isolation.
-        # Cast prefix_att_masks to long (smolvla emits bool; helper does cumsum on int).
-        # pi0 helper returns an additive mask [B, 1, L, L] with 0 (attendable)
-        # or -inf (blocked) — needs a float dtype for torch.finfo.min. smolvla's
-        # eager_attention_forward expects bool [B, L, L] via torch.where; convert.
         prefix_att_long = prefix_att_masks.to(dtype=torch.long)
         suffix_att_long = suffix_att_masks.to(dtype=torch.long)
         additive_mask, position_ids = build_flashvla_attention_mask_and_position_ids(
@@ -403,9 +327,8 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
             num_offsets=N,
             dtype=torch.float32,
         )
-        attention_mask = (additive_mask == 0).squeeze(1)  # [B, total_len, total_len] bool
+        attention_mask = (additive_mask == 0).squeeze(1)
 
-        # Run joint VLM+expert
         (_, suffix_out), _ = self.vlm_with_expert.forward(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -416,15 +339,13 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
             adarms_cond=suffix_adarms_cond,
         )
 
-        # Slice action outputs per config: suffix_out [B, N*H_cfg, D]
         suffix_out = suffix_out.view(bsize, N, H_cfg, -1)
         suffix_out = suffix_out.to(dtype=torch.float32)
-        v_t = self.action_out_proj(suffix_out)  # [B, N, H_cfg, action_dim]
+        v_t = self.action_out_proj(suffix_out)
         v_t = v_t.reshape(bsize, N * H_cfg, -1)
 
         losses = F.mse_loss(u_t, v_t, reduction="none")
 
-        # Loss mask: exclude padded slots
         if action_is_pad is not None:
             loss_mask = ~action_is_pad
         else:
@@ -433,9 +354,6 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         losses = losses[loss_mask]
         return losses
 
-    # ------------------------------------------------------------------
-    # Inference: denoise_step + cold_start + steady_streaming
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def denoise_step(  # type: ignore[override]
@@ -455,9 +373,7 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
-        # Suffix can attend to all real prefix tokens
         prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-        # Within suffix: AR causal masked by padding
         suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
         full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
 
@@ -475,7 +391,7 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out.to(dtype=torch.float32)
-        return self.action_out_proj(suffix_out)  # [B, suffix_len, action_dim]
+        return self.action_out_proj(suffix_out)
 
     @torch.no_grad()
     def _encode_and_prefill(self, images, img_masks, lang_tokens, lang_masks, state):
@@ -614,9 +530,6 @@ class VLAFlowMatchingFlashVLA(VLAFlowMatching):
         return actions_to_execute, buffer, step_counter + 1
 
 
-# ============================================================
-# Policy wrapper
-# ============================================================
 
 
 class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
@@ -631,7 +544,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
         self.config = config
         self.model = VLAFlowMatchingFlashVLA(config)
 
-        # Pre-allocate streaming buffer (action slots only; state is per-call in prefix)
         buf_len = config.total_buffer_length
         self.register_buffer(
             "action_buffer",
@@ -654,9 +566,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
     def get_optim_params(self) -> dict:
         return self.parameters()
 
-    # ------------------------------------------------------------------
-    # Input prep — mirror baseline SmolVLAPolicy
-    # ------------------------------------------------------------------
 
     def prepare_images(self, batch):
         images, img_masks = [], []
@@ -671,7 +580,7 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
             img = batch[key][:, -1, :, :, :] if batch[key].ndim == 5 else batch[key]
             if self.config.resize_imgs_with_padding is not None:
                 img = resize_with_pad(img, *self.config.resize_imgs_with_padding, pad_value=0)
-            img = img * 2.0 - 1.0  # [-1, 1] for siglip
+            img = img * 2.0 - 1.0
             bsize = img.shape[0]
             device = img.device
             if f"{key}_padding_mask" in batch:
@@ -694,9 +603,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
     def prepare_action(self, batch):
         return pad_vector(batch[ACTION], self.config.max_action_dim)
 
-    # ------------------------------------------------------------------
-    # Inference
-    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, Tensor], noise=None) -> Tensor | None:
@@ -750,9 +656,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
                 self._queues[ACTION].extend(actions.transpose(0, 1)[:self.config.n_action_steps])
         return self._queues[ACTION].popleft()
 
-    # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
 
     def forward(self, batch: dict[str, Tensor], noise=None) -> tuple[Tensor, dict]:
         """Training forward: shared-observation flow-matching MSE."""
@@ -771,9 +674,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
         loss = losses.mean()
         return loss, {"loss": loss.item()}
 
-    # ------------------------------------------------------------------
-    # Checkpoint loading
-    # ------------------------------------------------------------------
 
     @classmethod
     def from_pretrained(
@@ -831,13 +731,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
 
         state_dict = load_file(model_file)
 
-        # adaRMS: swap the expert's ``LlamaRMSNorm`` instances with
-        # ``LlamaAdaRMSNorm`` BEFORE load_state_dict, so the ckpt's
-        # ``...dense.weight`` / ``...dense.bias`` keys land on the new
-        # FiLM layers. The original ``weight`` ``nn.Parameter`` is reused
-        # (state_dict path stays stable). For warm-start from smolvla_base
-        # (no dense.* keys present), the zero-init we set at swap time
-        # survives → DiT identity at step 0.
         if getattr(config, "use_adarms_time_cond", False):
             D = instance.model.vlm_with_expert.expert_hidden_size
             expert = instance.model.vlm_with_expert.lm_expert
@@ -856,7 +749,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
                     variance_epsilon=old.variance_epsilon,
                     cond_dim=D,
                 )
-                # Match device & dtype of the surrounding expert (typically bf16).
                 new_norm = new_norm.to(device=old.weight.device, dtype=old.weight.dtype)
                 setattr(parent, attr_name, new_norm)
                 n_swapped += 1
@@ -866,7 +758,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
             )
 
         incompatible = instance.load_state_dict(state_dict, strict=False)
-        # Filter out lm_head (intentionally trimmed) from missing-key warnings.
         missing = [k for k in incompatible.missing_keys if "lm_head" not in k]
         unexpected = list(incompatible.unexpected_keys)
         if unexpected:
@@ -877,7 +768,6 @@ class SmolVLAFlashVLAPolicy(PreTrainedPolicy):
         instance.to(config.device)
         instance.eval()
 
-        # Cold-start stats for the N-1 warm-up calls
         instance._cold_start_stats = load_cold_start_stats(pretrained_name_or_path)
 
         return instance
