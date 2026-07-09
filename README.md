@@ -4,12 +4,6 @@
 
 **FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution.
 
-<p align="center">
-  <a href="https://youtu.be/-qU_243aaVw">
-    <img src="https://img.youtube.com/vi/-qU_243aaVw/maxresdefault.jpg" width="640" alt="FlashVLA demo video">
-  </a>
-</p>
-
 ## Install
 
 ```bash
