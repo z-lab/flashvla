@@ -2,7 +2,7 @@
 
 Batched LIBERO evaluation with async chunk-overlap inference. `eval.py` in
 this directory is the implementation (a standalone script on top of the
-`flashvla` library); `run_eval_libero_full.sh` is the multi-seed /
+`flashvla` library); `eval.sh` is the multi-seed /
 multi-suite / multi-GPU orchestrator.
 
 ## Requirements
@@ -66,7 +66,7 @@ async transition latency percentiles) into `--output_dir`.
 ```bash
 # overlap=1, seeds 1000/2000/3000, 4 GPUs
 GPUS="0 1 2 3" N_EPISODES=50 POLICY_PATH=/path/to/ckpt \
-  bash sim_eval/libero/run_eval_libero_full.sh 1 1000 2000 3000
+  bash sim_eval/libero/eval.sh 1 1000 2000 3000
 ```
 
 - One subprocess per (seed, suite), pulled from a shared queue so a slow

@@ -5,15 +5,15 @@
 # Listens on a TCP port; eval_client.sh connects to it from the RoboTwin env.
 #
 # Usage:
-#   bash serve.sh <policy_path> [port] [gpu_id] [cold_start_mode] \
+#   bash eval_server.sh [policy_path] [port] [gpu_id] [cold_start_mode] \
 #                 [inference_overlap_steps] [n_action_steps] [compile_model]
 #
 # Examples:
 #   # Sync (default)
-#   bash serve.sh /path/to/flashvla_robotwin_ckpt 9999 0
+#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0
 #
 #   # Async overlap=1 with compile + n_action_steps=5
-#   bash serve.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 5 true
+#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 5 true
 #
 # Prerequisites (one-time setup in the flashvla env):
 #   conda activate flashvla   # the env where `pip install -e flashvla` was run
@@ -21,7 +21,7 @@
 
 set -e
 
-policy_path=${1:?"usage: $0 <policy_path> [port] [gpu_id] [cold_start_mode] [inference_overlap_steps] [n_action_steps] [compile_model]"}
+policy_path=${1:-z-lab/flashvla-pi05-robotwin}
 port=${2:-9999}
 gpu_id=${3:-0}
 cold_start_mode=${4:-current_state}

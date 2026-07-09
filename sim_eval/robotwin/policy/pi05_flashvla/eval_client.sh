@@ -2,16 +2,16 @@
 # Run a single-task RoboTwin eval against a running pi05_flashvla server.
 #
 # Runs in the ROBOTWIN venv (torch 2.4 + sapien + mplib + gymnasium 0.29) at
-# the RoboTwin python env (set ROBOTWIN_VENV). Assumes serve.sh has already been started — by
+# the RoboTwin python env (set ROBOTWIN_VENV). Assumes eval_server.sh has already been started — by
 # default targets localhost:<port>; adjust ModelClient host in
 # eval_policy_client.py for remote.
 #
 # Usage:
-#   bash eval_client.sh <task_name> <task_config> [port] [seed] [gpu_id]
+#   bash eval_client.sh [task_name] [task_config] [port] [seed] [gpu_id]
 #
 # Example:
 #   # Terminal 1 (flashvla conda env):
-#   bash serve.sh /path/to/<robotwin_ckpt> 9999 0 current_state 1 5 true
+#   bash eval_server.sh /path/to/<robotwin_ckpt> 9999 0 current_state 1 5 true
 #
 #   # Terminal 2 (anywhere — script picks the venv explicitly):
 #   bash eval_client.sh beat_block_hammer demo_clean 9999 0 1
@@ -22,8 +22,8 @@
 
 set -e
 
-task_name=${1:?"usage: $0 <task_name> <task_config> [port] [seed] [gpu_id]"}
-task_config=${2:?"missing task_config (e.g. demo_clean, demo_randomized)"}
+task_name=${1:-beat_block_hammer}
+task_config=${2:-demo_clean}
 port=${3:-9999}
 seed=${4:-0}
 gpu_id=${5:-0}

@@ -11,8 +11,7 @@
 # exact global q01/q99 over the union, point robotwin_multitask.stats_path at a
 # JSON of pooled stats; features present there override the aggregated ones.
 #
-# Mirrors pi05_flashvla_clean_per_task.yaml but scaled to the merge. The
-# batch_size / grad_accum / steps / lr below are reasonable defaults — confirm
+# The batch_size / grad_accum / steps / lr below are reasonable defaults — confirm
 # before launch. Effective batch = batch_size x num_gpus x grad_accum.
 
 policy:
@@ -46,13 +45,18 @@ dataset:
   repo_id: robotwin/multitask_clean
   video_backend: torchcodec
 
-output_dir: pi05_flashvla_clean_merged_multitask
-job_name: pi05_flashvla_clean_merged_multitask
+output_dir: pi05_flashvla_robotwin
+job_name: pi05_flashvla_robotwin
 batch_size: 4
 grad_accum_steps: 4
 steps: 50000
 num_workers: 4
 seed: 1000
+
+# FSDP2 with bf16 mixed precision, sharded across GPUs (default multi-GPU path)
+fsdp:
+  enable: true
+  mixed_precision: bf16
 
 use_policy_training_preset: false
 optimizer:

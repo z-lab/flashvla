@@ -11,7 +11,7 @@ one-click pipeline to build the RoboTwin **training** dataset (see below).
 robotwin/
 ├── robotwin_pipeline/        # download + convert RoboTwin 2.0 -> LeRobot v3 training data
 ├── policy/
-│   └── pi05_flashvla/        # flashvla server adapter (serve.sh, eval_client.sh, model wrapper)
+│   └── pi05_flashvla/        # flashvla server adapter (eval_server.sh, eval_client.sh, model wrapper)
 └── overlay/                  # small patches to RoboTwin core (see below)
     ├── script/policy_model_server.py
     ├── script/eval_policy_client.py
@@ -95,7 +95,7 @@ Terminal 1 — server (flashvla env, GPU 0):
 
 ```bash
 cd $ROBOTWIN/policy/pi05_flashvla
-bash serve.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 10 true
+bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 10 true
 #             ckpt                            port gpu cold_start  o n_act compile
 ```
 
@@ -118,7 +118,7 @@ Notes:
 - `compile=true` + `inference_overlap_steps>=1` enables async overlap: the
   server's chunk inference is hidden behind SAPIEN env stepping.
 - First server boot pays torch.compile autotune (~minutes); subsequent boots
-  reuse the inductor cache. `serve.sh` warms up the CUDA graph before
+  reuse the inductor cache. `eval_server.sh` warms up the CUDA graph before
   accepting connections so the client's first request doesn't time out.
 - See `policy/pi05_flashvla/README.md` for the full protocol / version
   conflict matrix.

@@ -31,7 +31,7 @@ pi05_flashvla/
 ├── deploy_policy.py         # LIGHT: get_model lazy-imports flashvla; eval() uses model.call()
 ├── deploy_policy.yml        # shared config (unused fields ignored by each side)
 ├── pi05_flashvla_model.py   # HEAVY: imports flashvla → defines PI05FlashVLAModel (server only)
-├── serve.sh                 # start model server (flashvla env)
+├── eval_server.sh                 # start model server (flashvla env)
 ├── eval_client.sh           # run eval against server (RoboTwin env)
 └── README.md                # this file
 ```
@@ -69,7 +69,7 @@ You need **two terminals**, each in a different conda env.
 ```bash
 conda activate flashvla
 cd /path/to/RoboTwin/policy/pi05_flashvla
-bash serve.sh \
+bash eval_server.sh \
     /home/zekail/runs/flashvla_action_robotwin_multitask/checkpoints/last/pretrained_model \
     9999 0
 ```
@@ -110,7 +110,7 @@ done
 
 ## Protocol details
 
-- `serve.sh` → `RoboTwin/script/policy_model_server.py` →
+- `eval_server.sh` → `RoboTwin/script/policy_model_server.py` →
   `deploy_policy.get_model(usr_args)` → `PI05FlashVLAModel(...)` listening
   on port 9999. Server blocks, handles each client in a daemon thread.
 - `eval_client.sh` → `RoboTwin/script/eval_policy_client.py`:

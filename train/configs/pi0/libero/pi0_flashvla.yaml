@@ -29,6 +29,11 @@ steps: 50000
 num_workers: 4
 seed: 1000
 
+# FSDP2 with bf16 mixed precision, sharded across GPUs (default multi-GPU path)
+fsdp:
+  enable: true
+  mixed_precision: bf16
+
 # Optimizer configuration
 use_policy_training_preset: false
 optimizer:
