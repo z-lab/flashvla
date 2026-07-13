@@ -72,6 +72,10 @@ from flashvla.policies.factory import make_policy, make_pre_post_processors
 
 ACCELERATOR_STATE_DIR = "accelerator_state"
 REPLICATED_OPTIMIZER_STATE = "replicated_optimizer_state.pt"
+FSDP_POLICY_CLASS_NAMES = {
+    "pi0-flashvla": ("PI0ModelLayer", "PI0SuffixEmbedder"),
+    "pi05-flashvla": ("PI05ModelLayer", "PI05SuffixEmbedder"),
+}
 
 
 def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> int:
@@ -81,6 +85,35 @@ def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> in
         for p in model.parameters()
         if not only_trainable or p.requires_grad
     )
+
+
+def resolve_fsdp_module_classes(
+    policy_type: str,
+    mixed_precision: str,
+    wrap_layers: list[str],
+    fp32_module_classes: list[str],
+) -> tuple[list[str], list[str]]:
+    """Add the policy-specific FSDP classes without mutating the config."""
+    resolved_wrap_layers = list(dict.fromkeys(wrap_layers))
+    resolved_fp32_module_classes = list(dict.fromkeys(fp32_module_classes))
+    policy_classes = FSDP_POLICY_CLASS_NAMES.get(policy_type)
+    if policy_classes is None:
+        return resolved_wrap_layers, resolved_fp32_module_classes
+
+    model_layer_class, suffix_class = policy_classes
+    if model_layer_class not in resolved_wrap_layers:
+        resolved_wrap_layers.insert(0, model_layer_class)
+
+    if mixed_precision == "bf16":
+        if suffix_class not in resolved_fp32_module_classes:
+            resolved_fp32_module_classes.append(suffix_class)
+    elif mixed_precision == "no":
+        if suffix_class not in resolved_wrap_layers:
+            resolved_wrap_layers.append(suffix_class)
+    else:
+        raise ValueError(f"Unsupported FSDP mixed precision mode: {mixed_precision!r}")
+
+    return resolved_wrap_layers, resolved_fp32_module_classes
 
 
 def build_fsdp_mixed_precision_policy(mixed_precision: str, reduce_dtype: str):
@@ -441,7 +474,9 @@ def update_policy(
     policy.train()
 
     with autocast_ctx if autocast_ctx is not None else accelerator.autocast():
-        loss, output_dict = policy.forward(batch)
+        # Invoke nn.Module.__call__ so distributed wrappers can run their
+        # pre/post-forward hooks (in particular FSDP2 root unshard/reshard).
+        loss, output_dict = policy(batch)
         raw_loss = loss.detach()
         loss = loss * loss_scale
 
@@ -730,13 +765,14 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         else None
     )
     fsdp_wrap_layers = list(cfg.fsdp.wrap_layers)
-    if (
-        cfg.fsdp.enable
-        and fsdp_mixed_precision == "no"
-        and fsdp_wrap_layers
-        and "PI05SuffixEmbedder" not in fsdp_wrap_layers
-    ):
-        fsdp_wrap_layers.append("PI05SuffixEmbedder")
+    fsdp_fp32_module_classes = list(cfg.fsdp.fp32_module_classes)
+    if cfg.fsdp.enable:
+        fsdp_wrap_layers, fsdp_fp32_module_classes = resolve_fsdp_module_classes(
+            cfg.policy.type,
+            fsdp_mixed_precision,
+            fsdp_wrap_layers,
+            fsdp_fp32_module_classes,
+        )
     fsdp_policy_dtype_override = None
     if cfg.fsdp.enable and fsdp_mixed_precision == "no" and getattr(cfg.policy, "dtype", "float32") != "float32":
         old_policy_dtype = cfg.policy.dtype
@@ -825,7 +861,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                 f"state_dict_type={cfg.fsdp.state_dict_type}, "
                 f"wrap_layers={fsdp_wrap_layers}, "
                 f"ignored_module_classes={cfg.fsdp.ignored_module_classes}, "
-                f"fp32_module_classes={getattr(cfg.fsdp, 'fp32_module_classes', [])}, "
+                f"fp32_module_classes={fsdp_fp32_module_classes}, "
                 f"ignored_module_name_suffixes={cfg.fsdp.ignored_module_name_suffixes}"
             )
             if fsdp_policy_dtype_override is not None:
@@ -883,6 +919,27 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             cfg.policy.dtype = policy_config_dtype
     if policy_config_dtype is not None:
         policy.config.dtype = policy_config_dtype
+
+    if (
+        cfg.fsdp.enable
+        and hasattr(policy, "model")
+        and hasattr(policy.model, "detach_backbone_layer_aliases")
+    ):
+        parameter_ids_before = {id(param) for param in policy.parameters()}
+        policy.model.detach_backbone_layer_aliases()
+        parameter_ids_after = {id(param) for param in policy.parameters()}
+        if parameter_ids_before != parameter_ids_after:
+            raise RuntimeError(
+                "Detaching duplicate backbone paths changed the FSDP parameter set: "
+                f"before={len(parameter_ids_before)}, after={len(parameter_ids_after)}, "
+                f"dropped={len(parameter_ids_before - parameter_ids_after)}, "
+                f"added={len(parameter_ids_after - parameter_ids_before)}"
+            )
+        if is_main_process:
+            logging.info(
+                "FSDP2: detached duplicate backbone layer paths while preserving "
+                f"{len(parameter_ids_after)} unique parameter objects"
+            )
 
     if cfg.fsdp.enable and fsdp_mixed_precision == "bf16":
         checkpoint_input_casts = install_fsdp_bf16_checkpoint_input_casts(policy)
@@ -974,7 +1031,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     fsdp_replicated_params_to_sync: list[torch.nn.Parameter] = []
     fp32_module_classes = (
-        set(getattr(cfg.fsdp, "fp32_module_classes", []))
+        set(fsdp_fp32_module_classes)
         if fsdp_mixed_precision == "bf16"
         else set()
     )

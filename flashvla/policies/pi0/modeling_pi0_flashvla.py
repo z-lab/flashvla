@@ -52,7 +52,7 @@ from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_
 from flashvla.policies.pi0.configuration_pi0 import PI0FlashVLAConfig
 from flashvla.policies.pi0.modeling_pi0 import (
     PI0PrefixEmbedder,
-    PI0ModelLayer,
+    PI0ModelLayer as BasePI0ModelLayer,
 )
 from flashvla.policies.pi0.utils import (
     build_attention_mask_and_position_ids,
@@ -88,7 +88,7 @@ logger = logging.getLogger(__name__)
 
 
 
-class PI0StreamingSuffixEmbedder(nn.Module):
+class PI0SuffixEmbedder(nn.Module):
     """Embed state + noisy actions with per-slot time conditioning.
 
     Two operating modes selected by ``config.use_adarms_time_cond``:
@@ -245,6 +245,18 @@ class PI0StreamingSuffixEmbedder(nn.Module):
         return embs, pad_masks, att_masks, None
 
 
+class PI0ModelLayer(BasePI0ModelLayer):
+    """PI0 layer with wrapper-owned norms registered for FSDP sharding."""
+
+    def __init__(
+        self,
+        config: PI0FlashVLAConfig,
+        vlm_layer: nn.Module,
+        action_expert_layer: nn.Module,
+    ):
+        super().__init__(config, vlm_layer, action_expert_layer)
+        self.input_layernorm = nn.ModuleList(self.input_layernorm)
+        self.post_attention_layernorm = nn.ModuleList(self.post_attention_layernorm)
 
 
 class PI0FlashVLAModel(nn.Module):
@@ -263,7 +275,7 @@ class PI0FlashVLAModel(nn.Module):
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
 
         self.prefix_embedder = PI0PrefixEmbedder(config, self.vlm)
-        self.suffix_embedder = PI0StreamingSuffixEmbedder(config)
+        self.suffix_embedder = PI0SuffixEmbedder(config)
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
@@ -285,6 +297,20 @@ class PI0FlashVLAModel(nn.Module):
             torch.set_float32_matmul_precision("high")
             self._cold_start = torch.compile(self._cold_start, mode=config.compile_mode)
             self._steady_streaming = torch.compile(self._steady_streaming, mode=config.compile_mode)
+
+    def detach_backbone_layer_aliases(self) -> None:
+        """Remove duplicate decoder paths after loading/fusing their parameters."""
+        num_layers = len(self.layers)
+        self.vlm.model.language_model.layers = nn.ModuleList(
+            [nn.Identity() for _ in range(num_layers)]
+        )
+        self.action_expert.model.layers = nn.ModuleList(
+            [nn.Identity() for _ in range(num_layers)]
+        )
+
+    def backbone_dtype(self) -> torch.dtype:
+        """Return the dtype from the wrapper-owned VLM decoder layers."""
+        return self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype
 
 
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
@@ -466,7 +492,7 @@ class PI0FlashVLAModel(nn.Module):
         else:
             suffix_adarms_cond = None
 
-        backbone_dtype = self.vlm.model.language_model.layers[0].self_attn.o_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
         if suffix_adarms_cond is not None:
@@ -528,7 +554,7 @@ class PI0FlashVLAModel(nn.Module):
             state, x_t, time_per_slot, padding_mask=padding_mask,
         )
 
-        backbone_dtype = self.vlm.model.language_model.layers[0].self_attn.o_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
         if suffix_adarms_cond is not None:
             suffix_adarms_cond = suffix_adarms_cond.to(dtype=backbone_dtype)
