@@ -230,9 +230,6 @@ class PI05FlashVLAConfig(PI05Config):
     chunk_size: int = 10
     num_buffer_slots: int = 5
     n_action_steps: int = 10
-    freeze_vlm: bool = False
-
-    time_mlp_weight_decay: float = 0.0
 
     cold_start_mode: str = "zero_delta"
 

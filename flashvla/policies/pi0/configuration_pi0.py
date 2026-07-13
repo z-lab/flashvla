@@ -230,9 +230,6 @@ class PI0FlashVLAConfig(PI0Config):
 
     cold_start_mode: str = "zero_delta"
 
-    freeze_vlm: bool = False
-
-
     use_adarms_time_cond: bool = False
 
     @property

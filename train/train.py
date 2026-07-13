@@ -738,7 +738,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     ):
         fsdp_wrap_layers.append("PI05SuffixEmbedder")
     fsdp_policy_dtype_override = None
-    if cfg.fsdp.enable and fsdp_mixed_precision == "no" and cfg.policy.dtype != "float32":
+    if cfg.fsdp.enable and fsdp_mixed_precision == "no" and getattr(cfg.policy, "dtype", "float32") != "float32":
         old_policy_dtype = cfg.policy.dtype
         cfg.policy.dtype = "float32"
         fsdp_policy_dtype_override = (old_policy_dtype, cfg.policy.dtype)
@@ -867,8 +867,8 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating policy")
 
-    policy_config_dtype = cfg.policy.dtype
-    if cfg.fsdp.enable and fsdp_mixed_precision == "bf16" and cfg.policy.dtype == "bfloat16":
+    policy_config_dtype = getattr(cfg.policy, "dtype", None)
+    if cfg.fsdp.enable and fsdp_mixed_precision == "bf16" and policy_config_dtype == "bfloat16":
         cfg.policy.dtype = "float32"
         if is_main_process:
             logging.info("FSDP2 bf16: initializing policy parameters as fp32 master weights")
@@ -879,8 +879,10 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             ds_meta=dataset.meta,
         )
     finally:
-        cfg.policy.dtype = policy_config_dtype
-    policy.config.dtype = policy_config_dtype
+        if policy_config_dtype is not None:
+            cfg.policy.dtype = policy_config_dtype
+    if policy_config_dtype is not None:
+        policy.config.dtype = policy_config_dtype
 
     if cfg.fsdp.enable and fsdp_mixed_precision == "bf16":
         checkpoint_input_casts = install_fsdp_bf16_checkpoint_input_casts(policy)
@@ -890,18 +892,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                 f"{checkpoint_input_casts}"
             )
 
-    if getattr(cfg.policy, "freeze_vlm", False):
-        if hasattr(policy.model, "vlm"):
-            vlm_module = policy.model.vlm
-        elif hasattr(policy.model, "vlm_with_expert"):
-            vlm_module = policy.model.vlm_with_expert.vlm
-        else:
-            raise AttributeError("Cannot find VLM module to freeze")
-        for param in vlm_module.parameters():
-            param.requires_grad = False
-        if is_main_process:
-            logging.info("VLM backbone frozen")
-    elif getattr(cfg.policy, "freeze_vision_encoder", False):
+    if getattr(cfg.policy, "freeze_vision_encoder", False):
         if hasattr(policy.model, "vlm") and hasattr(policy.model.vlm, "model") and hasattr(policy.model.vlm.model, "vision_tower"):
             vision_tower = policy.model.vlm.model.vision_tower
         elif hasattr(policy.model, "vlm_with_expert"):
@@ -927,34 +918,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
-
-    time_mlp_wd = float(getattr(cfg.policy, "time_mlp_weight_decay", 0.0) or 0.0)
-    if time_mlp_wd > 0.0:
-        underlying = getattr(policy, "module", policy)
-        time_mlp_params = []
-        for n, p in underlying.named_parameters():
-            if "suffix_embedder.time_mlp_in" in n or "suffix_embedder.time_mlp_out" in n:
-                time_mlp_params.append(p)
-        time_mlp_ids = {id(p) for p in time_mlp_params}
-
-        new_groups = []
-        for g in optimizer.param_groups:
-            other = [p for p in g["params"] if id(p) not in time_mlp_ids]
-            base = {k: v for k, v in g.items() if k != "params"}
-            new_groups.append({**base, "params": other})
-        base = {k: v for k, v in optimizer.param_groups[0].items()
-                if k != "params" and k != "weight_decay"}
-        new_groups.append({**base, "params": time_mlp_params, "weight_decay": time_mlp_wd})
-        optimizer.param_groups = new_groups
-
-        if cfg.scheduler is not None:
-            lr_scheduler = cfg.scheduler.build(optimizer, cfg.steps)
-
-        if is_main_process:
-            logging.info(
-                f"Added separate weight_decay={time_mlp_wd} on "
-                f"{len(time_mlp_params)} suffix_embedder.time_mlp params"
-            )
 
     step = 0
 
@@ -1100,7 +1063,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     policy.train()
 
-    if cfg.deepspeed.enable and cfg.policy.dtype == "bfloat16":
+    if cfg.deepspeed.enable and getattr(cfg.policy, "dtype", None) == "bfloat16":
         autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
     elif cfg.fsdp.enable:
         autocast_ctx = nullcontext()

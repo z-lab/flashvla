@@ -24,7 +24,6 @@ policy:
   num_buffer_slots: 4
   chunk_size: 20
   freeze_vision_encoder: false
-  freeze_vlm: false
   cold_start_mode: current_state
   normalization_mapping:
     VISUAL: IDENTITY
