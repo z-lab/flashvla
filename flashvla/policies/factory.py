@@ -197,7 +197,22 @@ def make_pre_post_processors(
         preprocessor_json = Path(pretrained_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
         postprocessor_json = Path(pretrained_path) / f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
 
-        if preprocessor_json.exists() and postprocessor_json.exists():
+        has_pretrained_processors = preprocessor_json.exists() and postprocessor_json.exists()
+        if (
+            not has_pretrained_processors
+            and dataset_stats is None
+            and not Path(pretrained_path).is_dir()
+        ):
+            try:
+                from huggingface_hub import hf_hub_download
+
+                hf_hub_download(str(pretrained_path), f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json")
+                hf_hub_download(str(pretrained_path), f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")
+                has_pretrained_processors = True
+            except Exception:
+                has_pretrained_processors = False
+
+        if has_pretrained_processors:
             return (
                 PolicyProcessorPipeline.from_pretrained(
                     pretrained_model_name_or_path=pretrained_path,

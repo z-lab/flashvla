@@ -111,10 +111,30 @@ class ColdStartStats:
         return self.state_mean is not None and self.state_std is not None
 
 
-def _read_norm_map(checkpoint_dir: Path) -> dict:
+def _resolve_checkpoint_file(checkpoint_dir: str | Path, filename: str) -> Path | None:
+    """Resolve a checkpoint file from a local directory or a HuggingFace Hub repo id.
+
+    Returns the local path to the file, downloading it from the Hub when
+    ``checkpoint_dir`` is a repo id rather than an existing directory, or
+    ``None`` if the file cannot be found either way.
+    """
+    local = Path(checkpoint_dir) / filename
+    if local.exists():
+        return local
+    if Path(checkpoint_dir).is_dir():
+        return None
+    try:
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(str(checkpoint_dir), filename))
+    except Exception:
+        return None
+
+
+def _read_norm_map(checkpoint_dir: str | Path) -> dict:
     """Return the postprocessor's norm_map, or empty dict if unavailable."""
-    pp_json = checkpoint_dir / "policy_postprocessor.json"
-    if not pp_json.exists():
+    pp_json = _resolve_checkpoint_file(checkpoint_dir, "policy_postprocessor.json")
+    if pp_json is None:
         return {}
     try:
         doc = json.loads(pp_json.read_text())
@@ -127,8 +147,9 @@ def _read_norm_map(checkpoint_dir: Path) -> dict:
 
 
 def load_cold_start_stats(checkpoint_dir: str | Path) -> ColdStartStats:
-    """Load action + state normalization stats from a flashvla checkpoint dir.
+    """Load action + state normalization stats from a flashvla checkpoint.
 
+    Accepts a local checkpoint directory or a HuggingFace Hub repo id.
     Reads ``policy_postprocessor.json`` to pick the right mode per feature
     (MEAN_STD vs QUANTILES), then loads matching tensors from
     ``policy_postprocessor_step_0_unnormalizer_processor.safetensors``.
@@ -137,11 +158,12 @@ def load_cold_start_stats(checkpoint_dir: str | Path) -> ColdStartStats:
     """
     from safetensors.torch import load_file as _load_sf
 
-    checkpoint_dir = Path(checkpoint_dir)
-    stats_file = checkpoint_dir / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
-    if not stats_file.exists():
+    stats_file = _resolve_checkpoint_file(
+        checkpoint_dir, "policy_postprocessor_step_0_unnormalizer_processor.safetensors"
+    )
+    if stats_file is None:
         logging.warning(
-            f"No postprocessor stats at {stats_file}. "
+            f"No postprocessor stats found in {checkpoint_dir}. "
             "Cold start will fall back to zero action."
         )
         return ColdStartStats()
