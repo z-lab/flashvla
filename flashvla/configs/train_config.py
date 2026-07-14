@@ -60,16 +60,6 @@ class FSDPConfig:
     reduce_dtype: str = "float32"
     reshard_after_forward: bool = False
     cpu_offload: bool = False
-    wrap_layers: List[str] = field(
-        default_factory=lambda: [
-            "SiglipEncoderLayer",
-            "PaliGemmaMultiModalProjector",
-            "Embedding",
-        ]
-    )
-    ignored_module_classes: List[str] = field(default_factory=lambda: ["SiglipVisionEmbeddings"])
-    fp32_module_classes: List[str] = field(default_factory=lambda: ["FlashVLARMSNorm"])
-    ignored_module_name_suffixes: List[str] = field(default_factory=lambda: ["vision_model.post_layernorm", "model.language_model.norm", "action_expert.model.norm", "action_out_proj"])
     state_dict_type: str = "SHARDED_STATE_DICT"
     save_pretrained_max_shard_size: str = "50GB"
 
