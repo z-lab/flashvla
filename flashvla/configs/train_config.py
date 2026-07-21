@@ -69,3 +69,8 @@ class FlashVLATrainConfig(TrainPipelineConfig):
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
     robotwin_multitask: RoboTwinMultiTaskConfig = field(default_factory=RoboTwinMultiTaskConfig)
+
+    # Keep frequent checkpoints for requeue safety without retaining every
+    # 60+ GB FSDP2 optimizer snapshot forever. Zero preserves all checkpoints.
+    checkpoint_keep_last: int = 0
+    checkpoint_keep_every_n_steps: int = 0

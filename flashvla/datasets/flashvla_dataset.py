@@ -221,7 +221,7 @@ class _MultiDatasetMeta:
 
 
 class MultiFlashVLADataset(ConcatDataset):
-    """Concatenation of multiple FlashVLADataset subsets for joint training.
+    """Concatenation of multiple LeRobotDataset-compatible subsets for joint training.
 
     All subsets must share identical feature schema and fps. Stats are pooled
     across subsets using lerobot.datasets.compute_stats.aggregate_stats so that
@@ -235,7 +235,7 @@ class MultiFlashVLADataset(ConcatDataset):
     Also exposes .num_frames, .num_episodes, and .episodes for training loop logging.
     """
 
-    def __init__(self, subsets: list[FlashVLADataset]):
+    def __init__(self, subsets: list[LeRobotDataset]):
         if len(subsets) == 0:
             raise ValueError("MultiFlashVLADataset needs at least one subset")
         super().__init__(subsets)
@@ -251,7 +251,7 @@ class MultiFlashVLADataset(ConcatDataset):
 
 
 def make_robotwin_multitask_flashvla_dataset(cfg, image_transforms=None) -> MultiFlashVLADataset:
-    """Build the RoboTwin multi-task FlashVLA dataset by concatenating LeRobot leaves.
+    """Build a RoboTwin multi-task dataset by concatenating LeRobot leaves.
 
     Two modes, both driven by `cfg.robotwin_multitask`:
       * `roots` — explicit LeRobot leaf roots (e.g. clean + randomized settings of
@@ -261,8 +261,9 @@ def make_robotwin_multitask_flashvla_dataset(cfg, image_transforms=None) -> Mult
         `config_subdirs` pools every (task, subdir) leaf; tasks are auto-discovered
         only if they contain ALL requested subdirs.
 
-    `stats_path`, if set, overrides the pooled stats with exact global ones. Builds
-    FlashVLADataset subsets (num_buffer_slots / chunk_size from cfg.policy).
+    `stats_path`, if set, overrides the pooled stats with exact global ones. A
+    FlashVLA policy gets FlashVLADataset subsets, while a baseline policy gets
+    ordinary LeRobotDataset subsets with its configured action timestamps.
     """
     mt = cfg.robotwin_multitask
     if mt.roots:
@@ -300,22 +301,28 @@ def make_robotwin_multitask_flashvla_dataset(cfg, image_transforms=None) -> Mult
     ds_meta = LeRobotDatasetMetadata(probe_repo_id, root=probe_root, revision=None)
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
 
-    subsets: list[FlashVLADataset] = []
+    is_flashvla_policy = hasattr(cfg.policy, "num_buffer_slots")
+    subsets: list[LeRobotDataset] = []
     for repo_id, sub_root in root_specs:
         if not (sub_root / "meta" / "info.json").is_file():
             raise FileNotFoundError(f"Missing meta/info.json for RoboTwin subset: {sub_root}")
-        subsets.append(
-            FlashVLADataset(
-                repo_id=repo_id,
-                root=sub_root,
-                delta_timestamps=delta_timestamps,
-                image_transforms=image_transforms,
-                revision=None,
-                video_backend=cfg.dataset.video_backend,
+        dataset_kwargs = {
+            "repo_id": repo_id,
+            "root": sub_root,
+            "delta_timestamps": delta_timestamps,
+            "image_transforms": image_transforms,
+            "revision": None,
+            "video_backend": cfg.dataset.video_backend,
+        }
+        if is_flashvla_policy:
+            subset = FlashVLADataset(
+                **dataset_kwargs,
                 num_buffer_slots=cfg.policy.num_buffer_slots,
                 chunk_size=cfg.policy.chunk_size,
             )
-        )
+        else:
+            subset = LeRobotDataset(**dataset_kwargs)
+        subsets.append(subset)
 
     dataset = MultiFlashVLADataset(subsets)
 

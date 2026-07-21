@@ -24,6 +24,7 @@ Usage:
 
 import gc
 import logging
+import shutil
 import sys
 import time
 from contextlib import nullcontext
@@ -369,6 +370,43 @@ def auto_resume(cfg: FlashVLATrainConfig) -> FlashVLATrainConfig:
             "refusing to delete it. Choose another output_dir or clean it explicitly."
         )
     return cfg
+
+
+def prune_old_checkpoints(
+    output_dir: Path,
+    *,
+    keep_last: int,
+    keep_every_n_steps: int,
+) -> list[Path]:
+    """Remove old numeric checkpoint directories after `last` is durable."""
+    if keep_last <= 0:
+        return []
+
+    checkpoints_dir = output_dir / "checkpoints"
+    if not checkpoints_dir.is_dir():
+        return []
+
+    step_dirs = sorted(
+        (
+            path
+            for path in checkpoints_dir.iterdir()
+            if path.is_dir() and path.name.isdigit()
+        ),
+        key=lambda path: int(path.name),
+    )
+    protected = set(step_dirs[-keep_last:])
+    if keep_every_n_steps > 0:
+        protected.update(
+            path for path in step_dirs if int(path.name) % keep_every_n_steps == 0
+        )
+
+    removed = []
+    for path in step_dirs:
+        if path in protected:
+            continue
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
 
 
 @parser.wrap()
@@ -732,6 +770,16 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
                 if is_main_process:
                     update_last_checkpoint(checkpoint_dir)
+                    removed = prune_old_checkpoints(
+                        Path(cfg.output_dir),
+                        keep_last=cfg.checkpoint_keep_last,
+                        keep_every_n_steps=cfg.checkpoint_keep_every_n_steps,
+                    )
+                    if removed:
+                        logging.info(
+                            "Pruned old checkpoints: %s",
+                            ", ".join(path.name for path in removed),
+                        )
                     if wandb_logger:
                         wandb_logger.log_policy(checkpoint_dir)
                     logging.info(f"FSDP2 policy checkpointed at step {step}")
@@ -752,6 +800,16 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                     )
 
                     update_last_checkpoint(checkpoint_dir)
+                    removed = prune_old_checkpoints(
+                        Path(cfg.output_dir),
+                        keep_last=cfg.checkpoint_keep_last,
+                        keep_every_n_steps=cfg.checkpoint_keep_every_n_steps,
+                    )
+                    if removed:
+                        logging.info(
+                            "Pruned old checkpoints: %s",
+                            ", ".join(path.name for path in removed),
+                        )
 
                     if wandb_logger:
                         wandb_logger.log_policy(checkpoint_dir)
