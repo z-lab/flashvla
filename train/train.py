@@ -22,6 +22,7 @@ Usage:
     python train/train.py --config_path=train/configs/pi05/libero/flashvla_action.yaml
 """
 
+import gc
 import logging
 import sys
 import time
@@ -67,6 +68,7 @@ from flashvla.datasets.flashvla_dataset import (
     make_robotwin_multitask_flashvla_dataset,
 )
 from flashvla.distributed.fsdp import (
+    FSDP_PROCESS_GROUP_BACKEND,
     build_fsdp_mixed_precision_policy,
     fully_shard_policy,
     patch_accelerate_fsdp_optimizer_loader,
@@ -84,6 +86,35 @@ def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> in
         for p in model.parameters()
         if not only_trainable or p.requires_grad
     )
+
+
+def prepare_cuda_for_checkpoint(accelerator: Accelerator, stage: str) -> None:
+    """Synchronize and release cached CUDA memory before checkpoint collectives."""
+    accelerator.wait_for_everyone()
+    if accelerator.device.type != "cuda":
+        return
+
+    torch.cuda.synchronize(accelerator.device)
+    free_before, total = torch.cuda.mem_get_info(accelerator.device)
+    allocated = torch.cuda.memory_allocated(accelerator.device)
+    reserved = torch.cuda.memory_reserved(accelerator.device)
+    gc.collect()
+    torch.cuda.empty_cache()
+    free_after, _ = torch.cuda.mem_get_info(accelerator.device)
+
+    if accelerator.is_main_process:
+        mib = 1024**2
+        logging.info(
+            "FSDP2 checkpoint CUDA memory before %s (rank 0): "
+            "allocated=%d MiB, reserved=%d MiB, free=%d->%d MiB, total=%d MiB",
+            stage,
+            allocated // mib,
+            reserved // mib,
+            free_before // mib,
+            free_after // mib,
+            total // mib,
+        )
+    accelerator.wait_for_everyone()
 
 
 def make_flashvla_dataset(cfg: FlashVLATrainConfig):
@@ -220,14 +251,14 @@ def save_fsdp2_checkpoint(
         training_state_dir.mkdir(parents=True, exist_ok=True)
         save_training_step(step, training_state_dir)
 
-    accelerator.wait_for_everyone()
+    prepare_cuda_for_checkpoint(accelerator, "sharded state save")
     accelerator_state_dir = checkpoint_dir / ACCELERATOR_STATE_DIR
     accelerator.save_state(str(accelerator_state_dir), safe_serialization=True)
-    accelerator.wait_for_everyone()
 
     # Export the gathered inference checkpoint only after the exact sharded
     # resume state is durable. Gathering a multi-billion-parameter fp32 model
     # has a much higher peak-memory requirement than the sharded save.
+    prepare_cuda_for_checkpoint(accelerator, "inference model export")
     accelerator.save_model(
         policy,
         pretrained_dir,
@@ -367,43 +398,17 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         fsdp_policy_dtype_override = (old_policy_dtype, cfg.policy.dtype)
 
     if accelerator is None:
-        from accelerate.utils import DistributedDataParallelKwargs
-
-        if cfg.deepspeed.enable and cfg.fsdp.enable:
-            raise ValueError("deepspeed and fsdp are mutually exclusive; enable only one.")
+        from accelerate.utils import DistributedDataParallelKwargs, InitProcessGroupKwargs
 
         kwargs_handlers = []
-        ds_plugin = None
         fsdp_plugin = None
 
-        if cfg.deepspeed.enable:
-            from accelerate import DeepSpeedPlugin
-
-            ds_config = {
-                "train_micro_batch_size_per_gpu": cfg.batch_size,
-                "gradient_accumulation_steps": cfg.grad_accum_steps,
-                "gradient_clipping": cfg.optimizer.grad_clip_norm,
-                "zero_optimization": {
-                    "stage": cfg.deepspeed.stage,
-                    "allgather_partitions": True,
-                    "allgather_bucket_size": cfg.deepspeed.allgather_bucket_size,
-                    "reduce_scatter": True,
-                    "reduce_bucket_size": cfg.deepspeed.reduce_bucket_size,
-                    "overlap_comm": cfg.deepspeed.overlap_comm,
-                },
-                "bf16": {"enabled": False},
-                "fp16": {"enabled": False},
-            }
-            if cfg.deepspeed.offload_optimizer:
-                ds_config["zero_optimization"]["offload_optimizer"] = {
-                    "device": "cpu",
-                    "pin_memory": True,
-                }
-
-            ds_plugin = DeepSpeedPlugin(hf_ds_config=ds_config)
-        elif cfg.fsdp.enable:
+        if cfg.fsdp.enable:
             from accelerate import FullyShardedDataParallelPlugin
 
+            kwargs_handlers.append(
+                InitProcessGroupKwargs(backend=FSDP_PROCESS_GROUP_BACKEND)
+            )
             fsdp_plugin = FullyShardedDataParallelPlugin(
                 fsdp_version=2,
                 reshard_after_forward=cfg.fsdp.reshard_after_forward,
@@ -419,7 +424,6 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
             kwargs_handlers=kwargs_handlers,
-            deepspeed_plugin=ds_plugin,
             fsdp_plugin=fsdp_plugin,
             mixed_precision="no" if cfg.fsdp.enable else None,
         )
@@ -427,14 +431,18 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     init_logging(accelerator=accelerator)
     is_main_process = accelerator.is_main_process
 
+    if cfg.fsdp.enable:
+        backend_config = torch.distributed.get_backend_config()
+        required_backends = tuple(FSDP_PROCESS_GROUP_BACKEND.split(","))
+        if not all(backend in backend_config for backend in required_backends):
+            raise RuntimeError(
+                "FSDP2 checkpointing requires a composite CUDA/NCCL and CPU/Gloo "
+                f"process group; expected {FSDP_PROCESS_GROUP_BACKEND!r}, "
+                f"got {backend_config!r}."
+            )
+
     if is_main_process:
         logging.info(pformat(cfg.to_dict()))
-        if cfg.deepspeed.enable:
-            logging.info(
-                f"DeepSpeed enabled with ZeRO stage={cfg.deepspeed.stage}, "
-                f"offload_optimizer={cfg.deepspeed.offload_optimizer}, "
-                f"overlap_comm={cfg.deepspeed.overlap_comm}"
-            )
         if cfg.fsdp.enable:
             logging.info(
                 f"Runtime: torch={torch.__version__}, "
@@ -445,6 +453,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
                 f"mixed_precision={fsdp_mixed_precision}, "
                 f"reduce_dtype={fsdp_reduce_dtype}, global_autocast={accelerator.mixed_precision}, "
                 f"state_dict_type={cfg.fsdp.state_dict_type}, "
+                f"process_group={backend_config}, "
                 "sharding_plan=policy-owned, trainable_ignored_params=0"
             )
             if fsdp_policy_dtype_override is not None:
@@ -619,9 +628,7 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
 
     policy.train()
 
-    if cfg.deepspeed.enable and getattr(cfg.policy, "dtype", None) == "bfloat16":
-        autocast_ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-    elif cfg.fsdp.enable:
+    if cfg.fsdp.enable:
         autocast_ctx = nullcontext()
     else:
         autocast_ctx = None
@@ -706,6 +713,10 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
             train_tracker.reset_averages()
 
         if cfg.save_checkpoint and is_saving_step:
+            # The next iteration recreates these values. Drop the final
+            # microbatch before the checkpoint's FSDP gathers so it cannot
+            # consume CUDA headroom while no longer being used.
+            del batch, output_dict
             checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
 
             if cfg.fsdp.enable:

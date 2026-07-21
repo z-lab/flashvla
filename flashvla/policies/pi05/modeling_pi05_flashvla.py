@@ -373,7 +373,7 @@ class PI05ModelLayer(nn.Module):
         return hidden_states
 
 
-class PI05ModelLayer(PI05ModelLayer):
+class FlashVLAPI05ModelLayer(PI05ModelLayer):
     """Transformer layer with per-token adaRMS conditioning for FlashVLA.
 
     Overrides forward_shared_observation to handle per-token adaRMS cond
@@ -388,7 +388,7 @@ class PI05ModelLayer(PI05ModelLayer):
                 raise ValueError("num_offsets and suffix_length are required when suffix_adarms_conds is provided.")
             return self.forward_shared_observation(hidden_states, attention_mask, position_ids, suffix_adarms_conds, num_offsets, suffix_length, use_cache=use_cache)
         if conds is None:
-            raise ValueError("conds is required for the regular PI05ModelLayer forward path.")
+            raise ValueError("conds is required for the regular FlashVLAPI05ModelLayer forward path.")
         return super().forward(hidden_states, attention_mask, position_ids, conds, use_cache=use_cache)
 
     def forward_shared_observation(
@@ -484,7 +484,7 @@ class PI05FlashVLAModel(nn.Module):
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
-            PI05ModelLayer(
+            FlashVLAPI05ModelLayer(
                 config,
                 self.vlm.model.language_model.layers[i],
                 self.action_expert.model.layers[i],
@@ -1108,7 +1108,7 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
     config_class = PI05FlashVLAConfig
     name = "pi05-flashvla"
     fsdp_wrap_class_names = (
-        "PI05ModelLayer",
+        "FlashVLAPI05ModelLayer",
         "SiglipEncoderLayer",
         "PaliGemmaMultiModalProjector",
         "Embedding",

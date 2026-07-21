@@ -27,34 +27,8 @@ from lerobot.configs.train import TrainPipelineConfig
 
 
 @dataclass
-class DeepSpeedConfig:
-    """Configuration for DeepSpeed ZeRO training.
-
-    DeepSpeed ZeRO-2 shards optimizer states and gradients across GPUs
-    without flattening parameters, so mixed-precision parameters (some bf16,
-    some fp32) work without issues — unlike FSDP which requires uniform dtype.
-
-    We deliberately set bf16.enabled=false in the DeepSpeed config so that
-    DeepSpeed does NOT call model.bfloat16() or use its BF16_Optimizer (which
-    unconditionally casts all params back to bf16 after each step). Instead,
-    bf16 compute is handled by torch.autocast, preserving fp32 for sensitive
-    parameters (layernorms, vision tower embeddings).
-    """
-
-    enable: bool = False
-
-    stage: int = 2
-
-    offload_optimizer: bool = False
-
-    allgather_bucket_size: int = int(2e8)
-    reduce_bucket_size: int = int(2e8)
-    overlap_comm: bool = True
-
-
-@dataclass
 class FSDPConfig:
-    """FSDP2 (per-parameter sharding) config — mutually exclusive with deepspeed."""
+    """FSDP2 per-parameter sharding configuration."""
     enable: bool = False
     mixed_precision: str = "no"
     reduce_dtype: str = "float32"
@@ -91,8 +65,6 @@ class FlashVLATrainConfig(TrainPipelineConfig):
     """
 
     grad_accum_steps: int = 1
-
-    deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
 
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 

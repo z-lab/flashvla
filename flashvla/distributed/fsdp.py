@@ -22,6 +22,9 @@ if TYPE_CHECKING:
     from accelerate import Accelerator
 
 
+FSDP_PROCESS_GROUP_BACKEND = "cuda:nccl,cpu:gloo"
+
+
 @dataclass(frozen=True)
 class FSDPWrapReport:
     """Summary of the communication groups created for one policy."""

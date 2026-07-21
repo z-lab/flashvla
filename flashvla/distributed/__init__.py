@@ -1,6 +1,7 @@
 """Distributed training helpers for FlashVLA."""
 
 from .fsdp import (
+    FSDP_PROCESS_GROUP_BACKEND,
     FSDPModulePlan,
     FSDPWrapReport,
     build_fsdp_module_plan,
@@ -10,6 +11,7 @@ from .fsdp import (
 )
 
 __all__ = [
+    "FSDP_PROCESS_GROUP_BACKEND",
     "FSDPModulePlan",
     "FSDPWrapReport",
     "build_fsdp_module_plan",

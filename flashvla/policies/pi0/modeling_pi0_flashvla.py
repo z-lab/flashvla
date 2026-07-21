@@ -15,7 +15,7 @@ training with PerSeg time sampling.
 Differences from pi05 streaming:
   * Per-slot time is injected via pi0's existing concat path
     (``cat([action_emb, time_emb]) -> action_time_mlp_in/out``) instead of
-    pi05's adaRMS FiLM. ``PI0ModelLayer.forward(..., conds=[None, None])``
+    pi05's adaRMS FiLM. ``FlashVLAPI0ModelLayer.forward(..., conds=[None, None])``
     works unchanged — no patches, no per-token cond reshape gymnastics.
   * The state token sits at suffix index 0 of every buffer config (pi0
     keeps state-as-token; pi05 bakes state into the prompt via
@@ -245,8 +245,8 @@ class PI0SuffixEmbedder(nn.Module):
         return embs, pad_masks, att_masks, None
 
 
-class PI0ModelLayer(BasePI0ModelLayer):
-    """PI0 layer with wrapper-owned norms registered for FSDP sharding."""
+class FlashVLAPI0ModelLayer(BasePI0ModelLayer):
+    """FlashVLA PI0 layer with wrapper-owned norms registered for FSDP sharding."""
 
     def __init__(
         self,
@@ -279,7 +279,7 @@ class PI0FlashVLAModel(nn.Module):
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
-            PI0ModelLayer(
+            FlashVLAPI0ModelLayer(
                 config,
                 self.vlm.model.language_model.layers[i],
                 self.action_expert.model.layers[i],
@@ -783,7 +783,7 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
     config_class = PI0FlashVLAConfig
     name = "pi0-flashvla"
     fsdp_wrap_class_names = (
-        "PI0ModelLayer",
+        "FlashVLAPI0ModelLayer",
         "SiglipEncoderLayer",
         "PaliGemmaMultiModalProjector",
         "Embedding",
