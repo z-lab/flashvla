@@ -60,13 +60,13 @@ optimizer:
 
 scheduler:
   type: cosine_decay_with_warmup
-  num_warmup_steps: 2000
+  num_warmup_steps: 5000
   peak_lr: 5.0e-5
   decay_lr: 2.5e-6
   num_decay_steps: 100000
 
 save_checkpoint: true
-save_freq: 2000
+save_freq: 500
 checkpoint_keep_last: 2
 checkpoint_keep_every_n_steps: 10000
 
