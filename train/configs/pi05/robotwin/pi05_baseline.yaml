@@ -67,8 +67,8 @@ scheduler:
 
 save_checkpoint: true
 save_freq: 500
-checkpoint_keep_last: 2
-checkpoint_keep_every_n_steps: 10000
+checkpoint_keep_last: 1
+checkpoint_keep_every_n_steps: 0
 
 log_freq: 50
 wandb:
