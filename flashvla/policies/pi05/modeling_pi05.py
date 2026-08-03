@@ -38,6 +38,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from lerobot.policies.pi_gemma import (
     PiGemmaForCausalLM as GemmaForCausalLM,
     PaliGemmaForConditionalGenerationWithPiGemma as PaliGemmaForConditionalGeneration,
@@ -121,7 +122,11 @@ class PI05PrefixEmbedder(nn.Module):
             pg = self._paligemma_model[0]
             vt = pg.vision_tower.vision_model
             hidden = vt.embeddings(img)
-            enc_dtype = vt.encoder.layers[0].self_attn.q_proj.weight.dtype
+            enc_dtype = getattr(
+                self,
+                "_fsdp_compute_dtype",
+                vt.encoder.layers[0].self_attn.q_proj.weight.dtype,
+            )
             hidden = hidden.to(enc_dtype)
             hidden = vt.encoder(inputs_embeds=hidden).last_hidden_state
             img_feats = vt.post_layernorm(hidden)
@@ -380,8 +385,12 @@ class PI05ModelLayer(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.input_layernorm = [vlm_layer.input_layernorm, action_expert_layer.input_layernorm]
-        self.post_attention_layernorm = [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
+        self.input_layernorm = nn.ModuleList(
+            [vlm_layer.input_layernorm, action_expert_layer.input_layernorm]
+        )
+        self.post_attention_layernorm = nn.ModuleList(
+            [vlm_layer.post_attention_layernorm, action_expert_layer.post_attention_layernorm]
+        )
 
         self.self_attn = PI05Attention(
             config,
@@ -577,6 +586,30 @@ class PI05Model(nn.Module):
             torch.set_float32_matmul_precision("high")
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
 
+    def detach_backbone_layer_aliases(self) -> None:
+        """Keep one registered owner for every decoder parameter."""
+        num_layers = len(self.layers)
+        self.vlm.model.language_model.layers = nn.ModuleList(
+            [nn.Identity() for _ in range(num_layers)]
+        )
+        self.action_expert.model.layers = nn.ModuleList(
+            [nn.Identity() for _ in range(num_layers)]
+        )
+
+    def set_fsdp_compute_dtype(self, dtype: torch.dtype) -> None:
+        """Record the unsharded compute dtype without consulting DTensor shards."""
+        if dtype not in {torch.float32, torch.bfloat16}:
+            raise ValueError(f"Unsupported PI0.5 FSDP compute dtype: {dtype}")
+        self._fsdp_compute_dtype = dtype
+        self.prefix_embedder._fsdp_compute_dtype = dtype
+
+    def backbone_dtype(self) -> torch.dtype:
+        return getattr(
+            self,
+            "_fsdp_compute_dtype",
+            self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype,
+        )
+
     def init_qkv_fusion_from_existing(self) -> None:
         """Fuse Q/K/V projections into single QKVLinear for faster inference.
         
@@ -763,7 +796,7 @@ class PI05Model(nn.Module):
             state, x_t, time
         )
 
-        backbone_dtype = self.vlm.model.language_model.layers[0].mlp.down_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
@@ -777,7 +810,24 @@ class PI05Model(nn.Module):
         conds = [None, suffix_adarms_cond]
 
         for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_mask, position_ids, conds, use_cache=False)
+            if self.training and self.config.gradient_checkpointing:
+                hidden_states = activation_checkpoint(
+                    layer,
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    conds,
+                    False,
+                    use_reentrant=False,
+                )
+            else:
+                hidden_states = layer(
+                    hidden_states,
+                    attention_mask,
+                    position_ids,
+                    conds,
+                    use_cache=False,
+                )
 
         norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
         final_hidden_states: list[torch.Tensor | None] = []
@@ -863,7 +913,7 @@ class PI05Model(nn.Module):
         
         suffix_adarms_conds = suffix_adarms_cond_flat.view(batch_size, num_offsets, -1) if suffix_adarms_cond_flat is not None else None
         
-        backbone_dtype = self.vlm.model.language_model.layers[0].mlp.down_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         prefix_embs = prefix_embs.to(dtype=backbone_dtype)
         suffix_embs_concat = suffix_embs_concat.to(dtype=backbone_dtype)
         
@@ -937,7 +987,7 @@ class PI05Model(nn.Module):
             state, x_t, timestep
         )
 
-        backbone_dtype = self.vlm.model.language_model.layers[0].mlp.down_proj.weight.dtype
+        backbone_dtype = self.backbone_dtype()
         suffix_embs = suffix_embs.to(dtype=backbone_dtype)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
@@ -1077,6 +1127,27 @@ class PI05Policy(PreTrainedPolicy):
 
     config_class = PI05Config
     name = "pi05"
+    fsdp_wrap_class_names = (
+        "PI05ModelLayer",
+        "SiglipEncoderLayer",
+        "PaliGemmaMultiModalProjector",
+        "Embedding",
+        "PI05SuffixEmbedder",
+    )
+    fsdp_wrap_name_suffixes = ("vlm.lm_head", "action_expert.lm_head")
+    fsdp_fp32_class_names = (
+        "FlashVLARMSNorm",
+        "PiGemmaRMSNorm",
+        "PI05SuffixEmbedder",
+        "SiglipVisionEmbeddings",
+    )
+    fsdp_fp32_name_suffixes = (
+        "vision_model.post_layernorm",
+        "model.language_model.norm",
+        "action_expert.model.norm",
+        "action_out_proj",
+    )
+    fsdp_fp32_output_name_suffixes = ("suffix_embedder", "action_out_proj")
 
     def __init__(
         self,
@@ -1095,6 +1166,27 @@ class PI05Policy(PreTrainedPolicy):
         self.model = PI05Model(config)
 
         self.reset()
+
+    def prepare_for_fsdp(self, *, compute_dtype: torch.dtype) -> None:
+        """Finalize canonical decoder ownership before distributed wrapping."""
+        self.model.set_fsdp_compute_dtype(compute_dtype)
+        for lm_head, embedding in (
+            (self.model.vlm.lm_head, self.model.vlm.language_model.embed_tokens),
+            (self.model.action_expert.lm_head, self.model.action_expert.model.embed_tokens),
+        ):
+            if lm_head.weight is not embedding.weight:
+                lm_head.requires_grad_(False)
+
+        parameter_ids_before = {id(parameter) for parameter in self.parameters()}
+        self.model.detach_backbone_layer_aliases()
+        parameter_ids_after = {id(parameter) for parameter in self.parameters()}
+        if parameter_ids_before != parameter_ids_after:
+            raise RuntimeError(
+                "Detaching PI0.5 backbone aliases changed the parameter set: "
+                f"before={len(parameter_ids_before)}, after={len(parameter_ids_after)}, "
+                f"dropped={len(parameter_ids_before - parameter_ids_after)}, "
+                f"added={len(parameter_ids_after - parameter_ids_before)}"
+            )
 
     @classmethod
     def from_pretrained(

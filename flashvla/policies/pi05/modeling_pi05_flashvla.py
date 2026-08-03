@@ -103,7 +103,11 @@ class PI05PrefixEmbedder(nn.Module):
             pg = self._paligemma_model[0]
             vt = pg.vision_tower.vision_model
             hidden = vt.embeddings(img)
-            enc_dtype = vt.encoder.layers[0].self_attn.q_proj.weight.dtype
+            enc_dtype = getattr(
+                self,
+                "_fsdp_compute_dtype",
+                vt.encoder.layers[0].self_attn.q_proj.weight.dtype,
+            )
             hidden = hidden.to(enc_dtype)
             hidden = vt.encoder(inputs_embeds=hidden).last_hidden_state
             img_feats = vt.post_layernorm(hidden)
@@ -369,7 +373,7 @@ class PI05ModelLayer(nn.Module):
         return hidden_states
 
 
-class PI05ModelLayer(PI05ModelLayer):
+class FlashVLAPI05ModelLayer(PI05ModelLayer):
     """Transformer layer with per-token adaRMS conditioning for FlashVLA.
 
     Overrides forward_shared_observation to handle per-token adaRMS cond
@@ -384,7 +388,7 @@ class PI05ModelLayer(PI05ModelLayer):
                 raise ValueError("num_offsets and suffix_length are required when suffix_adarms_conds is provided.")
             return self.forward_shared_observation(hidden_states, attention_mask, position_ids, suffix_adarms_conds, num_offsets, suffix_length, use_cache=use_cache)
         if conds is None:
-            raise ValueError("conds is required for the regular PI05ModelLayer forward path.")
+            raise ValueError("conds is required for the regular FlashVLAPI05ModelLayer forward path.")
         return super().forward(hidden_states, attention_mask, position_ids, conds, use_cache=use_cache)
 
     def forward_shared_observation(
@@ -480,7 +484,7 @@ class PI05FlashVLAModel(nn.Module):
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
-            PI05ModelLayer(
+            FlashVLAPI05ModelLayer(
                 config,
                 self.vlm.model.language_model.layers[i],
                 self.action_expert.model.layers[i],
@@ -508,8 +512,19 @@ class PI05FlashVLAModel(nn.Module):
         self.vlm.model.language_model.layers = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
         self.action_expert.model.layers = nn.ModuleList([nn.Identity() for _ in range(num_layers)])
 
+    def set_fsdp_compute_dtype(self, dtype: torch.dtype) -> None:
+        """Record the unsharded compute dtype without consulting master shards."""
+        if dtype not in {torch.float32, torch.bfloat16}:
+            raise ValueError(f"Unsupported PI0.5 FSDP compute dtype: {dtype}")
+        self._fsdp_compute_dtype = dtype
+        self.prefix_embedder._fsdp_compute_dtype = dtype
+
     def backbone_dtype(self):
-        return self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype
+        return getattr(
+            self,
+            "_fsdp_compute_dtype",
+            self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype,
+        )
 
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
         modules = [self.vlm, self.action_expert]
@@ -1092,6 +1107,30 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
 
     config_class = PI05FlashVLAConfig
     name = "pi05-flashvla"
+    fsdp_wrap_class_names = (
+        "FlashVLAPI05ModelLayer",
+        "SiglipEncoderLayer",
+        "PaliGemmaMultiModalProjector",
+        "Embedding",
+        "PI05SuffixEmbedder",
+    )
+    fsdp_wrap_name_suffixes = ("vlm.lm_head", "action_expert.lm_head")
+    fsdp_fp32_class_names = (
+        "FlashVLARMSNorm",
+        "PiGemmaRMSNorm",
+        "PI05SuffixEmbedder",
+        "SiglipVisionEmbeddings",
+    )
+    fsdp_fp32_name_suffixes = (
+        "vision_model.post_layernorm",
+        "model.language_model.norm",
+        "action_expert.model.norm",
+        "action_out_proj",
+    )
+    # PI0.5's adaRMS conditioning intentionally remains fp32 between the
+    # suffix embedder and each fp32 RMSNorm island. The model explicitly casts
+    # only suffix token embeddings to the backbone dtype.
+    fsdp_fp32_output_name_suffixes = ("suffix_embedder", "action_out_proj")
 
     def __init__(
         self,
@@ -1115,6 +1154,26 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
         self._cold_start_stats = ColdStartStats()
 
         self.reset()
+
+    def prepare_for_fsdp(self, *, compute_dtype: torch.dtype) -> None:
+        """Finalize canonical decoder ownership before distributed wrapping."""
+        self.model.set_fsdp_compute_dtype(compute_dtype)
+        for lm_head, embedding in (
+            (self.model.vlm.lm_head, self.model.vlm.language_model.embed_tokens),
+            (self.model.action_expert.lm_head, self.model.action_expert.model.embed_tokens),
+        ):
+            if lm_head.weight is not embedding.weight:
+                lm_head.requires_grad_(False)
+        parameter_ids_before = {id(parameter) for parameter in self.parameters()}
+        self.model.detach_backbone_layer_aliases()
+        parameter_ids_after = {id(parameter) for parameter in self.parameters()}
+        if parameter_ids_before != parameter_ids_after:
+            raise RuntimeError(
+                "Detaching PI0.5 backbone aliases changed the parameter set: "
+                f"before={len(parameter_ids_before)}, after={len(parameter_ids_after)}, "
+                f"dropped={len(parameter_ids_before - parameter_ids_after)}, "
+                f"added={len(parameter_ids_after - parameter_ids_before)}"
+            )
 
     @classmethod
     def from_pretrained(

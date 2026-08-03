@@ -179,21 +179,22 @@ def make_pre_post_processors(
 ]:
     """Create or load pre- and post-processor pipelines for a policy.
 
-    If the pretrained_path contains processor JSON files, loads them directly.
-    Otherwise, creates full processor pipelines with normalization, tokenization,
-    and device transfer based on the policy type.
+    If no dataset statistics are supplied and the pretrained path contains
+    processor JSON files, load them directly. When dataset statistics are
+    supplied, build processors for the current policy and dataset instead.
 
     Args:
         policy_cfg: Policy configuration.
         pretrained_path: Path to pretrained model directory.
-        dataset_stats: Dataset statistics for normalization.
+        dataset_stats: Dataset statistics for normalization. Supplying these
+            selects freshly built processors for the current dataset.
         **kwargs: Keyword arguments including preprocessor_overrides and
             postprocessor_overrides.
 
     Returns:
         A tuple of (preprocessor, postprocessor) pipelines.
     """
-    if pretrained_path:
+    if pretrained_path and dataset_stats is None:
         preprocessor_json = Path(pretrained_path) / f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json"
         postprocessor_json = Path(pretrained_path) / f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json"
 

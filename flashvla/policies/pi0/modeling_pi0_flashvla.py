@@ -15,7 +15,7 @@ training with PerSeg time sampling.
 Differences from pi05 streaming:
   * Per-slot time is injected via pi0's existing concat path
     (``cat([action_emb, time_emb]) -> action_time_mlp_in/out``) instead of
-    pi05's adaRMS FiLM. ``PI0ModelLayer.forward(..., conds=[None, None])``
+    pi05's adaRMS FiLM. ``FlashVLAPI0ModelLayer.forward(..., conds=[None, None])``
     works unchanged — no patches, no per-token cond reshape gymnastics.
   * The state token sits at suffix index 0 of every buffer config (pi0
     keeps state-as-token; pi05 bakes state into the prompt via
@@ -245,8 +245,8 @@ class PI0SuffixEmbedder(nn.Module):
         return embs, pad_masks, att_masks, None
 
 
-class PI0ModelLayer(BasePI0ModelLayer):
-    """PI0 layer with wrapper-owned norms registered for FSDP sharding."""
+class FlashVLAPI0ModelLayer(BasePI0ModelLayer):
+    """FlashVLA PI0 layer with wrapper-owned norms registered for FSDP sharding."""
 
     def __init__(
         self,
@@ -279,7 +279,7 @@ class PI0FlashVLAModel(nn.Module):
 
         num_hidden_layers = config.vlm_config.text_config.num_hidden_layers
         self.layers = nn.ModuleList([
-            PI0ModelLayer(
+            FlashVLAPI0ModelLayer(
                 config,
                 self.vlm.model.language_model.layers[i],
                 self.action_expert.model.layers[i],
@@ -308,9 +308,20 @@ class PI0FlashVLAModel(nn.Module):
             [nn.Identity() for _ in range(num_layers)]
         )
 
+    def set_fsdp_compute_dtype(self, dtype: torch.dtype) -> None:
+        """Record the unsharded compute dtype without consulting master shards."""
+        if dtype not in {torch.float32, torch.bfloat16}:
+            raise ValueError(f"Unsupported PI0 FSDP compute dtype: {dtype}")
+        self._fsdp_compute_dtype = dtype
+        self.prefix_embedder._fsdp_compute_dtype = dtype
+
     def backbone_dtype(self) -> torch.dtype:
         """Return the dtype from the wrapper-owned VLM decoder layers."""
-        return self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype
+        return getattr(
+            self,
+            "_fsdp_compute_dtype",
+            self.layers[0].mlp.vlm_mlp.down_proj.weight.dtype,
+        )
 
 
     def to_bfloat16_for_selected_params(self, precision: str = "bfloat16") -> None:
@@ -771,6 +782,27 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
 
     config_class = PI0FlashVLAConfig
     name = "pi0-flashvla"
+    fsdp_wrap_class_names = (
+        "FlashVLAPI0ModelLayer",
+        "SiglipEncoderLayer",
+        "PaliGemmaMultiModalProjector",
+        "Embedding",
+        "PI0SuffixEmbedder",
+    )
+    fsdp_wrap_name_suffixes = ("vlm.lm_head", "action_expert.lm_head")
+    fsdp_fp32_class_names = (
+        "FlashVLARMSNorm",
+        "PiGemmaRMSNorm",
+        "PI0SuffixEmbedder",
+        "SiglipVisionEmbeddings",
+    )
+    fsdp_fp32_name_suffixes = (
+        "vision_model.post_layernorm",
+        "model.language_model.norm",
+        "action_expert.model.norm",
+        "action_out_proj",
+    )
+    fsdp_fp32_output_name_suffixes = ("action_out_proj",)
 
     def __init__(
         self,
@@ -791,6 +823,26 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
         self._step_counter = 0
         self._cold_start_stats = ColdStartStats()
         self.reset()
+
+    def prepare_for_fsdp(self, *, compute_dtype: torch.dtype) -> None:
+        """Finalize canonical decoder ownership before distributed wrapping."""
+        self.model.set_fsdp_compute_dtype(compute_dtype)
+        for lm_head, embedding in (
+            (self.model.vlm.lm_head, self.model.vlm.language_model.embed_tokens),
+            (self.model.action_expert.lm_head, self.model.action_expert.model.embed_tokens),
+        ):
+            if lm_head.weight is not embedding.weight:
+                lm_head.requires_grad_(False)
+        parameter_ids_before = {id(parameter) for parameter in self.parameters()}
+        self.model.detach_backbone_layer_aliases()
+        parameter_ids_after = {id(parameter) for parameter in self.parameters()}
+        if parameter_ids_before != parameter_ids_after:
+            raise RuntimeError(
+                "Detaching PI0 backbone aliases changed the parameter set: "
+                f"before={len(parameter_ids_before)}, after={len(parameter_ids_after)}, "
+                f"dropped={len(parameter_ids_before - parameter_ids_after)}, "
+                f"added={len(parameter_ids_after - parameter_ids_before)}"
+            )
 
     @classmethod
     def from_pretrained(

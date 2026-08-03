@@ -101,7 +101,11 @@ class PI0PrefixEmbedder(nn.Module):
             pg = self._paligemma_model[0]
             vt = pg.vision_tower.vision_model
             hidden = vt.embeddings(img)
-            enc_dtype = vt.encoder.layers[0].self_attn.q_proj.weight.dtype
+            enc_dtype = getattr(
+                self,
+                "_fsdp_compute_dtype",
+                vt.encoder.layers[0].self_attn.q_proj.weight.dtype,
+            )
             hidden = hidden.to(enc_dtype)
             hidden = vt.encoder(inputs_embeds=hidden).last_hidden_state
             img_feats = vt.post_layernorm(hidden)

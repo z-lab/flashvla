@@ -27,49 +27,13 @@ from lerobot.configs.train import TrainPipelineConfig
 
 
 @dataclass
-class DeepSpeedConfig:
-    """Configuration for DeepSpeed ZeRO training.
-
-    DeepSpeed ZeRO-2 shards optimizer states and gradients across GPUs
-    without flattening parameters, so mixed-precision parameters (some bf16,
-    some fp32) work without issues — unlike FSDP which requires uniform dtype.
-
-    We deliberately set bf16.enabled=false in the DeepSpeed config so that
-    DeepSpeed does NOT call model.bfloat16() or use its BF16_Optimizer (which
-    unconditionally casts all params back to bf16 after each step). Instead,
-    bf16 compute is handled by torch.autocast, preserving fp32 for sensitive
-    parameters (layernorms, vision tower embeddings).
-    """
-
-    enable: bool = False
-
-    stage: int = 2
-
-    offload_optimizer: bool = False
-
-    allgather_bucket_size: int = int(2e8)
-    reduce_bucket_size: int = int(2e8)
-    overlap_comm: bool = True
-
-
-@dataclass
 class FSDPConfig:
-    """FSDP2 (per-parameter sharding) config — mutually exclusive with deepspeed."""
+    """FSDP2 per-parameter sharding configuration."""
     enable: bool = False
     mixed_precision: str = "no"
     reduce_dtype: str = "float32"
     reshard_after_forward: bool = False
     cpu_offload: bool = False
-    wrap_layers: List[str] = field(
-        default_factory=lambda: [
-            "SiglipEncoderLayer",
-            "PaliGemmaMultiModalProjector",
-            "Embedding",
-        ]
-    )
-    ignored_module_classes: List[str] = field(default_factory=lambda: ["SiglipVisionEmbeddings"])
-    fp32_module_classes: List[str] = field(default_factory=lambda: ["FlashVLARMSNorm"])
-    ignored_module_name_suffixes: List[str] = field(default_factory=lambda: ["vision_model.post_layernorm", "model.language_model.norm", "action_expert.model.norm", "action_out_proj"])
     state_dict_type: str = "SHARDED_STATE_DICT"
     save_pretrained_max_shard_size: str = "50GB"
 
@@ -102,8 +66,11 @@ class FlashVLATrainConfig(TrainPipelineConfig):
 
     grad_accum_steps: int = 1
 
-    deepspeed: DeepSpeedConfig = field(default_factory=DeepSpeedConfig)
-
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
 
     robotwin_multitask: RoboTwinMultiTaskConfig = field(default_factory=RoboTwinMultiTaskConfig)
+
+    # Keep frequent checkpoints for requeue safety without retaining every
+    # 60+ GB FSDP2 optimizer snapshot forever. Zero preserves all checkpoints.
+    checkpoint_keep_last: int = 0
+    checkpoint_keep_every_n_steps: int = 0
