@@ -207,7 +207,10 @@ class PI05FlashVLAModel:
             m.next_chunk = None
 
         action_np = m.current_chunk[:, m.chunk_index, :]
-        action = torch.from_numpy(action_np).to(self.device)
+        # Keep cached actions on CPU. An H2D copy here would wait behind the
+        # in-flight next-chunk inference on the default CUDA stream, defeating
+        # the overlap that lets RoboTwin execute cached actions asynchronously.
+        action = torch.from_numpy(action_np)
 
         m.chunk_index = (m.chunk_index + 1) % m.n_action_steps
         if m.chunk_index == 0:
