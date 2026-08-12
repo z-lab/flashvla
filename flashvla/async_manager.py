@@ -55,7 +55,7 @@ Minimal real-robot integration::
     mgr.reset()                                  # at episode start
     while running:
         processed = preprocessor(robot_obs)      # tokenize/normalize/device
-        action = mgr.act(processed)              # [B, action_dim] on GPU
+        action = mgr.act(processed)              # [B, action_dim] on CPU
         action = postprocessor(action)           # unnormalize
         robot.send_action(action.cpu().numpy())
 """
@@ -82,7 +82,7 @@ class AsyncStreamingActionManager:
         mgr.reset()
         for obs in env_loop:
             processed = preprocessor(obs)
-            action = mgr.act(processed)             # [B, action_dim] on policy device
+            action = mgr.act(processed)             # [B, action_dim] on CPU
             action = postprocessor({ACTION: action})[ACTION]
             obs, r, done, info = env.step(action.cpu().numpy())
     """
@@ -192,8 +192,8 @@ class AsyncStreamingActionManager:
                 expects.
 
         Returns:
-            Action tensor ``[B, action_dim]`` on ``self.device``. Caller is
-            responsible for postprocessing (unnormalize) and moving to CPU.
+            CPU action tensor ``[B, action_dim]``. Caller is responsible for
+            postprocessing (unnormalize).
         """
         if not self.is_running():
             self.current_chunk = self._launch_inference(processed_obs).detach().cpu().numpy()
@@ -213,7 +213,11 @@ class AsyncStreamingActionManager:
             self.next_chunk = self._launch_inference(processed_obs)
 
         action_np = self.current_chunk[:, self.chunk_index, :]
-        action_t = torch.from_numpy(action_np).to(self.device)
+        # Keep the executing action on CPU. Moving it back to the policy device
+        # would enqueue a blocking H2D copy behind the just-launched inference
+        # on the default CUDA stream, synchronizing that inference and defeating
+        # the overlap. The current chunk already lives in CPU-backed NumPy.
+        action_t = torch.from_numpy(action_np)
 
         self.chunk_index = (self.chunk_index + 1) % self.n_action_steps
         if self.chunk_index == 0:
