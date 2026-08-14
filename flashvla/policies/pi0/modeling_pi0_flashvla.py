@@ -49,6 +49,10 @@ from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
 
+from flashvla.policies.loading import (
+    assert_checkpoint_covers_parameters,
+    restore_untied_lm_head_embeddings,
+)
 from flashvla.policies.pi0.configuration_pi0 import PI0FlashVLAConfig
 from flashvla.policies.pi0.modeling_pi0 import (
     PI0PrefixEmbedder,
@@ -928,6 +932,17 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
                 continue
             mapped_sd[new_key] = value
 
+        restored_embeddings = restore_untied_lm_head_embeddings(instance, mapped_sd, target_sd)
+        if restored_embeddings:
+            logger.info(
+                "Restored %d tied input embedding(s) from their lm_head: %s",
+                len(restored_embeddings),
+                ", ".join(restored_embeddings),
+            )
+
+        # Parameters this branch deliberately (re)initializes instead of loading.
+        freshly_initialized: set[str] = set()
+
         if getattr(config, "use_adarms_time_cond", False):
             from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
             from lerobot.policies.pi_gemma import (
@@ -946,28 +961,39 @@ class PI0FlashVLAPolicy(PreTrainedPolicy):
                             n_kept += 1
                         else:
                             module.dense.weight.zero_()
+                            freshly_initialized.add(dense_w_key)
                             if module.dense.bias is not None:
                                 module.dense.bias.zero_()
+                                freshly_initialized.add(f"{ae_prefix}{name}.dense.bias")
                             n_zeroed += 1
                 se = instance.model.suffix_embedder
                 if hasattr(se, "state_mlp_out"):
                     if "model.suffix_embedder.state_mlp_out.weight" not in mapped_sd:
                         se.state_mlp_out.weight.zero_()
+                        freshly_initialized.add("model.suffix_embedder.state_mlp_out.weight")
                         if se.state_mlp_out.bias is not None:
                             se.state_mlp_out.bias.zero_()
+                            freshly_initialized.add("model.suffix_embedder.state_mlp_out.bias")
             logger.info(
                 f"adaRMS mode: zero-init'd {n_zeroed} fresh FiLM dense layers "
                 f"(DiT identity), {n_kept} layers will be loaded from ckpt"
             )
 
         incompatible = instance.load_state_dict(mapped_sd, strict=False)
-        _missing_keys, unexpected_keys = incompatible.missing_keys, incompatible.unexpected_keys
+        unexpected_keys = incompatible.unexpected_keys
         unexpected_fatal = list(unexpected_keys)
         if unexpected_fatal:
             raise RuntimeError(
                 "Checkpoint loading failed.\n"
                 f"Unexpected keys: {unexpected_fatal}"
             )
+
+        assert_checkpoint_covers_parameters(
+            instance,
+            mapped_sd,
+            source=str(pretrained_name_or_path),
+            allow=freshly_initialized,
+        )
 
         instance.to(config.device)
         instance.eval()

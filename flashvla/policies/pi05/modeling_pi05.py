@@ -30,6 +30,7 @@ Architecture:
 """
 
 import builtins
+import logging
 import math
 import os
 from collections import deque
@@ -47,6 +48,10 @@ from lerobot.policies.pi_gemma import (
 from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
+from flashvla.policies.loading import (
+    assert_checkpoint_covers_parameters,
+    restore_untied_lm_head_embeddings,
+)
 from flashvla.policies.pi05.configuration_pi05 import PI05Config
 from flashvla.policies.pi05.utils import (
     create_sinusoidal_pos_embedding,
@@ -1295,8 +1300,16 @@ class PI05Policy(PreTrainedPolicy):
                 continue
             mapped_sd[new_key] = value
 
+        restored_embeddings = restore_untied_lm_head_embeddings(instance, mapped_sd, target_sd)
+        if restored_embeddings:
+            logging.info(
+                "Restored %d tied input embedding(s) from their lm_head: %s",
+                len(restored_embeddings),
+                ", ".join(restored_embeddings),
+            )
+
         incompatible = instance.load_state_dict(mapped_sd, strict=False)
-        missing_keys, unexpected_keys = incompatible.missing_keys, incompatible.unexpected_keys
+        unexpected_keys = incompatible.unexpected_keys
 
         unexpected_fatal = list(unexpected_keys)
         if unexpected_fatal:
@@ -1304,6 +1317,10 @@ class PI05Policy(PreTrainedPolicy):
                 "Checkpoint loading failed.\n"
                 f"Unexpected keys: {unexpected_fatal}"
             )
+
+        assert_checkpoint_covers_parameters(
+            instance, mapped_sd, source=str(pretrained_name_or_path)
+        )
 
         instance.to(config.device)
         instance.eval()
