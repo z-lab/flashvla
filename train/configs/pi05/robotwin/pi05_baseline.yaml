@@ -14,7 +14,6 @@ policy:
   chunk_size: 50
   n_action_steps: 50
   freeze_vision_encoder: false
-  gradient_checkpointing: true
   normalization_mapping:
     VISUAL: IDENTITY
     STATE: QUANTILES

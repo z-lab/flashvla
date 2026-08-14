@@ -39,7 +39,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
-from torch.utils.checkpoint import checkpoint as activation_checkpoint
 from lerobot.policies.pi_gemma import (
     PiGemmaForCausalLM as GemmaForCausalLM,
     PaliGemmaForConditionalGenerationWithPiGemma as PaliGemmaForConditionalGeneration,
@@ -815,24 +814,13 @@ class PI05Model(nn.Module):
         conds = [None, suffix_adarms_cond]
 
         for layer in self.layers:
-            if self.training and self.config.gradient_checkpointing:
-                hidden_states = activation_checkpoint(
-                    layer,
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    conds,
-                    False,
-                    use_reentrant=False,
-                )
-            else:
-                hidden_states = layer(
-                    hidden_states,
-                    attention_mask,
-                    position_ids,
-                    conds,
-                    use_cache=False,
-                )
+            hidden_states = layer(
+                hidden_states,
+                attention_mask,
+                position_ids,
+                conds,
+                use_cache=False,
+            )
 
         norms = [self.vlm.language_model.norm, self.action_expert.model.norm]
         final_hidden_states: list[torch.Tensor | None] = []

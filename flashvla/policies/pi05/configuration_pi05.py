@@ -128,6 +128,11 @@ class PI05Config(PreTrainedConfig):
     )
 
     attention_backend: str = "sdpa"
+    # Removed feature, kept only so that configs written by earlier versions still
+    # parse (draccus rejects unknown keys). Setting it True is an error: the old
+    # implementation checkpointed layers that rebind their input list in place, so
+    # the recomputation ran against post-layernorm tensors and produced silently
+    # wrong gradients. See __post_init__.
     gradient_checkpointing: bool = False
     freeze_vision_encoder: bool = False
     compile_model: bool = False
@@ -164,6 +169,15 @@ class PI05Config(PreTrainedConfig):
             raise ValueError(f"Invalid action_expert_variant: {self.action_expert_variant}")
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
+        if self.gradient_checkpointing:
+            raise ValueError(
+                "gradient_checkpointing was removed. The previous implementation "
+                "produced silently wrong gradients: the joint layers rebind their "
+                "hidden_states list in place, so torch.utils.checkpoint replayed "
+                "them against post-layernorm tensors during backward. A checkpoint "
+                "whose config carries gradient_checkpointing=true was trained that "
+                "way and should be retrained."
+            )
 
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
