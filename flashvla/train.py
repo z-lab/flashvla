@@ -19,7 +19,7 @@ Trains flashvla policies (pi05 / pi0 / smolvla) with shared
 observation and padded cold start.
 
 Usage:
-    python train/train.py --config_path=train/configs/pi05/libero/flashvla_action.yaml
+    python -m flashvla.train --config_path=train/configs/pi05/libero/pi05_flashvla.yaml
 """
 
 import gc

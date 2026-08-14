@@ -21,7 +21,7 @@ classifiers = [
 dependencies = [
     "lerobot[smolvla]==0.5.1",
     # FSDP2/DDP training: accelerate>=1.13 ships fsdp_version=2 + save_state/
-    # save_model with sharded state_dict_type used by train/train.py.
+    # save_model with sharded state_dict_type used by flashvla/train.py.
     "accelerate>=1.13.0",
 ]
 
@@ -33,8 +33,8 @@ libero = ["lerobot[libero]==0.5.1"]
 Homepage = "https://github.com/z-lab/flashvla"
 Repository = "https://github.com/z-lab/flashvla"
 
-# No console scripts: the package is a pure library (policies / datasets /
-# async_manager). Workflows are standalone scripts at the repo root:
-# train/, sim_eval/, benchmarks/.
+# No console scripts: training is implemented by the flashvla.train module and
+# invoked through train/train.sh. Evaluation and benchmark workflows remain
+# standalone scripts under sim_eval/ and benchmarks/.
 [tool.setuptools.packages.find]
 include = ["flashvla*"]
