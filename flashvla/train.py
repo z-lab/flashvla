@@ -15,8 +15,9 @@
 # limitations under the License.
 """FlashVLA Training Module.
 
-Trains flashvla policies (pi05 / pi0 / smolvla) with shared
-observation and padded cold start.
+Trains baseline and FlashVLA policies (PI0.5 / PI0 / SmolVLA / LingBot).
+Streaming policies use shared-observation, padded-buffer datasets; baseline
+policies use ordinary LeRobot action-chunk datasets.
 
 Usage:
     python -m flashvla.train --config_path=train/configs/pi05/libero/pi05_flashvla.yaml
@@ -44,7 +45,7 @@ from lerobot.datasets.factory import (
     resolve_delta_timestamps,
 )
 from lerobot.datasets.sampler import EpisodeAwareSampler
-from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
 from lerobot.datasets.transforms import ImageTransforms
 from lerobot.datasets.utils import cycle
 from lerobot.optim.factory import make_optimizer_and_scheduler
@@ -89,6 +90,228 @@ def count_parameters(model: torch.nn.Module, only_trainable: bool = False) -> in
     )
 
 
+def _format_init_report(
+    label: str,
+    init: str,
+    matches: list[str],
+    changed_values: int,
+) -> str:
+    preview = matches[:12]
+    suffix = "" if len(matches) <= len(preview) else f", ... (+{len(matches) - len(preview)} more)"
+    return (
+        f"  {label} init={init}, modules={len(matches)}, "
+        f"changed_values={changed_values:,}, matches={preview}{suffix}"
+    )
+
+
+def _reset_linear(module: torch.nn.Module, init: str) -> int:
+    changed_values = sum(parameter.numel() for parameter in module.parameters(recurse=False))
+    if init == "random":
+        if not hasattr(module, "reset_parameters"):
+            raise TypeError(f"Module {type(module).__name__} does not support reset_parameters()")
+        module.reset_parameters()
+    elif init == "zero":
+        weight = getattr(module, "weight", None)
+        bias = getattr(module, "bias", None)
+        if weight is not None:
+            weight.zero_()
+        if bias is not None:
+            bias.zero_()
+    else:
+        raise ValueError(f"Unsupported FlashVLA init={init!r}; expected 'random' or 'zero'")
+    return changed_values
+
+
+def _iter_adaptive_norm_linears(name: str, norm: torch.nn.Module | None):
+    """Yield the train-from-scratch modulation projections of one norm."""
+    if norm is None:
+        return
+
+    dense = getattr(norm, "dense", None)
+    if isinstance(dense, torch.nn.Linear):
+        yield f"{name}.dense", dense
+        return
+
+    for attribute in ("gamma", "beta", "gate", "gamma_beta_gate"):
+        projection = getattr(norm, attribute, None)
+        if isinstance(projection, torch.nn.Linear):
+            yield f"{name}.{attribute}", projection
+
+
+def _iter_lingbot_action_expert_norms(
+    policy: PreTrainedPolicy,
+    *,
+    include_final_norm: bool,
+):
+    """Yield LingBot action-expert norms without touching the VLM norms."""
+    joint_model = getattr(policy.model, "qwenvl_with_expert", None)
+    qwen_expert_model = getattr(getattr(joint_model, "qwen_expert", None), "model", None)
+    if qwen_expert_model is None:
+        return
+
+    if include_final_norm:
+        final_norm = getattr(qwen_expert_model, "norm", None)
+        if final_norm is not None:
+            yield "model.qwenvl_with_expert.qwen_expert.model.norm", final_norm
+
+    for index, layer in enumerate(getattr(qwen_expert_model, "layers", ())):
+        for attribute in ("input_layernorm", "post_attention_layernorm"):
+            norm = getattr(layer, attribute, None)
+            if norm is not None:
+                yield (
+                    f"model.qwenvl_with_expert.qwen_expert.model.layers.{index}.{attribute}",
+                    norm,
+                )
+
+
+def _iter_action_expert_norm_init_modules(
+    policy: PreTrainedPolicy,
+    *,
+    include_final_norm: bool,
+):
+    """Yield AdaNorm projections reset by ``flashvla_init``."""
+    model = policy.model
+
+    if include_final_norm:
+        action_expert_model = getattr(getattr(model, "action_expert", None), "model", None)
+        yield from _iter_adaptive_norm_linears(
+            "model.action_expert.model.norm",
+            getattr(action_expert_model, "norm", None),
+        )
+
+    layers = getattr(model, "layers", None)
+    if layers is not None:
+        for index, layer in enumerate(layers):
+            input_norms = getattr(layer, "input_layernorm", None)
+            if input_norms is not None and len(input_norms) > 1:
+                yield from _iter_adaptive_norm_linears(
+                    f"model.layers.{index}.input_layernorm.1",
+                    input_norms[1],
+                )
+
+            post_norms = getattr(layer, "post_attention_layernorm", None)
+            if post_norms is not None and len(post_norms) > 1:
+                yield from _iter_adaptive_norm_linears(
+                    f"model.layers.{index}.post_attention_layernorm.1",
+                    post_norms[1],
+                )
+
+    for name, norm in _iter_lingbot_action_expert_norms(
+        policy,
+        include_final_norm=include_final_norm,
+    ):
+        yield from _iter_adaptive_norm_linears(name, norm)
+
+
+def _iter_streaming_time_mlp_modules(policy: PreTrainedPolicy):
+    """Yield time-conditioning projections owned by a streaming policy."""
+    model = policy.model
+
+    suffix_embedder = getattr(model, "suffix_embedder", None)
+    if suffix_embedder is not None:
+        for attribute in ("time_mlp_in", "time_mlp_out"):
+            module = getattr(suffix_embedder, attribute, None)
+            if isinstance(module, torch.nn.Linear):
+                yield f"model.suffix_embedder.{attribute}", module
+
+    for attribute in (
+        "action_time_mlp_in",
+        "action_time_mlp_out",
+        "time_mlp_in",
+        "time_mlp_out",
+    ):
+        module = getattr(model, attribute, None)
+        if isinstance(module, torch.nn.Linear):
+            yield f"model.{attribute}", module
+
+
+def apply_flashvla_training_init(
+    policy: PreTrainedPolicy,
+    cfg: FlashVLATrainConfig,
+    *,
+    is_main_process: bool,
+) -> None:
+    """Apply a configured fresh-run initialization before optimizer creation."""
+    init_cfg = cfg.flashvla_init
+    if init_cfg.mode == "default":
+        return
+    if cfg.resume:
+        if is_main_process:
+            logging.info("Skipping flashvla_init mode=%r on resume", init_cfg.mode)
+        return
+
+    reports: list[str] = []
+    seen_module_ids: set[int] = set()
+    with torch.no_grad():
+        if init_cfg.reset_time_mlp:
+            matches = []
+            changed_values = 0
+            for name, module in _iter_streaming_time_mlp_modules(policy):
+                changed_values += _reset_linear(module, init_cfg.time_mlp_init)
+                matches.append(name)
+            if not matches:
+                raise RuntimeError("flashvla_init matched no time MLP modules")
+            reports.append(
+                _format_init_report(
+                    "time_mlp",
+                    init_cfg.time_mlp_init,
+                    matches,
+                    changed_values,
+                )
+            )
+
+        scale_matches = []
+        scale_changed_values = 0
+        for name, norm in _iter_lingbot_action_expert_norms(
+            policy,
+            include_final_norm=init_cfg.include_final_norm,
+        ):
+            weight = getattr(norm, "weight", None)
+            if isinstance(weight, torch.nn.Parameter):
+                weight.fill_(1.0)
+                scale_changed_values += weight.numel()
+                scale_matches.append(f"{name}.weight")
+        if scale_matches:
+            reports.append(
+                _format_init_report(
+                    "lingbot_rms_scales",
+                    "one",
+                    scale_matches,
+                    scale_changed_values,
+                )
+            )
+
+        matches = []
+        changed_values = 0
+        for name, module in _iter_action_expert_norm_init_modules(
+            policy,
+            include_final_norm=init_cfg.include_final_norm,
+        ):
+            if id(module) in seen_module_ids:
+                continue
+            seen_module_ids.add(id(module))
+            changed_values += _reset_linear(module, init_cfg.action_expert_norm_init)
+            matches.append(name)
+        if not matches and not scale_matches:
+            raise RuntimeError("flashvla_init matched no action-expert norm modules")
+        if matches:
+            reports.append(
+                _format_init_report(
+                    "action_expert_norms",
+                    init_cfg.action_expert_norm_init,
+                    matches,
+                    changed_values,
+                )
+            )
+
+    if is_main_process:
+        logging.info(
+            "Applied flashvla_init mode=%r:\n%s",
+            init_cfg.mode,
+            "\n".join(reports),
+        )
+
+
 def prepare_cuda_for_checkpoint(accelerator: Accelerator, stage: str) -> None:
     """Synchronize and release cached CUDA memory before checkpoint collectives."""
     accelerator.wait_for_everyone()
@@ -119,18 +342,19 @@ def prepare_cuda_for_checkpoint(accelerator: Accelerator, stage: str) -> None:
 
 
 def make_flashvla_dataset(cfg: FlashVLATrainConfig):
-    """Create a FlashVLADataset for FlashVLA training.
+    """Create the appropriate LeRobot dataset for one training policy.
 
     When `cfg.robotwin_multitask.enable` is True, builds a concatenation of
-    per-task FlashVLADataset subsets from the RoboTwin-LeRobot-v3.0
-    directory layout. Otherwise returns a single FlashVLADataset built
-    from `cfg.dataset.repo_id`/`cfg.dataset.root`.
+    per-task subsets from the RoboTwin-LeRobot-v3.0 directory layout.
+    Otherwise returns one dataset from `cfg.dataset.repo_id`/`cfg.dataset.root`.
+    Policies with ``num_buffer_slots`` use FlashVLADataset; baselines use
+    LeRobotDataset.
 
     Args:
         cfg: Training configuration.
 
     Returns:
-        (Multi)FlashVLADataset instance.
+        A single- or multi-source LeRobot-compatible dataset.
     """
     image_transforms = (
         ImageTransforms(cfg.dataset.image_transforms) if cfg.dataset.image_transforms.enable else None
@@ -151,17 +375,23 @@ def make_flashvla_dataset(cfg: FlashVLATrainConfig):
 
     delta_timestamps = resolve_delta_timestamps(cfg.policy, ds_meta)
 
-    dataset = FlashVLADataset(
-        cfg.dataset.repo_id,
-        root=cfg.dataset.root,
-        episodes=cfg.dataset.episodes,
-        delta_timestamps=delta_timestamps,
-        image_transforms=image_transforms,
-        revision=cfg.dataset.revision,
-        video_backend=cfg.dataset.video_backend,
-        num_buffer_slots=cfg.policy.num_buffer_slots,
-        chunk_size=cfg.policy.chunk_size,
-    )
+    dataset_kwargs = {
+        "repo_id": cfg.dataset.repo_id,
+        "root": cfg.dataset.root,
+        "episodes": cfg.dataset.episodes,
+        "delta_timestamps": delta_timestamps,
+        "image_transforms": image_transforms,
+        "revision": cfg.dataset.revision,
+        "video_backend": cfg.dataset.video_backend,
+    }
+    if hasattr(cfg.policy, "num_buffer_slots"):
+        dataset = FlashVLADataset(
+            **dataset_kwargs,
+            num_buffer_slots=cfg.policy.num_buffer_slots,
+            chunk_size=cfg.policy.chunk_size,
+        )
+    else:
+        dataset = LeRobotDataset(**dataset_kwargs)
 
     if cfg.dataset.use_imagenet_stats:
         for key in dataset.meta.camera_keys:
@@ -550,11 +780,15 @@ def train(cfg: FlashVLATrainConfig, accelerator: Accelerator | None = None):
     if policy_config_dtype is not None:
         policy.config.dtype = policy_config_dtype
 
+    apply_flashvla_training_init(policy, cfg, is_main_process=is_main_process)
+
     if getattr(cfg.policy, "freeze_vision_encoder", False):
         if hasattr(policy.model, "vlm") and hasattr(policy.model.vlm, "model") and hasattr(policy.model.vlm.model, "vision_tower"):
             vision_tower = policy.model.vlm.model.vision_tower
         elif hasattr(policy.model, "vlm_with_expert"):
             vision_tower = policy.model.vlm_with_expert.vlm.model.vision_model
+        elif hasattr(policy.model, "qwenvl_with_expert"):
+            vision_tower = policy.model.qwenvl_with_expert.qwenvl.visual
         else:
             raise AttributeError("Cannot find vision tower to freeze")
         for param in vision_tower.parameters():

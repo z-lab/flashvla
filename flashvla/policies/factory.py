@@ -56,6 +56,7 @@ from lerobot.processor.converters import (
 
 import importlib as _importlib
 for _mod in (
+    "flashvla.policies.lingbot.processor",
     "flashvla.policies.pi0.processor",
     "flashvla.policies.pi05.processor",
     "flashvla.policies.smolvla.processor_smolvla",
@@ -95,6 +96,14 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
     if name == "pi05-flashvla":
         from flashvla.policies.pi05.modeling_pi05_flashvla import PI05FlashVLAPolicy
         return PI05FlashVLAPolicy
+
+    if name == "lingbot":
+        from flashvla.policies.lingbot.modeling_lingbot_vla import LingbotVlaPolicy
+        return LingbotVlaPolicy
+
+    if name in {"lingbot-flashvla", "lingbot-action-streaming"}:
+        from flashvla.policies.lingbot.modeling_lingbot_flashvla import LingbotFlashVLAPolicy
+        return LingbotFlashVLAPolicy
 
     if name == "smolvla":
         from flashvla.policies.smolvla.modeling_smolvla import SmolVLAPolicy
@@ -207,8 +216,14 @@ def make_pre_post_processors(
             try:
                 from huggingface_hub import hf_hub_download
 
-                hf_hub_download(str(pretrained_path), f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json")
-                hf_hub_download(str(pretrained_path), f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json")
+                hf_hub_download(
+                    str(pretrained_path),
+                    f"{POLICY_PREPROCESSOR_DEFAULT_NAME}.json",
+                )
+                hf_hub_download(
+                    str(pretrained_path),
+                    f"{POLICY_POSTPROCESSOR_DEFAULT_NAME}.json",
+                )
                 has_pretrained_processors = True
             except Exception:
                 has_pretrained_processors = False
@@ -238,6 +253,9 @@ def make_pre_post_processors(
     elif policy_type.startswith("pi0"):
         from flashvla.policies.pi0.processor import make_flashvla_pi0_pre_post_processors
         return make_flashvla_pi0_pre_post_processors(policy_cfg, dataset_stats)
+    elif policy_type.startswith("lingbot"):
+        from flashvla.policies.lingbot.processor import make_lingbot_pre_post_processors
+        return make_lingbot_pre_post_processors(policy_cfg, dataset_stats)
     elif policy_type.startswith("smolvla"):
         from flashvla.policies.smolvla.processor_smolvla import make_flashvla_smolvla_pre_post_processors
         return make_flashvla_smolvla_pre_post_processors(policy_cfg, dataset_stats)

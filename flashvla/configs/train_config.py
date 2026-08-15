@@ -39,6 +39,23 @@ class FSDPConfig:
 
 
 @dataclass
+class FlashVLAInitConfig:
+    """Optional fresh-run initialization for a streaming action expert.
+
+    ``ae-norm-zero`` is used by the LingBot FlashVLA recipe when converting
+    the released joint action/time projection to a separate time projection.
+    It is deliberately applied only before a fresh optimizer is created;
+    resumed runs keep the parameters stored in their checkpoint.
+    """
+
+    mode: str = "default"
+    include_final_norm: bool = True
+    reset_time_mlp: bool = True
+    time_mlp_init: str = "random"
+    action_expert_norm_init: str = "zero"
+
+
+@dataclass
 class RoboTwinMultiTaskConfig:
     """Multi-task training config for the RoboTwin-LeRobot-v3.0 dataset layout.
 
@@ -59,10 +76,7 @@ class RoboTwinMultiTaskConfig:
 
 @dataclass
 class FlashVLATrainConfig(TrainPipelineConfig):
-    """FlashVLA flashvla training configuration.
-
-    Uses shared observation training with padded cold start buffer.
-    """
+    """Training configuration for baseline and FlashVLA policy variants."""
 
     grad_accum_steps: int = 1
 
@@ -70,7 +84,48 @@ class FlashVLATrainConfig(TrainPipelineConfig):
 
     robotwin_multitask: RoboTwinMultiTaskConfig = field(default_factory=RoboTwinMultiTaskConfig)
 
+    flashvla_init: FlashVLAInitConfig = field(default_factory=FlashVLAInitConfig)
+
     # Keep frequent checkpoints for requeue safety without retaining every
     # 60+ GB FSDP2 optimizer snapshot forever. Zero preserves all checkpoints.
     checkpoint_keep_last: int = 0
     checkpoint_keep_every_n_steps: int = 0
+
+    def validate(self) -> None:
+        if getattr(self.policy, "gradient_checkpointing", False):
+            raise ValueError(
+                "gradient_checkpointing is not supported by the current FlashVLA "
+                "trainer because the previous implementation produced incorrect "
+                "gradients. Set it to false for training."
+            )
+        if self.flashvla_init.mode not in {"default", "ae-norm-zero"}:
+            raise ValueError(
+                "flashvla_init.mode must be 'default' or 'ae-norm-zero', got "
+                f"{self.flashvla_init.mode!r}"
+            )
+        if self.flashvla_init.time_mlp_init not in {"random", "zero"}:
+            raise ValueError(
+                "flashvla_init.time_mlp_init must be 'random' or 'zero', got "
+                f"{self.flashvla_init.time_mlp_init!r}"
+            )
+        if self.flashvla_init.action_expert_norm_init not in {"random", "zero"}:
+            raise ValueError(
+                "flashvla_init.action_expert_norm_init must be 'random' or 'zero', got "
+                f"{self.flashvla_init.action_expert_norm_init!r}"
+            )
+        if (
+            self.policy.type == "lingbot-flashvla"
+            and not self.resume
+            and self.flashvla_init.mode == "ae-norm-zero"
+        ):
+            if not self.flashvla_init.reset_time_mlp:
+                raise ValueError(
+                    "Fresh LingBot FlashVLA training requires "
+                    "flashvla_init.reset_time_mlp=true"
+                )
+            if self.flashvla_init.time_mlp_init != "random":
+                raise ValueError(
+                    "Fresh LingBot FlashVLA training requires a randomly initialized "
+                    "time MLP"
+                )
+        super().validate()
