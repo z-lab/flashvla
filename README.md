@@ -2,7 +2,7 @@
 
 **Paper** | **Blog** | [**Models**](https://huggingface.co/collections/z-lab/flashvla)
 
-**FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution. The repository includes π0.5, π0, SmolVLA, and LingBot-VLA (Qwen2.5-VL) backbones.
+**FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution.
 
 ## Install
 
@@ -73,13 +73,6 @@ Per-action inference latency is measured with `benchmarks/benchmark_latency.py`:
 python benchmarks/benchmark_latency.py --config_path=benchmarks/configs/latency_flashvla.yaml
 ```
 
-The same harness also benchmarks LingBot-VLA on RoboTwin:
-
-| Backbone | Baseline config | FlashVLA config |
-|:--|:--|:--|
-| π0.5 | `benchmarks/configs/latency_baseline.yaml` | `benchmarks/configs/latency_flashvla.yaml` |
-| LingBot-VLA | `benchmarks/configs/latency_lingbot_baseline.yaml` | `benchmarks/configs/latency_lingbot_flashvla.yaml` |
-
 Use `--num_views=1`, `--num_views=2`, or `--num_views=3` to sweep camera views.
 
 Per-action latency (ms) on RTX 4090 / 5090 with 2 and 3 camera views (π0.5 uses PyTorch max-autotune):
@@ -91,36 +84,24 @@ Per-action latency (ms) on RTX 4090 / 5090 with 2 and 3 camera views (π0.5 uses
 
 ## Training
 
-`train/train.sh <config> [num_gpus]` launches a training recipe (8 GPUs by
-default):
+**LIBERO:**
 
 ```bash
 bash train/train.sh train/configs/pi05/libero/pi05_flashvla.yaml
 ```
 
-| Backbone | Benchmark | Config |
-|:--|:--|:--|
-| π0.5 | LIBERO | `train/configs/pi05/libero/pi05_flashvla.yaml` |
-| π0.5 | RoboTwin 2.0 | `train/configs/pi05/robotwin/pi05_flashvla.yaml` |
-| π0 | LIBERO | `train/configs/pi0/libero/pi0_flashvla.yaml` |
-| SmolVLA | LIBERO | `train/configs/smolvla/libero/smolvla_flashvla.yaml` |
-| LingBot-VLA | RoboTwin 2.0 | `train/configs/lingbot/robotwin/lingbot_vla_baseline.yaml` |
-| LingBot-VLA + FlashVLA | RoboTwin 2.0 | `train/configs/lingbot/robotwin/lingbot_flashvla.yaml` |
+**RoboTwin** — first build the LeRobot-format training dataset
+(see [Building the training dataset](sim_eval/robotwin/README.md#building-the-training-dataset)),
+then:
 
-The RoboTwin recipes require the LeRobot-format dataset described in
-[Building the training dataset](sim_eval/robotwin/README.md#building-the-training-dataset).
-See [the LingBot integration notes](docs/lingbot_vla_flashvla.md) for its
-checkpoint migration and typed-action layout.
+```bash
+bash train/train.sh train/configs/pi05/robotwin/pi05_flashvla.yaml
+```
 
 ## Acknowledgement
 
-This project builds on [LeRobot](https://github.com/huggingface/lerobot),
-[VLASH](https://github.com/mit-han-lab/vlash), and
-[LingBot-VLA](https://github.com/Robbyant/lingbot-vla).
-
-LingBot-VLA support is built with Qwen. Qwen model materials are subject to
-the separate Qwen Research License; see
-[`NOTICE.md`](NOTICE.md).
+This project builds on [LeRobot](https://github.com/huggingface/lerobot) and
+[VLASH](https://github.com/mit-han-lab/vlash).
 
 ## Citation
 
@@ -134,6 +115,4 @@ the separate Qwen Research License; see
 
 ## License
 
-FlashVLA source code is Apache-2.0. Third-party model weights, tokenizers,
-datasets, and simulator assets retain their own licenses; see
-[`NOTICE.md`](NOTICE.md).
+Apache-2.0
