@@ -1,6 +1,6 @@
 # FlashVLA: Streaming Action Decoding for Fast and Asynchronous VLA Inference
 
-**Paper** | **Blog** | [**Models**](https://huggingface.co/z-lab)
+**Paper** | **Blog** | [**Models**](https://huggingface.co/collections/z-lab/flashvla)
 
 **FlashVLA** is a general streaming action decoding method for flow-matching VLA models, achieving fast and asynchronous execution.
 
