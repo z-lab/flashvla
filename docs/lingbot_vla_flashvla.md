@@ -53,10 +53,11 @@ train/configs/lingbot/robotwin/lingbot_vla_baseline.yaml
 train/configs/lingbot/robotwin/lingbot_flashvla.yaml
 ```
 
-The included streaming YAML is the generic 4B-base L2/FM recipe
-(`N=4`, `C=20`, `n_action_steps=10`). It is intentionally not presented as
-the distinct upstream RoboTwin-posttrained L1 recipe, which executes all 20
-actions per slot.
+The included streaming YAML reproduces the successful L2/FM fine-tune from
+`robbyant/lingbot-vla-4b-posttrain-robotwin` on the unified clean+random
+dataset (`N=4`, `C=20`, `n_action_steps=10`). Its reported RoboTwin evaluation
+uses a deployment-time `n_action_steps=20` override; that setting does not
+change the 80-action training target.
 
 Launch either through the normal entrypoint:
 
@@ -74,8 +75,9 @@ The configs use the current policy-owned FSDP2 implementation. LingBot's wrap
 plan covers Qwen vision blocks, VLM decoder layers, action-expert decoder
 layers, the patch merger, and token embeddings. `use_lm_head=true` is rejected
 for FSDP2 because the tied embedding/head parameter would cross communication
-groups. Activation checkpointing remains disabled until a gradient-correct
-implementation is available.
+groups. Activation checkpointing is globally disabled because the previous
+implementation produced incorrect gradients; every policy rejects
+`gradient_checkpointing=true`.
 
 ## Evaluation and latency
 
