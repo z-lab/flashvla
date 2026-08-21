@@ -43,6 +43,7 @@ never-written parameter into a hard error instead of a silent accuracy loss.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Collection, Iterable
 
 from torch import Tensor, nn
@@ -150,7 +151,15 @@ def find_unfilled_parameters(
         Sorted parameter names, one per distinct unfilled tensor.
     """
     allow = set(allow)
-    named = list(instance.named_parameters())
+    # remove_duplicate=False so every alias name of an aliased parameter is
+    # visible: a tensor is "filled" if ANY of its names is in the checkpoint.
+    # The FlashVLA joint layers alias the backbone decoder layers, and a
+    # checkpoint may store a given tensor under EITHER alias (e.g. VLM layers
+    # saved under the fused `model.layers.*` name while the deduped first name
+    # is the un-fused `model.vlm.*` one). With the default remove_duplicate=True
+    # the deduped name can miss the checkpoint's chosen alias and this check
+    # falsely reports a loaded tensor as unfilled.
+    named = list(instance.named_parameters(remove_duplicate=False))
     filled_ids = {id(parameter) for name, parameter in named if name in mapped_sd}
     allowed_ids = {id(parameter) for name, parameter in named if name in allow}
 
@@ -198,7 +207,112 @@ def assert_checkpoint_covers_parameters(
     )
 
 
+# Prefix rewrites turning a raw lerobot/openpi pi0.5 checkpoint (paligemma_with_expert.*
+# namespace, bare openpi suffix-net keys) into this repo's model.* namespace. Shared by
+# the eager (PI05Policy) and streaming (PI05FlashVLAPolicy) loaders.
+PI05_RENAME_RULES: list[tuple[str, str]] = [
+    ("model.action_in_proj.", "model.suffix_embedder.action_in_proj."),
+    ("model.action_out_proj.", "model.action_out_proj."),
+    ("model.time_mlp_in.", "model.suffix_embedder.time_mlp_in."),
+    ("model.time_mlp_out.", "model.suffix_embedder.time_mlp_out."),
+    ("model.state_proj.", "model.suffix_embedder.state_proj."),
+    ("model.state_mlp_in.", "model.suffix_embedder.state_mlp_in."),
+    ("model.state_mlp_out.", "model.suffix_embedder.state_mlp_out."),
+    ("model.paligemma_with_expert.gemma_expert.", "model.action_expert."),
+    ("model.paligemma_with_expert.paligemma.", "model.vlm."),
+    ("action_in_proj.", "model.suffix_embedder.action_in_proj."),
+    ("action_out_proj.", "model.action_out_proj."),
+    ("time_mlp_in.", "model.suffix_embedder.time_mlp_in."),
+    ("time_mlp_out.", "model.suffix_embedder.time_mlp_out."),
+    ("state_proj.", "model.suffix_embedder.state_proj."),
+    ("state_mlp_in.", "model.suffix_embedder.state_mlp_in."),
+    ("state_mlp_out.", "model.suffix_embedder.state_mlp_out."),
+    ("paligemma_with_expert.gemma_expert.", "model.action_expert."),
+    ("paligemma_with_expert.paligemma.", "model.vlm."),
+]
+
+
+def load_remapped_checkpoint(
+    model: nn.Module,
+    model_file: str,
+    rename_rules: Iterable[tuple[str, str]] = (),
+    *,
+    allow_fresh: Iterable[str] = (),
+    expected_unexpected: Iterable[str] = (),
+    native_load_model: bool = False,
+    raw_marker: str = "paligemma_with_expert.",
+    device: str = "cpu",
+    source: str | None = None,
+) -> None:
+    """Fill ``model`` from a single-file safetensors checkpoint.
+
+    Two layouts are handled, selected by a header sniff for ``raw_marker``:
+
+    * NATIVE — keys already in this policy's ``model.*`` namespace. When
+      ``native_load_model`` is set, delegate to ``safetensors.torch.load_model``,
+      whose storage-based ``_remove_duplicate_names(preferred_names=file_keys)``
+      reconcile IS an identity coverage check: a weight saved under EITHER of its
+      alias names is accepted, and any genuinely missing/unexpected tensor raises.
+      It requires the model's alias tree and tied embeddings to be LIVE, so callers
+      must invoke this BEFORE any weight fusion / alias detach.
+    * RAW — a foreign openpi base whose keys need prefix-remapping. Apply
+      ``rename_rules`` (first match wins, identity fall-through), drop
+      shape-mismatched targets, restore tied embeddings the file dropped, load
+      non-strict, treat unexpected keys (minus ``expected_unexpected``) as fatal,
+      then assert full coverage (``allow_fresh`` names may stay at init).
+
+    The check is always strict regardless of any caller ``strict`` flag: a native
+    load_model raises on gaps, and the raw branch asserts full coverage.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import load_file, load_model
+
+    with safe_open(model_file, framework="pt") as f:
+        is_raw = any(k.startswith(raw_marker) for k in f.keys())
+
+    if native_load_model and not is_raw:
+        load_model(model, model_file, strict=True, device=device)
+        return
+
+    rules = list(rename_rules)
+
+    def map_key(key: str) -> str:
+        for src, dst in rules:
+            if key.startswith(src):
+                return dst + key[len(src):]
+        return key
+
+    original_sd = load_file(model_file, device=device)
+    target_sd = model.state_dict()
+    mapped_sd: dict[str, Tensor] = {}
+    for old_key, value in original_sd.items():
+        new_key = map_key(old_key)
+        if new_key in target_sd and target_sd[new_key].shape != value.shape:
+            continue
+        mapped_sd[new_key] = value
+
+    restored = restore_untied_lm_head_embeddings(model, mapped_sd, target_sd)
+    if restored:
+        logging.info(
+            "Restored %d tied input embedding(s) from their lm_head: %s",
+            len(restored),
+            ", ".join(restored),
+        )
+
+    incompatible = model.load_state_dict(mapped_sd, strict=False)
+    tolerated = set(expected_unexpected)
+    fatal = [k for k in incompatible.unexpected_keys if k not in tolerated]
+    if fatal:
+        raise RuntimeError("Checkpoint loading failed.\n" f"Unexpected keys: {fatal}")
+
+    assert_checkpoint_covers_parameters(
+        model, mapped_sd, source=source or str(model_file), allow=allow_fresh
+    )
+
+
 __all__ = [
+    "PI05_RENAME_RULES",
+    "load_remapped_checkpoint",
     "assert_checkpoint_covers_parameters",
     "find_unfilled_parameters",
     "restore_untied_lm_head_embeddings",

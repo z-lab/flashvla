@@ -46,8 +46,8 @@ from lerobot.configs.policies import PreTrainedConfig, T
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION, OBS_STATE, OBS_LANGUAGE_TOKENS, OBS_LANGUAGE_ATTENTION_MASK
 from flashvla.policies.loading import (
-    assert_checkpoint_covers_parameters,
-    restore_untied_lm_head_embeddings,
+    PI05_RENAME_RULES,
+    load_remapped_checkpoint,
 )
 from flashvla.policies.pi05.configuration_pi05 import PI05FlashVLAConfig
 from flashvla.policies.pi05.utils import (
@@ -483,6 +483,20 @@ class PI05FlashVLAModel(nn.Module):
         self.vlm = PaliGemmaForConditionalGeneration(config.vlm_config)
         self.action_expert = GemmaForCausalLM(config.action_expert_config)
 
+        # Re-tie each (dead, inference-unused) lm_head to its live embedding.
+        # PiGemma breaks the stock tie by swapping in a fresh embed_tokens, so
+        # without this the heads sit at random init with no checkpoint key; the
+        # tie lets them load from the embedding and lets load_model reconstruct
+        # the sharing.
+        for head, embed in (
+            (self.vlm.lm_head, self.vlm.model.language_model.embed_tokens),
+            (self.action_expert.lm_head, self.action_expert.model.embed_tokens),
+        ):
+            if (
+                head.weight is not embed.weight
+                and head.weight.shape == embed.weight.shape
+            ):
+                head.weight = embed.weight
 
         self.prefix_embedder = PI05PrefixEmbedder(config, self.vlm)
         self.suffix_embedder = PI05SuffixEmbedder(config)
@@ -1140,6 +1154,7 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
     def __init__(
         self,
         config: PI05FlashVLAConfig,
+        **kwargs,
     ):
         super().__init__(config)
         config.validate_features()
@@ -1181,132 +1196,39 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
             )
 
     @classmethod
-    def from_pretrained(
-        cls: builtins.type[T],
-        pretrained_name_or_path: str | Path,
-        *,
-        config: PreTrainedConfig | None = None,
-        force_download: bool = False,
-        resume_download: bool | None = None,
-        proxies: dict | None = None,
-        token: str | bool | None = None,
-        cache_dir: str | Path | None = None,
-        local_files_only: bool = False,
-        revision: str | None = None,
-        **kwargs,
+    def _load_as_safetensor(
+        cls: builtins.type[T], model: T, model_file: str, map_location: str, strict: bool
     ) -> T:
-        if config is None:
-            config = PreTrainedConfig.from_pretrained(
-                pretrained_name_or_path=pretrained_name_or_path,
-                force_download=force_download,
-                resume_download=resume_download,
-                proxies=proxies,
-                token=token,
-                cache_dir=cache_dir,
-                local_files_only=local_files_only,
-                revision=revision,
-                **kwargs,
-            )
+        """Fill a freshly-built policy from ``model.safetensors``.
 
-        kwargs.pop("dataset_stats", None)
-        instance = cls(config, **kwargs)
-
-        from safetensors.torch import load_file
-        from transformers.utils import cached_file
-
-        original_state_dict: dict[str, Tensor] | None = None
-        if os.path.isdir(pretrained_name_or_path):
-            model_file = os.path.join(pretrained_name_or_path, "model.safetensors")
-            if not os.path.isfile(model_file):
-                raise FileNotFoundError(f"No 'model.safetensors' found in directory: {model_file}")
-            original_state_dict = load_file(model_file)
-        else:
-            resolved_file = cached_file(
-                pretrained_name_or_path, "model.safetensors",
-                cache_dir=cache_dir, force_download=force_download,
-                resume_download=resume_download, proxies=proxies,
-                token=token, revision=revision, local_files_only=local_files_only,
-            )
-            if resolved_file is None:
-                raise FileNotFoundError(f"Could not resolve 'model.safetensors' for {pretrained_name_or_path}")
-            original_state_dict = load_file(resolved_file)
-
-        prefix_rules: list[tuple[str, str]] = [
-            ("model.action_in_proj.", "model.suffix_embedder.action_in_proj."),
-            ("model.action_out_proj.", "model.action_out_proj."),
-            ("model.time_mlp_in.", "model.suffix_embedder.time_mlp_in."),
-            ("model.time_mlp_out.", "model.suffix_embedder.time_mlp_out."),
-            ("model.state_proj.", "model.suffix_embedder.state_proj."),
-            ("model.state_mlp_in.", "model.suffix_embedder.state_mlp_in."),
-            ("model.state_mlp_out.", "model.suffix_embedder.state_mlp_out."),
-            ("model.paligemma_with_expert.gemma_expert.", "model.action_expert."),
-            ("model.paligemma_with_expert.paligemma.", "model.vlm."),
-            ("action_in_proj.", "model.suffix_embedder.action_in_proj."),
-            ("action_out_proj.", "model.action_out_proj."),
-            ("time_mlp_in.", "model.suffix_embedder.time_mlp_in."),
-            ("time_mlp_out.", "model.suffix_embedder.time_mlp_out."),
-            ("state_proj.", "model.suffix_embedder.state_proj."),
-            ("state_mlp_in.", "model.suffix_embedder.state_mlp_in."),
-            ("state_mlp_out.", "model.suffix_embedder.state_mlp_out."),
-            ("paligemma_with_expert.gemma_expert.", "model.action_expert."),
-            ("paligemma_with_expert.paligemma.", "model.vlm."),
-        ]
-
-        def map_key(key: str) -> str | None:
-            for src, dst in prefix_rules:
-                if key.startswith(src):
-                    return dst + key[len(src):]
-            return key
-
-        target_sd = instance.state_dict()
-        mapped_sd: dict[str, Tensor] = {}
-        for old_key, value in original_state_dict.items():
-            new_key = map_key(old_key)
-            if (new_key in target_sd) and (target_sd[new_key].shape != value.shape):
-                continue
-            mapped_sd[new_key] = value
-
-        restored_embeddings = restore_untied_lm_head_embeddings(instance, mapped_sd, target_sd)
-        if restored_embeddings:
-            logging.info(
-                "Restored %d tied input embedding(s) from their lm_head: %s",
-                len(restored_embeddings),
-                ", ".join(restored_embeddings),
-            )
-
-        incompatible = instance.load_state_dict(mapped_sd, strict=False)
-        unexpected_keys = incompatible.unexpected_keys
-
-        unexpected_fatal = list(unexpected_keys)
-        if unexpected_fatal:
-            raise RuntimeError(
-                "Checkpoint loading failed.\n"
-                f"Unexpected keys: {unexpected_fatal}"
-            )
-
-        assert_checkpoint_covers_parameters(
-            instance, mapped_sd, source=str(pretrained_name_or_path)
+        Overrides lerobot's supported hook (called by the base ``from_pretrained``
+        after it resolves the config + downloads/locates the file and builds the
+        instance). The shared loader handles both a native flashvla checkpoint
+        (safetensors.load_model) and a raw openpi base (prefix-remap). Weight-
+        dependent post-load — RMSNorm swap, qkv/mlp fusion, backbone-alias detach,
+        cold-start stats — runs here while the aliases are still live; the base
+        does ``.to(device)`` / ``.eval()`` afterwards.
+        """
+        load_remapped_checkpoint(
+            model, model_file, PI05_RENAME_RULES, native_load_model=True
         )
 
         from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
         from lerobot.policies.pi_gemma import PiGemmaRMSNorm as OriginalGemmaRMSNorm
-        for module in instance.model.modules():
+        for module in model.model.modules():
             if type(module) is OriginalGemmaRMSNorm:
                 module.__class__ = PatchedGemmaRMSNorm
 
-        instance.to(config.device)
-        instance.eval()
+        if getattr(model.config, "fuse_qkv", True):
+            model.model.init_qkv_fusion_from_existing()
+        if getattr(model.config, "fuse_gate_up", True):
+            model.model.init_mlp_fusion_from_existing()
 
-        if getattr(config, "fuse_qkv", True):
-            instance.model.init_qkv_fusion_from_existing()
-        if getattr(config, "fuse_gate_up", True):
-            instance.model.init_mlp_fusion_from_existing()
+        model.model.detach_backbone_layer_aliases()
 
-        instance.model.detach_backbone_layer_aliases()
+        model._cold_start_stats = load_cold_start_stats(os.path.dirname(model_file))
 
-        instance._cold_start_stats = load_cold_start_stats(pretrained_name_or_path)
-
-        return instance
+        return model
 
     def reset(self):
         """Reset buffer and step counter. Call when environment resets.
