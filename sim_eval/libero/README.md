@@ -6,11 +6,14 @@ underlying single-run script.
 
 ## Setup
 
-LIBERO isn't in the base env — add the extra (needs cmake + a C/C++ compiler,
-both provided by `environment.yml`), and set EGL for headless rendering:
+LIBERO isn't in the base env — install the build tools, add the extra, and set
+EGL for headless rendering. `--no-build-isolation` matters: the cmake that
+lerobot's deps pull in via pip is a Python entry script, invisible inside pip's
+isolated build env.
 
 ```bash
-CMAKE_POLICY_VERSION_MINIMUM=3.5 pip install -e ".[libero]"
+conda install -y cxx-compiler make
+CMAKE_POLICY_VERSION_MINIMUM=3.5 pip install --no-build-isolation -e ".[libero]"
 export MUJOCO_GL=egl
 export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 ```
