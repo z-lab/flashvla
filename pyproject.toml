@@ -23,6 +23,13 @@ dependencies = [
     # FSDP2/DDP training: accelerate>=1.13 ships fsdp_version=2 + save_state/
     # save_model with sharded state_dict_type used by flashvla/train.py.
     "accelerate>=1.13.0",
+    # Imported directly by the LingBot-VLA implementation and strict
+    # checkpoint loader (not merely through LeRobot/Transformers internals).
+    "einops",
+    "huggingface-hub>=1.0,<2.0",
+    "numpy",
+    "packaging",
+    "safetensors",
 ]
 
 [project.optional-dependencies]

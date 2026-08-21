@@ -13,17 +13,20 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Latency benchmark — pi05 baseline vs FlashVLA.
+"""Latency benchmark — baseline VLA vs FlashVLA.
 
 Two variants with a uniform 3-stage breakdown (encode / prefill / action):
 
-  1. baseline         — vanilla pi05 (modeling_pi05.py). Each call does
-                        encode + prefill + N inference denoise steps.
-  2. flashvla — pi05 FlashVLA
-                        (modeling_pi05_flashvla.py). Each call does
-                        encode + prefill + 1 denoise step on a rolling
-                        N-slot buffer; cold-start fills the buffer over the
-                        first N-1 calls.
+  1. baseline — a vanilla flow-matching VLA. Each call does encode + prefill
+                + ``num_inference_steps`` denoise steps.
+  2. flashvla — the FlashVLA variant of the same backbone. Each call does
+                encode + prefill + 1 denoise step on a rolling N-slot buffer;
+                cold start fills the buffer over the first N-1 calls.
+
+The backbone comes from ``cfg.policy.type`` and is dispatched through the
+shared policy factory, so any registered policy works (pi05 and lingbot ship
+with the encode/prefill/action instrumentation; anything else falls back to
+total-latency-only timing).
 
 Sweep dimension: number of camera views. The image observation history is
 held at one frame per view (cfg.policy.num_frames_per_view = 1). View count
@@ -44,6 +47,7 @@ Usage:
         --num_views=2
 """
 
+import inspect
 import json
 import logging
 from pathlib import Path
@@ -73,6 +77,22 @@ logger = logging.getLogger(__name__)
 VALID_VARIANTS = ["baseline", "flashvla"]
 
 
+
+
+def _predict_accepts_profile(policy) -> bool:
+    """True iff ``policy.predict_action_chunk`` accepts a ``profile`` kwarg.
+
+    Keeps the harness robust across policies that have not been instrumented
+    with the in-model encode/prefill/action breakdown: those fall back to
+    total-latency-only timing instead of raising a TypeError. A ``**kwargs``
+    sink could swallow ``profile`` without honoring it, so only an explicit
+    parameter counts as support.
+    """
+    try:
+        sig = inspect.signature(policy.predict_action_chunk)
+    except (TypeError, ValueError):
+        return False
+    return "profile" in sig.parameters
 
 
 def compute_latency_stats(latencies: list[float]) -> dict:
@@ -233,16 +253,31 @@ def load_policy(variant: str, cfg: BenchmarkConfig, ds_meta: LeRobotDatasetMetad
         f"image inputs: {[k for k in cfg.policy.input_features if 'images.' in k]}"
     )
 
-    if variant == "baseline":
-        from flashvla.policies.pi05.modeling_pi05 import PI05Policy
-        policy_cls = PI05Policy
-    elif variant == "flashvla":
-        from flashvla.policies.pi05.modeling_pi05_flashvla import PI05FlashVLAPolicy
-        policy_cls = PI05FlashVLAPolicy
-    else:
+    # Dispatch on the policy's own ``type`` through the shared factory so every
+    # registered backbone loads by one path. ``variant`` stays an output label
+    # and a cross-check: a flashvla benchmark must be paired with a
+    # ``-flashvla`` policy type (the rolling-buffer 1-step path), and a baseline
+    # benchmark must not be.
+    from flashvla.policies.factory import get_policy_class
+
+    policy_type = cfg.policy.type
+    is_streaming_type = policy_type.endswith("-flashvla")
+    if variant == "flashvla" and not is_streaming_type:
+        raise ValueError(
+            f"variant='flashvla' requires a '-flashvla' policy type "
+            f"(rolling-buffer 1-step decode); got policy.type='{policy_type}'."
+        )
+    if variant == "baseline" and is_streaming_type:
+        logger.warning(
+            "variant='baseline' paired with streaming policy.type='%s'; the "
+            "rolling-buffer 1-step path will be exercised, not a full-denoise "
+            "baseline.", policy_type,
+        )
+    if variant not in ("baseline", "flashvla"):
         raise ValueError(f"Unknown variant: {variant}")
 
-    logger.info(f"Loading policy class: {policy_cls.__name__}")
+    policy_cls = get_policy_class(policy_type)
+    logger.info(f"Loading policy class: {policy_cls.__name__} (type={policy_type})")
 
     policy = policy_cls.from_pretrained(
         pretrained_name_or_path=cfg.policy.pretrained_path,
@@ -320,11 +355,21 @@ def benchmark_non_streaming(
     latencies: list[float] = []
     breakdowns: list[dict] = []
 
-    use_internal_breakdown = not cfg.policy.compile_model
-    if not use_internal_breakdown:
+    # The per-stage breakdown needs both (a) an un-compiled model — cuda.Event
+    # ops force dynamo graph breaks / a second specialization that wrecks
+    # latency on weaker GPUs — and (b) a policy whose predict_action_chunk
+    # actually accepts a ``profile`` kwarg. Either missing → total latency only.
+    profile_supported = _predict_accepts_profile(policy)
+    use_internal_breakdown = (not cfg.policy.compile_model) and profile_supported
+    if cfg.policy.compile_model:
         logger.info(
             "compile_model=True → measuring total latency only "
             "(per-stage breakdown disabled to keep compiled graph specialized for profile=False)"
+        )
+    elif not profile_supported:
+        logger.info(
+            "policy.predict_action_chunk does not accept a 'profile' kwarg → "
+            "measuring total latency only (no encode/prefill/action breakdown)."
         )
 
     logger.info(f"Starting non-streaming benchmark with {cfg.num_samples} samples...")
@@ -452,7 +497,11 @@ def benchmark_latency(cfg: BenchmarkConfig):
 
     set_seed(cfg.seed)
 
-    if cfg.num_views == 3:
+    # pi0-family policies were trained with a 4th (empty) camera slot and expect
+    # one at num_views==3. LingBot uses exactly 3 real cameras (high /
+    # left_wrist / right_wrist) and must keep empty_cameras=0 — a padding camera
+    # would corrupt its prefix layout.
+    if cfg.num_views == 3 and cfg.policy.type.startswith("pi0"):
         cfg.policy.empty_cameras = 1
 
     dataset, ds_meta = load_dataset(cfg)

@@ -424,7 +424,10 @@ def eval_policy(task_name,
     # vanilla pi05 with pi0_step=50) each call covers pi0_step env steps.
     per_ep: list[dict] = []
     all_call_lats_ms: list[float] = []
-    use_lazy_image_obs = bool(args.get("lazy_image_obs", False)) and policy_name == "pi05_flashvla"
+    use_lazy_image_obs = bool(args.get("lazy_image_obs", False)) and policy_name in {
+        "pi05_flashvla",
+        "lingbot_flashvla",
+    }
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]

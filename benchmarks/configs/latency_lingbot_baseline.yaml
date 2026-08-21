@@ -1,0 +1,75 @@
+# Latency Benchmark: LingBot-VLA baseline (eager, no torch.compile).
+#
+# Each call: encode (VLM image+language embed) + prefill (prefix KV-cache
+# fill) + N (=num_steps=10) Euler denoise iterations. Compare against
+# latency_lingbot_flashvla.yaml, which runs a single denoise step on a rolling
+# 4-slot buffer — the FlashVLA win is the action segment.
+#
+# LingBot RoboTwin uses exactly 3 real cameras (cam_high / cam_left_wrist /
+# cam_right_wrist), so run with num_views=3 and NO empty-camera padding (the
+# harness only injects empty_cameras for the pi0 family).
+#
+# Usage:
+#   python benchmarks/benchmark_latency.py \
+#       --config_path=benchmarks/configs/latency_lingbot_baseline.yaml
+
+type: latency
+variant: baseline
+
+# robotwin_unified has 3 image views; keep all of them.
+num_views: 3
+
+policy:
+  type: lingbot
+  device: cuda
+  dtype: bfloat16
+
+  pretrained_path: robbyant/lingbot-vla-4b
+  # Also supplies the Qwen2.5-VL backbone config, not just the tokenizer.
+  tokenizer_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+  compile_model: false
+
+  # Single frame per view; the sweep varies VIEW count, not history.
+  num_frames_per_view: 1
+
+  # Baseline flow-matching inference: 10 Euler denoise steps per call.
+  chunk_size: 50
+  n_action_steps: 50
+  num_steps: 10
+
+  # RoboTwin typed-joint layout (14-d raw action, 75-d padded model space).
+  max_state_dim: 75
+  max_action_dim: 75
+  action_dim: 14
+  robotwin_feature_layout: true
+
+  # Released LingBot-VLA RoboTwin recipe.
+  tokenizer_max_length: 72
+  image_resolution: [224, 224]
+  image_resize_mode: stretch
+  attention_implementation: eager
+  vision_attention_implementation: sdpa
+  adanorm_time: true
+  # The baseline loads the released joint action_time_mlp exactly.
+  separate_time_proj: false
+  old_adanorm: true
+  use_cache: true
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+dataset:
+  repo_id: lerobot/robotwin_unified
+  root: /path/to/robotwin_unified
+  video_backend: torchcodec
+
+num_samples: 100
+warmup_steps: 10
+batch_size: 1
+num_workers: 0
+seed: 42
+
+output_file: outputs/benchmarks/latency_lingbot_baseline.json

@@ -19,6 +19,7 @@ This module provides configuration classes for FlashVLA training:
 """
 
 from flashvla.configs.train_config import FlashVLATrainConfig
+from flashvla.policies.lingbot import LingBotConfig, LingBotFlashVLAConfig
 from flashvla.policies.pi05 import PI05Config, PI05FlashVLAConfig
 from flashvla.policies.pi0 import PI0Config, PI0FlashVLAConfig
 from flashvla.policies.smolvla import SmolVLAConfig, SmolVLAFlashVLAConfig
@@ -29,6 +30,11 @@ _LRPreTrainedConfig._choice_registry["pi05"] = PI05Config
 _LRPreTrainedConfig._choice_registry["pi05-flashvla"] = PI05FlashVLAConfig
 _LRPreTrainedConfig._choice_registry["pi0"] = PI0Config
 _LRPreTrainedConfig._choice_registry["pi0-flashvla"] = PI0FlashVLAConfig
+_LRPreTrainedConfig._choice_registry["lingbot"] = LingBotConfig
+_LRPreTrainedConfig._choice_registry["lingbot-flashvla"] = LingBotFlashVLAConfig
+# Read configs saved by the pre-open-source VLASH integration. New saves use
+# the canonical ``lingbot-flashvla`` discriminator above.
+_LRPreTrainedConfig._choice_registry["lingbot-action-streaming"] = LingBotFlashVLAConfig
 _LRPreTrainedConfig._choice_registry["smolvla"] = SmolVLAConfig
 _LRPreTrainedConfig._choice_registry["smolvla-flashvla"] = SmolVLAFlashVLAConfig
 
@@ -38,6 +44,8 @@ __all__ = [
     "PI05FlashVLAConfig",
     "PI0Config",
     "PI0FlashVLAConfig",
+    "LingBotConfig",
+    "LingBotFlashVLAConfig",
     "SmolVLAConfig",
     "SmolVLAFlashVLAConfig",
 ]

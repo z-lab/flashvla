@@ -31,7 +31,8 @@ robotwin_multitask:
 
    ```bash
    ROBOTWIN=/path/to/RoboTwin
-   cp -r policy/pi05_flashvla $ROBOTWIN/policy/
+   cp -r policy/pi05_flashvla $ROBOTWIN/policy/      # π0.5 adapter
+   cp -r policy/lingbot_flashvla $ROBOTWIN/policy/   # LingBot-VLA adapter
    cp overlay/script/*.py $ROBOTWIN/script/
    cp overlay/envs/_base_task.py $ROBOTWIN/envs/
    ```
@@ -59,3 +60,29 @@ inference; for the async overlap used in the paper, pass overlap + compile
 (`bash eval_server.sh <ckpt> 9999 0 current_state 1 5 true`). `cold_start_mode=current_state`
 is required (RoboTwin is absolute-qpos — a zero action would crash the arm).
 Results land in `$ROBOTWIN/eval_result/<task>/pi05_flashvla/...`.
+
+### LingBot-VLA
+
+Use the same two-terminal flow from `$ROBOTWIN/policy/lingbot_flashvla/`:
+
+```bash
+# terminal 1 — flashvla env
+bash eval_server.sh /path/to/lingbot_flashvla_checkpoint
+
+# terminal 2 — RoboTwin env
+EVAL_STEP_LIM_OFFSET=30 ROBOTWIN_VENV=/path/to/robotwin_venv \
+  bash eval_client.sh beat_block_hammer demo_clean
+```
+
+`eval_server.sh` deliberately requires an explicit checkpoint: pass either a
+local exported checkpoint or an accessible Hugging Face model repo. Set
+`TOKENIZER_PATH` when the checkpoint's saved Qwen repository path needs to be
+overridden.
+
+The default LingBot streaming recipe uses four buffer slots and executes ten
+actions per call, so its padded cold start holds the current qpos for
+`(4 - 1) × 10 = 30` simulator steps. Its `tokenizer_path` must point to a full
+Qwen2.5-VL-3B-Instruct repository because the policy reads both tokenizer and
+backbone configuration there. The adapter accepts raw 14-dimensional ALOHA
+qpos and performs LingBot's sparse 75-dimensional typed-joint mapping inside
+the policy; deploy a checkpoint together with its saved pre/postprocessors.

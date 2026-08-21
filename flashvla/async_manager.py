@@ -114,6 +114,7 @@ class AsyncStreamingActionManager:
         self.device = next(self.policy.parameters()).device
 
         self._is_streaming = policy.config.type in (
+            "lingbot-flashvla",
             "pi05-flashvla",
             "pi0-flashvla",
             "smolvla-flashvla",
@@ -142,6 +143,41 @@ class AsyncStreamingActionManager:
             self.overlap_steps > 0
             and self.chunk_index == self.n_action_steps - self.overlap_steps
         )
+
+    def needs_observation(self) -> bool:
+        """Whether the next control step must call the policy.
+
+        Simulation adapters can use this to skip rendering and transferring
+        images while replaying actions that are already cached on CPU.
+        """
+        if not self.is_running():
+            return True
+        if self.chunk_index == 0 and self.next_chunk is None:
+            return True
+        return self._should_launch_next()
+
+    def _pop_current_action(self) -> torch.Tensor:
+        if self.current_chunk is None:
+            raise RuntimeError("No current action chunk is available")
+        action_np = self.current_chunk[:, self.chunk_index, :]
+        action = torch.from_numpy(action_np)
+        self.chunk_index = (self.chunk_index + 1) % self.n_action_steps
+        if self.chunk_index == 0:
+            self.current_chunk = None
+        return action
+
+    def pop_cached_action(self) -> torch.Tensor:
+        """Return one cached CPU action without running policy inference."""
+        if self.needs_observation():
+            raise RuntimeError(
+                "pop_cached_action called when the next step requires an observation"
+            )
+        if self.current_chunk is None:
+            if self.next_chunk is None:
+                raise RuntimeError("No current or next action chunk is available")
+            self.current_chunk = self.next_chunk.detach().cpu().numpy()
+            self.next_chunk = None
+        return self._pop_current_action()
 
     def _launch_inference(self, processed_obs: dict) -> torch.Tensor:
         """Run policy + handle cold-start fallback.
@@ -212,18 +248,10 @@ class AsyncStreamingActionManager:
         if self._should_launch_next():
             self.next_chunk = self._launch_inference(processed_obs)
 
-        action_np = self.current_chunk[:, self.chunk_index, :]
-        # Keep the executing action on CPU. Moving it back to the policy device
-        # would enqueue a blocking H2D copy behind the just-launched inference
-        # on the default CUDA stream, synchronizing that inference and defeating
-        # the overlap. The current chunk already lives in CPU-backed NumPy.
-        action_t = torch.from_numpy(action_np)
-
-        self.chunk_index = (self.chunk_index + 1) % self.n_action_steps
-        if self.chunk_index == 0:
-            self.current_chunk = None
-
-        return action_t
+        # Keep execution on CPU: moving the tiny action back to the policy GPU
+        # would synchronize it behind an in-flight inference on the default
+        # stream and defeat overlap.
+        return self._pop_current_action()
 
     def warmup(self, processed_obs: dict, num_steps: Optional[int] = None) -> None:
         """Pre-capture the CUDA graph for ``_steady_streaming``.

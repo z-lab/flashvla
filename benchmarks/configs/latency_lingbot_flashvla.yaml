@@ -1,0 +1,85 @@
+# Latency Benchmark: LingBot-VLA + FlashVLA (eager, no torch.compile).
+#
+# Each call: encode (VLM image+language embed) + prefill (prefix KV-cache
+# fill) + 1 Euler denoise step on a rolling num_buffer_slots=4 buffer. Cold
+# start fills the first N-1=3 calls, absorbed during warmup since
+# warmup_steps >= num_buffer_slots. That single denoise step is the FlashVLA
+# win: the action segment costs ~1/num_steps of the baseline's 10-step loop,
+# while encode/prefill (the shared observation cost) stay comparable.
+#
+# Same checkpoint / tokenizer / dataset as latency_lingbot_baseline.yaml. The
+# released joint action_time_mlp is migrated to a fresh time-only MLP
+# (separate_time_proj=true) at load; that is irrelevant to latency (identical
+# compute shape), so this measures the FlashVLA streaming decode faithfully.
+#
+# Values mirror train/configs/lingbot/robotwin/lingbot_flashvla.yaml.
+#
+# Usage:
+#   python benchmarks/benchmark_latency.py \
+#       --config_path=benchmarks/configs/latency_lingbot_flashvla.yaml
+
+type: latency
+variant: flashvla
+
+# robotwin_unified has 3 image views; keep all of them.
+num_views: 3
+
+policy:
+  type: lingbot-flashvla
+  device: cuda
+  dtype: bfloat16
+
+  pretrained_path: robbyant/lingbot-vla-4b
+  # Also supplies the Qwen2.5-VL backbone config, not just the tokenizer.
+  tokenizer_path: Qwen/Qwen2.5-VL-3B-Instruct
+
+  compile_model: false
+
+  # Single frame per view; the sweep varies VIEW count, not history.
+  num_frames_per_view: 1
+
+  # Four 20-action slots (horizon 80); steady-state inference is a single
+  # denoise step over the full buffer.
+  num_buffer_slots: 4
+  chunk_size: 20
+  n_action_steps: 20
+  timestep_sample_mode: per-chunk
+  cold_start_mode: current_state
+
+  # RoboTwin typed-joint layout (14-d raw action, 75-d padded model space).
+  max_state_dim: 75
+  max_action_dim: 75
+  action_dim: 14
+  robotwin_feature_layout: true
+
+  # Released LingBot-VLA RoboTwin recipe.
+  tokenizer_max_length: 72
+  image_resolution: [224, 224]
+  image_resize_mode: stretch
+  attention_implementation: eager
+  vision_attention_implementation: sdpa
+  adanorm_time: true
+  # FlashVLA: action-only embeddings plus a fresh time-only AdaRMS MLP.
+  separate_time_proj: true
+  old_adanorm: true
+  use_cache: true
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+dataset:
+  repo_id: lerobot/robotwin_unified
+  root: /path/to/robotwin_unified
+  video_backend: torchcodec
+
+num_samples: 100
+# Absorb the N-1=3 cold-start steps so every timed step is a steady-state
+# single-step decode.
+warmup_steps: 10
+batch_size: 1
+num_workers: 0
+seed: 42
+
+output_file: outputs/benchmarks/latency_lingbot_flashvla.json

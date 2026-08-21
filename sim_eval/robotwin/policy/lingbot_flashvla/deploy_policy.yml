@@ -1,0 +1,53 @@
+# Shared config for both server and client sides of the lingbot_flashvla eval
+# pipeline. Unused fields are ignored by the side that doesn't need them
+# (server ignores task_name/task_config/seed; client ignores
+# policy_path/cold_start_mode/device).
+
+# Fields read by both sides. RoboTwin imports Python modules by this
+# underscore name; docs and results use the display name "lingbot-flashvla".
+policy_name: lingbot_flashvla
+
+# ── Server-side fields (policy_model_server.py) ──
+# Path (or HuggingFace repo id) of a LingBot FlashVLA checkpoint. Must contain:
+# config.json, model.safetensors, policy_preprocessor.json,
+# policy_postprocessor.json, and the corresponding *_processor.safetensors.
+policy_path: null
+
+# Cold-start action source for the first (num_buffer_slots - 1) observations:
+#   - "current_state": hold current qpos (required for RoboTwin)
+#   - "zero_delta":    return zero delta (breaks absolute-qpos envs)
+cold_start_mode: current_state
+
+device: cuda
+
+# Async overlap: launch the next chunk inference this many steps before the
+# current chunk ends. 0 = sync. Only pays off when the checkpoint has
+# compile_model=true, since torch.compile + CUDA graphs are what make
+# predict_action_chunk non-blocking. Should be <= n_action_steps.
+inference_overlap_steps: 0
+
+# Optional: override the checkpoint's n_action_steps without retraining.
+# Leave null to keep what's saved in config.json (10 for the released
+# RoboTwin checkpoint).
+n_action_steps: null
+
+# Optional: override compile_model / compile_mode from config.json.
+compile_model: null
+compile_mode: null
+
+# Optional: override config.json's tokenizer_path. This must be a FULL
+# Qwen2.5-VL-3B-Instruct repo or directory, not a tokenizer-only export — the
+# policy reads the Qwen backbone architecture config from it too.
+tokenizer_path: null
+
+# ── Client-side fields (eval_policy_client.py) ──
+task_name: null
+task_config: null
+ckpt_setting: null
+seed: null
+# Use the training-set instruction templates/descriptions.
+instruction_type: seen
+policy_conda_env: flashvla
+# Ask the server whether this step triggers inference; cached actions need
+# neither a fresh RoboTwin render nor an RGB round trip.
+lazy_image_obs: true

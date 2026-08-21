@@ -1,0 +1,133 @@
+# FlashVLA fine-tuning from LingBot-VLA's official RoboTwin post-trained
+# checkpoint on the unified clean+random dataset (2,500 clean + 25,000
+# randomized episodes, 6,075,103 frames). This reproduces the successful 100K
+# L2/FM run: N=4, C=20, with n_action_steps=10 in its saved training config.
+# The reported d=0 evaluation (87.78% clean / 88.02% randomized) overrides
+# n_action_steps to 20 at deployment; training still supervises all 80 actions.
+#
+# N=4 slots x C=20 actions gives an 80-action denoising buffer, matching the
+# RoboTwin PI0.5 FlashVLA recipe. The validated production shape is 16
+# samples/rank x 8 ranks x 2 accumulation microsteps = global batch 256.
+
+policy:
+  type: lingbot-flashvla
+  # Validated source revision: fb71a2c9749ccfedbb7290c2c3f0e5e7c7305c9e.
+  pretrained_path: robbyant/lingbot-vla-4b-posttrain-robotwin
+  # Also supplies the Qwen2.5-VL backbone config, not just the tokenizer.
+  tokenizer_path: Qwen/Qwen2.5-VL-3B-Instruct
+  push_to_hub: false
+  dtype: bfloat16
+  device: cuda
+
+  num_buffer_slots: 4
+  chunk_size: 20
+  n_action_steps: 10
+  # Sample one flow time per buffer slot, matching the RoboTwin PI0.5 recipe.
+  timestep_sample_mode: per-chunk
+  cold_start_mode: current_state
+
+  max_state_dim: 75
+  max_action_dim: 75
+  action_dim: 14
+  robotwin_feature_layout: true
+  tokenizer_max_length: 72
+  image_resolution: [224, 224]
+  image_resize_mode: stretch
+  num_steps: 10
+  time_sampling_beta_alpha: 1.5
+  time_sampling_beta_beta: 1.0
+  time_sampling_scale: 0.999
+  time_sampling_offset: 0.001
+  min_period: 4.0e-3
+  max_period: 4.0
+
+  attention_implementation: eager
+  vision_attention_implementation: sdpa
+  adanorm_time: true
+  # FlashVLA follows PI0.5: action embeddings stay independent of time and a
+  # fresh time-only MLP supplies per-token AdaRMS conditioning. The released
+  # LingBot joint action_time_mlp weights are intentionally not loaded.
+  separate_time_proj: true
+  old_adanorm: true
+  split_gate_liner: false
+  nosplit_gate_liner: false
+  final_norm_adanorm: false
+  enable_expert_vision: false
+  loss_type: fm
+  use_cache: true
+  freeze_vision_encoder: false
+  # Activation checkpointing is globally disabled because the previous
+  # implementation produced incorrect gradients.
+  gradient_checkpointing: false
+  compile_model: false
+
+  normalization_mapping:
+    VISUAL: IDENTITY
+    STATE: QUANTILES
+    ACTION: QUANTILES
+
+dataset:
+  repo_id: lerobot/robotwin_unified
+  # Omit root to use LeRobot's standard cache. Override dataset.root when the
+  # unified dataset is already available on local storage.
+  video_backend: torchcodec
+  use_imagenet_stats: true
+
+robotwin_multitask:
+  enable: false
+
+# Moving from one global flow time to per-slot/per-token times makes the
+# pretrained action-expert modulation a poor initialization. Keep the Qwen
+# expert's attention, MLP, and action-output weights, but restore its RMS scales
+# to one and its AdaRMS gamma/beta/gate projections to zero, and train the
+# FlashVLA time MLP from scratch. Fresh runs only; auto-resume skips this block.
+flashvla_init:
+  mode: ae-norm-zero
+  include_final_norm: true
+  reset_time_mlp: true
+  time_mlp_init: random
+  action_expert_norm_init: zero
+
+fsdp:
+  enable: true
+  mixed_precision: bf16
+  reduce_dtype: float32
+  reshard_after_forward: false
+  # The trainer reduce-scatters every accumulation microbatch, matching the
+  # validated run's sync_each_microstep=true behavior.
+  cpu_offload: false
+  state_dict_type: SHARDED_STATE_DICT
+  save_pretrained_max_shard_size: 50GB
+
+output_dir: outputs/train/lingbot_vla_flashvla_clean_random_fsdp_bf16_100k_l2
+job_name: lingbot-vla-flashvla-clean-random-fsdp-bf16-100k-l2
+batch_size: 16
+grad_accum_steps: 2
+steps: 100000
+num_workers: 4
+seed: 1000
+
+use_policy_training_preset: false
+optimizer:
+  type: adamw
+  lr: 5.0e-5
+  betas: [0.9, 0.95]
+  weight_decay: 0.0
+  grad_clip_norm: 1.0
+scheduler:
+  type: cosine_decay_with_warmup
+  num_warmup_steps: 5000
+  peak_lr: 5.0e-5
+  decay_lr: 2.5e-7
+  num_decay_steps: 100000
+
+save_checkpoint: true
+save_freq: 1000
+checkpoint_keep_last: 3
+
+log_freq: 20
+wandb:
+  enable: true
+  project: flashvla-robotwin-clean-random
+  entity: null
+  disable_artifact: true
