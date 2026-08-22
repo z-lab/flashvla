@@ -195,6 +195,7 @@ def rollout(
         leave=False,
     )
     check_env_attributes_and_types(env)
+    loop_start_t = time.perf_counter()
     while not np.all(done) and step < max_steps:
         observation = preprocess_observation(observation)
         if return_observations:
@@ -207,12 +208,7 @@ def rollout(
         observation = preprocessor(observation)
 
         will_trigger_inference = (
-            action_manager.chunk_index == 0
-            or (
-                inference_overlap_steps > 0
-                and action_manager.chunk_index
-                == action_manager.n_action_steps - inference_overlap_steps
-            )
+            action_manager.chunk_index == 0 or action_manager._should_launch_next()
         )
         _t0 = time.perf_counter()
         action = action_manager.act(observation)
@@ -259,6 +255,8 @@ def rollout(
         progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
         progbar.update()
 
+    rollout_walltime_s = time.perf_counter() - loop_start_t
+
     if return_observations:
         observation = preprocess_observation(observation)
         all_observations.append(deepcopy(observation))
@@ -270,6 +268,7 @@ def rollout(
         "done": torch.stack(all_dones, dim=1),
         "step_latencies_ms": step_latencies_ms,
         "step_is_transition": step_is_transition,
+        "rollout_walltime_s": rollout_walltime_s,
     }
     if return_observations:
         stacked_observations = {}
@@ -335,6 +334,8 @@ def eval_policy(
     max_rewards = []
     all_successes = []
     all_seeds = []
+    all_episode_steps = []
+    all_episode_walltimes = []
     threads = []
     n_episodes_rendered = 0
 
@@ -379,6 +380,12 @@ def eval_policy(
 
         n_steps = rollout_data["done"].shape[1]
         done_indices = torch.argmax(rollout_data["done"].to(int), dim=1)
+
+        # Per-episode executed action steps; the batch's stepping-loop walltime
+        # (excluding env.reset) stands in for each of its episodes' walltime —
+        # exact at batch_size=1, where one rollout is one episode.
+        all_episode_steps.extend((done_indices + 1).tolist())
+        all_episode_walltimes.extend([rollout_data["rollout_walltime_s"]] * env.num_envs)
 
         mask = (torch.arange(n_steps) <= einops.repeat(done_indices + 1, "b -> b s", s=n_steps)).int()
         batch_sum_rewards = einops.reduce((rollout_data["reward"] * mask), "b n -> b", "sum")
@@ -443,6 +450,9 @@ def eval_policy(
     for thread in threads:
         thread.join()
 
+    avg_episode_steps = float(np.nanmean(all_episode_steps[:n_episodes]))
+    avg_episode_walltime = float(np.nanmean(all_episode_walltimes[:n_episodes]))
+
     info = {
         "per_episode": [
             {
@@ -451,13 +461,17 @@ def eval_policy(
                 "max_reward": max_reward,
                 "success": success,
                 "seed": seed,
+                "n_steps": ep_steps,
+                "walltime_s": ep_walltime,
             }
-            for i, (sum_reward, max_reward, success, seed) in enumerate(
+            for i, (sum_reward, max_reward, success, seed, ep_steps, ep_walltime) in enumerate(
                 zip(
                     sum_rewards[:n_episodes],
                     max_rewards[:n_episodes],
                     all_successes[:n_episodes],
                     all_seeds[:n_episodes],
+                    all_episode_steps[:n_episodes],
+                    all_episode_walltimes[:n_episodes],
                     strict=True,
                 )
             )
@@ -466,6 +480,9 @@ def eval_policy(
             "avg_sum_reward": float(np.nanmean(sum_rewards[:n_episodes])),
             "avg_max_reward": float(np.nanmean(max_rewards[:n_episodes])),
             "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
+            "avg_episode_steps": avg_episode_steps,
+            "avg_episode_walltime_s": avg_episode_walltime,
+            "avg_time_per_action_step_ms": 1000.0 * avg_episode_walltime / avg_episode_steps,
             "eval_s": time.time() - start,
             "eval_ep_s": (time.time() - start) / n_episodes,
         },
@@ -612,10 +629,12 @@ class TaskMetrics(TypedDict):
     sum_rewards: list[float]
     max_rewards: list[float]
     successes: list[bool]
+    episode_steps: list[int]
+    episode_walltimes_s: list[float]
     video_paths: list[str]
 
 
-ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
+ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "episode_steps", "episode_walltimes_s", "video_paths")
 
 
 def eval_one(
@@ -659,6 +678,8 @@ def eval_one(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
+        episode_steps=[ep["n_steps"] for ep in per_episode],
+        episode_walltimes_s=[ep["walltime_s"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
     )
 
@@ -745,6 +766,8 @@ def eval_policy_all(
         _append("sum_rewards", metrics.get("sum_rewards"))
         _append("max_rewards", metrics.get("max_rewards"))
         _append("successes", metrics.get("successes"))
+        _append("episode_steps", metrics.get("episode_steps"))
+        _append("episode_walltimes_s", metrics.get("episode_walltimes_s"))
         paths = metrics.get("video_paths", [])
         if paths:
             group_acc[group]["video_paths"].extend(paths)
@@ -788,12 +811,19 @@ def eval_policy_all(
         arr = np.array(xs, dtype=float)
         return float(np.nanmean(arr))
 
+    def _time_per_step_ms(acc):
+        # avg episode walltime / avg episode steps; NaN propagates when empty.
+        return 1000.0 * _agg_from_list(acc["episode_walltimes_s"]) / _agg_from_list(acc["episode_steps"])
+
     groups_aggregated = {}
     for group, acc in group_acc.items():
         groups_aggregated[group] = {
             "avg_sum_reward": _agg_from_list(acc["sum_rewards"]),
             "avg_max_reward": _agg_from_list(acc["max_rewards"]),
             "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
+            "avg_episode_steps": _agg_from_list(acc["episode_steps"]),
+            "avg_episode_walltime_s": _agg_from_list(acc["episode_walltimes_s"]),
+            "avg_time_per_action_step_ms": _time_per_step_ms(acc),
             "n_episodes": len(acc["sum_rewards"]),
             "video_paths": list(acc["video_paths"]),
         }
@@ -802,6 +832,9 @@ def eval_policy_all(
         "avg_sum_reward": _agg_from_list(overall["sum_rewards"]),
         "avg_max_reward": _agg_from_list(overall["max_rewards"]),
         "pc_success": _agg_from_list(overall["successes"]) * 100 if overall["successes"] else float("nan"),
+        "avg_episode_steps": _agg_from_list(overall["episode_steps"]),
+        "avg_episode_walltime_s": _agg_from_list(overall["episode_walltimes_s"]),
+        "avg_time_per_action_step_ms": _time_per_step_ms(overall),
         "n_episodes": len(overall["sum_rewards"]),
         "eval_s": time.time() - start_t,
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
