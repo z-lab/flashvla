@@ -30,6 +30,7 @@ Protocol exposed to ``RoboTwin/script/policy_model_server.py``:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -79,9 +80,13 @@ class PI05FlashVLAModel:
         self.postprocessor = postprocessor
 
         self.overlap_steps = int(inference_overlap_steps)
+        # RTC realignment: skip the first overlap_steps stale actions of each
+        # replanned chunk (env-gated, mirrors the LIBERO eval).
+        self.skip_stale_actions = os.environ.get("SKIP_STALE_ACTIONS") == "1"
         self.manager = AsyncStreamingActionManager(
             policy=self.policy,
             overlap_steps=self.overlap_steps,
+            skip_stale_actions=self.skip_stale_actions,
         )
 
         self._current_instruction: str | None = None
@@ -91,6 +96,7 @@ class PI05FlashVLAModel:
             f"[pi05_flashvla] cold_start_mode={cold_start_mode}, device={self.device}, "
             f"n_action_steps={self.policy.config.n_action_steps}, "
             f"inference_overlap_steps={self.overlap_steps}, "
+            f"skip_stale_actions={self.skip_stale_actions}, "
             f"compile_model={getattr(self.policy.config, 'compile_model', False)}"
         )
 

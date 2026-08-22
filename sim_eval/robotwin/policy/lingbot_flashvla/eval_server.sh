@@ -15,6 +15,11 @@
 #   # Async overlap=1 with compile
 #   bash eval_server.sh /path/to/lingbot_ckpt 9999 0 current_state 1 10 true
 #
+# Env knobs:
+#   SKIP_STALE_ACTIONS=1  RTC realignment (with overlap>0): skip the first
+#     overlap_steps stale actions of each replanned chunk (requires 2*overlap
+#     <= n_action_steps). e.g. SKIP_STALE_ACTIONS=1 bash eval_server.sh ... 1 10 true
+#
 # Prerequisites (one-time setup in the flashvla env):
 #   conda activate flashvla   # the env where `pip install -e flashvla` was run
 
