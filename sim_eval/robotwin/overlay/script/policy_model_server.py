@@ -117,6 +117,9 @@ class ModelServer:
         while self.running:
             try:
                 client_socket, addr = self.server_socket.accept()
+                # Small RPCs (needs_image_obs, get_cached_action) otherwise
+                # stall ~40ms each on Nagle + delayed ACK.
+                client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 print(f"✅ Client connected from {addr}")
                 # Handle each client in a separate thread
                 t = threading.Thread(target=self._handle_client,

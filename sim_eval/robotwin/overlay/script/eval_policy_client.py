@@ -149,6 +149,9 @@ class ModelClient:
         while attempts < max_attempts:
             try:
                 self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                # Small RPCs (needs_image_obs, get_cached_action) otherwise
+                # stall ~40ms each on Nagle + delayed ACK.
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.sock.settimeout(self.timeout)
                 self.sock.connect((self.host, self.port))
                 print(f"🔗 Connected to model server at {self.host}:{self.port}")
