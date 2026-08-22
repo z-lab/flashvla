@@ -26,6 +26,13 @@ device: cuda
 # benefit. Should be <= n_action_steps; typically 1–2 on chunk10 ckpts.
 inference_overlap_steps: 0
 
+# RTC realignment: when promoting a chunk launched inference_overlap_steps
+# early, skip its first inference_overlap_steps actions (they target control
+# steps the outgoing chunk already executed) and consume
+# [overlap, overlap + n_action_steps) of the full predicted chunk. Requires
+# inference_overlap_steps + n_action_steps <= chunk_size.
+skip_stale_actions: false
+
 # Optional: override the ckpt's n_action_steps without retraining.
 # Leave as null to keep what's saved in config.json.
 n_action_steps: null

@@ -82,6 +82,7 @@ def get_model(usr_args: dict) -> Any:
         n_action_steps=_coerce_optional_int(usr_args.get("n_action_steps")),
         compile_model=_coerce_optional_bool(usr_args.get("compile_model")),
         compile_mode=_coerce_optional_str(usr_args.get("compile_mode")),
+        skip_stale_actions=_coerce_optional_bool(usr_args.get("skip_stale_actions")) or False,
         tokenizer_path=_coerce_optional_str(usr_args.get("tokenizer_path")),
     )
 

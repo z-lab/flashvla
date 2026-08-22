@@ -6,7 +6,8 @@
 #
 # Usage:
 #   bash eval_server.sh [policy_path] [port] [gpu_id] [cold_start_mode] \
-#                 [inference_overlap_steps] [n_action_steps] [compile_model]
+#                 [inference_overlap_steps] [n_action_steps] [compile_model] \
+#                 [skip_stale_actions]
 #
 # Examples:
 #   # Sync (default)
@@ -15,10 +16,13 @@
 #   # Async overlap=1 with compile + n_action_steps=5
 #   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 5 true
 #
+#   # Async overlap=1 with RTC realignment (skip stale actions at promotion)
+#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 5 true true
+#
 # Env knobs:
-#   SKIP_STALE_ACTIONS=1  RTC realignment (with overlap>0): skip the first
-#     overlap_steps stale actions of each replanned chunk (requires 2*overlap
-#     <= n_action_steps). e.g. SKIP_STALE_ACTIONS=1 bash eval_server.sh ... 1 5 true
+#   SKIP_STALE_ACTIONS=1  force RTC realignment server-wide (same effect as the
+#     8th positional arg; requires inference_overlap_steps + n_action_steps
+#     <= chunk_size). e.g. SKIP_STALE_ACTIONS=1 bash eval_server.sh ... 1 5 true
 #
 # Prerequisites (one-time setup in the flashvla env):
 #   conda activate flashvla   # the env where `pip install -e flashvla` was run
@@ -33,6 +37,7 @@ cold_start_mode=${4:-current_state}
 inference_overlap_steps=${5:-0}
 n_action_steps=${6:-}
 compile_model=${7:-}
+skip_stale_actions=${8:-}
 
 export CUDA_VISIBLE_DEVICES=${gpu_id}
 echo -e "\033[33mgpu id: ${gpu_id}, port: ${port}\033[0m"
@@ -41,6 +46,7 @@ echo -e "\033[33mcold_start_mode: ${cold_start_mode}\033[0m"
 echo -e "\033[33minference_overlap_steps: ${inference_overlap_steps}\033[0m"
 echo -e "\033[33mn_action_steps: ${n_action_steps:-(use ckpt default)}\033[0m"
 echo -e "\033[33mcompile_model: ${compile_model:-(use ckpt default)}\033[0m"
+echo -e "\033[33mskip_stale_actions: ${skip_stale_actions:-false}\033[0m"
 
 # Build override list — only include n_action_steps / compile_model when set,
 # because policy_model_server.py's override parser doesn't understand "null"
@@ -57,6 +63,9 @@ if [[ -n "${n_action_steps}" ]]; then
 fi
 if [[ -n "${compile_model}" ]]; then
     overrides+=(--compile_model "${compile_model}")
+fi
+if [[ -n "${skip_stale_actions}" ]]; then
+    overrides+=(--skip_stale_actions "${skip_stale_actions}")
 fi
 
 cd ../..  # → RoboTwin root (policy_model_server.py expects CWD here)

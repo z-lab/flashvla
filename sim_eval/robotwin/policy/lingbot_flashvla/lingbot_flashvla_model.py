@@ -53,6 +53,7 @@ class LingBotFlashVLAModel:
         n_action_steps: int | None = None,
         compile_model: bool | None = None,
         compile_mode: str | None = None,
+        skip_stale_actions: bool = False,
         tokenizer_path: str | None = None,
     ) -> None:
         if device.startswith("cuda") and not torch.cuda.is_available():
@@ -144,9 +145,12 @@ class LingBotFlashVLAModel:
         )
 
         self.overlap_steps = int(inference_overlap_steps)
-        # RTC realignment: skip the first overlap_steps stale actions of each
-        # replanned chunk (env-gated, mirrors the LIBERO eval).
-        self.skip_stale_actions = os.environ.get("SKIP_STALE_ACTIONS") == "1"
+        # RTC realignment: skip the stale prefix of each replanned chunk.
+        # Enabled via the skip_stale_actions config/CLI override, or forced
+        # server-wide with SKIP_STALE_ACTIONS=1 (mirrors the LIBERO eval).
+        self.skip_stale_actions = (
+            bool(skip_stale_actions) or os.environ.get("SKIP_STALE_ACTIONS") == "1"
+        )
         self.manager = AsyncStreamingActionManager(
             policy=self.policy,
             overlap_steps=self.overlap_steps,

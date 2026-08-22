@@ -35,6 +35,12 @@ n_action_steps: null
 compile_model: null
 compile_mode: null
 
+# RTC realignment: when promoting a chunk launched inference_overlap_steps
+# early, skip its first inference_overlap_steps actions and consume
+# [overlap, overlap + n_action_steps) of the full predicted chunk. Requires
+# inference_overlap_steps + n_action_steps <= chunk_size.
+skip_stale_actions: false
+
 # Optional: override config.json's tokenizer_path. This must be a FULL
 # Qwen2.5-VL-3B-Instruct repo or directory, not a tokenizer-only export — the
 # policy reads the Qwen backbone architecture config from it too.

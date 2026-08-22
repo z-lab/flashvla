@@ -53,6 +53,7 @@ class PI05FlashVLAModel:
         inference_overlap_steps: int = 0,
         n_action_steps: int | None = None,
         compile_model: bool | None = None,
+        skip_stale_actions: bool = False,
     ) -> None:
         if device.startswith("cuda") and not torch.cuda.is_available():
             print("[pi05_flashvla] CUDA not available, falling back to CPU")
@@ -80,9 +81,12 @@ class PI05FlashVLAModel:
         self.postprocessor = postprocessor
 
         self.overlap_steps = int(inference_overlap_steps)
-        # RTC realignment: skip the first overlap_steps stale actions of each
-        # replanned chunk (env-gated, mirrors the LIBERO eval).
-        self.skip_stale_actions = os.environ.get("SKIP_STALE_ACTIONS") == "1"
+        # RTC realignment: skip the stale prefix of each replanned chunk.
+        # Enabled via the skip_stale_actions config/CLI override, or forced
+        # server-wide with SKIP_STALE_ACTIONS=1 (mirrors the LIBERO eval).
+        self.skip_stale_actions = (
+            bool(skip_stale_actions) or os.environ.get("SKIP_STALE_ACTIONS") == "1"
+        )
         self.manager = AsyncStreamingActionManager(
             policy=self.policy,
             overlap_steps=self.overlap_steps,
@@ -96,7 +100,7 @@ class PI05FlashVLAModel:
             f"[pi05_flashvla] cold_start_mode={cold_start_mode}, device={self.device}, "
             f"n_action_steps={self.policy.config.n_action_steps}, "
             f"inference_overlap_steps={self.overlap_steps}, "
-            f"skip_stale_actions={self.skip_stale_actions}, "
+            f"skip_stale_actions={self.manager.skip_stale_actions}, "
             f"compile_model={getattr(self.policy.config, 'compile_model', False)}"
         )
 
@@ -193,35 +197,17 @@ class PI05FlashVLAModel:
 
     def needs_image_obs(self) -> bool:
         """Whether the next action call will launch policy inference."""
-        m = self.manager
-        if not m.is_running():
-            return True
-        if m.chunk_index == 0 and m.next_chunk is None:
-            return True
-        return bool(m._should_launch_next())
+        return self.manager.needs_observation()
 
     def get_cached_action(self) -> np.ndarray:
-        """Replay one already-computed action without a rendered observation."""
-        if self.needs_image_obs():
-            raise RuntimeError("get_cached_action called when the next step needs image observation")
+        """Replay one already-computed action without a rendered observation.
 
-        m = self.manager
-        if m.current_chunk is None:
-            if m.next_chunk is None:
-                raise RuntimeError("no current or next action chunk is available")
-            m.current_chunk = m.next_chunk.detach().cpu().numpy()
-            m.next_chunk = None
-
-        action_np = m.current_chunk[:, m.chunk_index, :]
-        # Keep cached actions on CPU. An H2D copy here would wait behind the
-        # in-flight next-chunk inference on the default CUDA stream, defeating
-        # the overlap that lets RoboTwin execute cached actions asynchronously.
-        action = torch.from_numpy(action_np)
-
-        m.chunk_index = (m.chunk_index + 1) % m.n_action_steps
-        if m.chunk_index == 0:
-            m.current_chunk = None
-
+        Delegates promotion/index bookkeeping to the manager so skip-stale
+        realignment and chunk-window state stay in one place; the manager
+        keeps cached actions on CPU (an H2D copy would wait behind the
+        in-flight next-chunk inference and defeat the overlap).
+        """
+        action = self.manager.pop_cached_action()
         action = self.postprocessor(action)
         return action.detach().to("cpu").numpy().reshape(-1).astype(np.float32)
 

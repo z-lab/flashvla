@@ -79,6 +79,7 @@ def get_model(usr_args: dict) -> Any:
         inference_overlap_steps=_coerce_optional_int(usr_args.get("inference_overlap_steps", 0)) or 0,
         n_action_steps=_coerce_optional_int(usr_args.get("n_action_steps")),
         compile_model=_coerce_optional_bool(usr_args.get("compile_model")),
+        skip_stale_actions=_coerce_optional_bool(usr_args.get("skip_stale_actions")) or False,
     )
 
 
