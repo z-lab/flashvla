@@ -112,11 +112,15 @@ class AsyncStreamingActionManager:
             raise ValueError(
                 f"overlap_steps must be in [0, {self.n_action_steps}], got {self.overlap_steps}"
             )
-        if self.skip_stale_actions and not (0 <= self.overlap_steps < self.n_action_steps):
-            raise ValueError(
-                "skip_stale_actions requires 0 <= overlap_steps < n_action_steps; got "
-                f"overlap_steps={self.overlap_steps}, n_action_steps={self.n_action_steps}"
-            )
+        if self.skip_stale_actions:
+            # Realignment consumes [overlap_steps, overlap_steps + n_action_steps)
+            # of each promoted chunk, so the policy's full chunk must cover it.
+            chunk_size = getattr(policy.config, "chunk_size", None)
+            if chunk_size is not None and self.overlap_steps + self.n_action_steps > chunk_size:
+                raise ValueError(
+                    "skip_stale_actions requires overlap_steps + n_action_steps <= chunk_size; "
+                    f"got {self.overlap_steps} + {self.n_action_steps} > {chunk_size}"
+                )
 
         self.device = next(self.policy.parameters()).device
 
@@ -131,6 +135,9 @@ class AsyncStreamingActionManager:
         self.current_chunk: Optional[np.ndarray] = None
         self.next_chunk: Optional[torch.Tensor] = None
         self.chunk_index = 0
+        # First consumed index of current_chunk: 0 normally, overlap_steps for a
+        # chunk promoted under skip_stale_actions (RTC realignment).
+        self._skip_offset = 0
 
     def reset(self) -> None:
         """Clear manager state AND reset the underlying policy's streaming
@@ -138,6 +145,7 @@ class AsyncStreamingActionManager:
         self.current_chunk = None
         self.next_chunk = None
         self.chunk_index = 0
+        self._skip_offset = 0
         if hasattr(self.policy, "reset"):
             self.policy.reset()
 
@@ -148,7 +156,8 @@ class AsyncStreamingActionManager:
         """True when this call should start the next inference asynchronously."""
         return (
             self.overlap_steps > 0
-            and self.chunk_index == self.n_action_steps - self.overlap_steps
+            and self.chunk_index
+            == self._skip_offset + self.n_action_steps - self.overlap_steps
         )
 
     def needs_observation(self) -> bool:
@@ -168,10 +177,31 @@ class AsyncStreamingActionManager:
             raise RuntimeError("No current action chunk is available")
         action_np = self.current_chunk[:, self.chunk_index, :]
         action = torch.from_numpy(action_np)
-        self.chunk_index = (self.chunk_index + 1) % self.n_action_steps
-        if self.chunk_index == 0:
+        self.chunk_index += 1
+        if self.chunk_index - self._skip_offset >= self.n_action_steps:
+            self.chunk_index = 0
+            self._skip_offset = 0
             self.current_chunk = None
         return action
+
+    def _promote_next_chunk(self) -> None:
+        """Make ``next_chunk`` current. Under skip_stale_actions, realign by
+        resuming at index ``overlap_steps``: the chunk was launched that many
+        steps early, so its first ``overlap_steps`` actions target control
+        steps the outgoing chunk already executed. The consumption window
+        [overlap_steps, overlap_steps + n_action_steps) draws on the policy's
+        full chunk, which predict_action_chunk returns unsliced."""
+        self.current_chunk = self.next_chunk.detach().cpu().numpy()
+        self.next_chunk = None
+        if self.skip_stale_actions and self.overlap_steps > 0:
+            if self.current_chunk.shape[1] < self.overlap_steps + self.n_action_steps:
+                raise ValueError(
+                    "skip_stale_actions needs overlap_steps + n_action_steps <= "
+                    f"chunk length; got chunk length {self.current_chunk.shape[1]} "
+                    f"< {self.overlap_steps} + {self.n_action_steps}"
+                )
+            self.chunk_index = self.overlap_steps
+            self._skip_offset = self.overlap_steps
 
     def pop_cached_action(self) -> torch.Tensor:
         """Return one cached CPU action without running policy inference."""
@@ -182,14 +212,7 @@ class AsyncStreamingActionManager:
         if self.current_chunk is None:
             if self.next_chunk is None:
                 raise RuntimeError("No current or next action chunk is available")
-            self.current_chunk = self.next_chunk.detach().cpu().numpy()
-            self.next_chunk = None
-            if self.skip_stale_actions and self.overlap_steps > 0:
-                # RTC realignment: this chunk was launched overlap_steps early,
-                # so its first overlap_steps actions are for control steps the
-                # outgoing chunk already executed. Skip them (chunk_index just
-                # wrapped to 0, so overriding is safe).
-                self.chunk_index = self.overlap_steps
+            self._promote_next_chunk()
         return self._pop_current_action()
 
     def _launch_inference(self, processed_obs: dict) -> torch.Tensor:
@@ -229,7 +252,10 @@ class AsyncStreamingActionManager:
             raise ValueError(
                 f"cold-start chunk batch {cold.shape[0]} != env batch {bsz}"
             )
-        chunk = cold.unsqueeze(1).expand(bsz, self.n_action_steps, self.action_dim).contiguous()
+        # Pad the hold-pose chunk so a skip_stale_actions promotion can still
+        # consume n_action_steps actions after skipping overlap_steps.
+        cold_len = self.n_action_steps + (self.overlap_steps if self.skip_stale_actions else 0)
+        chunk = cold.unsqueeze(1).expand(bsz, cold_len, self.action_dim).contiguous()
         return chunk
 
     def act(self, processed_obs: dict) -> torch.Tensor:
@@ -248,11 +274,7 @@ class AsyncStreamingActionManager:
             self.current_chunk = self._launch_inference(processed_obs).detach().cpu().numpy()
         elif self.chunk_index == 0:
             if self.next_chunk is not None:
-                self.current_chunk = self.next_chunk.detach().cpu().numpy()
-                self.next_chunk = None
-                if self.skip_stale_actions and self.overlap_steps > 0:
-                    # RTC realignment: skip the first overlap_steps stale actions.
-                    self.chunk_index = self.overlap_steps
+                self._promote_next_chunk()
             elif self.overlap_steps == 0:
                 self.current_chunk = self._launch_inference(processed_obs).detach().cpu().numpy()
             else:
