@@ -91,6 +91,7 @@ class AsyncStreamingActionManager:
         self,
         policy: PreTrainedPolicy,
         overlap_steps: int = 0,
+        skip_stale_actions: bool = False,
     ):
         """
         Args:
@@ -105,10 +106,16 @@ class AsyncStreamingActionManager:
         self.n_action_steps = policy.config.n_action_steps
         self.action_dim = policy.config.action_feature.shape[0]
         self.overlap_steps = overlap_steps
+        self.skip_stale_actions = skip_stale_actions
 
         if not (0 <= self.overlap_steps <= self.n_action_steps):
             raise ValueError(
                 f"overlap_steps must be in [0, {self.n_action_steps}], got {self.overlap_steps}"
+            )
+        if self.skip_stale_actions and not (0 <= self.overlap_steps < self.n_action_steps):
+            raise ValueError(
+                "skip_stale_actions requires 0 <= overlap_steps < n_action_steps; got "
+                f"overlap_steps={self.overlap_steps}, n_action_steps={self.n_action_steps}"
             )
 
         self.device = next(self.policy.parameters()).device
@@ -177,6 +184,12 @@ class AsyncStreamingActionManager:
                 raise RuntimeError("No current or next action chunk is available")
             self.current_chunk = self.next_chunk.detach().cpu().numpy()
             self.next_chunk = None
+            if self.skip_stale_actions and self.overlap_steps > 0:
+                # RTC realignment: this chunk was launched overlap_steps early,
+                # so its first overlap_steps actions are for control steps the
+                # outgoing chunk already executed. Skip them (chunk_index just
+                # wrapped to 0, so overriding is safe).
+                self.chunk_index = self.overlap_steps
         return self._pop_current_action()
 
     def _launch_inference(self, processed_obs: dict) -> torch.Tensor:
@@ -237,6 +250,9 @@ class AsyncStreamingActionManager:
             if self.next_chunk is not None:
                 self.current_chunk = self.next_chunk.detach().cpu().numpy()
                 self.next_chunk = None
+                if self.skip_stale_actions and self.overlap_steps > 0:
+                    # RTC realignment: skip the first overlap_steps stale actions.
+                    self.chunk_index = self.overlap_steps
             elif self.overlap_steps == 0:
                 self.current_chunk = self._launch_inference(processed_obs).detach().cpu().numpy()
             else:

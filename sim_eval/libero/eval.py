@@ -170,6 +170,7 @@ def rollout(
     action_manager = AsyncStreamingActionManager(
         policy=policy,
         overlap_steps=inference_overlap_steps,
+        skip_stale_actions=(os.environ.get("SKIP_STALE_ACTIONS") == "1"),
     )
     action_manager.reset()
     observation, info = env.reset(seed=seeds)
@@ -574,6 +575,7 @@ def eval_main(cfg: AsyncEvalPipelineConfig):
         warmup_obs = preprocessor(warmup_obs)
         warmup_manager = AsyncStreamingActionManager(
             policy=policy, overlap_steps=cfg.inference_overlap_steps,
+            skip_stale_actions=(os.environ.get("SKIP_STALE_ACTIONS") == "1"),
         )
         warmup_manager.warmup(warmup_obs)
 
