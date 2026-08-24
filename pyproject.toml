@@ -26,6 +26,8 @@ dependencies = [
     # Imported directly by the LingBot-VLA implementation and strict
     # checkpoint loader (not merely through LeRobot/Transformers internals).
     "einops",
+    # RoboTwin -> LeRobot data conversion (sim_eval/robotwin/robotwin_pipeline).
+    "h5py",
     "huggingface-hub>=1.0,<2.0",
     "numpy",
     "packaging",

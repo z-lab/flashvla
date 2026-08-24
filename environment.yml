@@ -12,5 +12,4 @@ dependencies:
       - torch==2.9.1+cu128
       - torchvision==0.24.1+cu128
       - torchcodec==0.9.1+cu128
-      - h5py
       - -e .
