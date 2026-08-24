@@ -1,11 +1,6 @@
 # Portions derived from LingBot-VLA, Copyright Robbyant Team.
 # Source: https://github.com/Robbyant/lingbot-vla (commit 4eb34b7).
 # Modified by the FlashVLA team. Licensed under Apache-2.0.
-"""LingBot-VLA Policy Configuration for FlashVLA.
-
-Wraps LingBot-VLA's Qwen2.5-VL + Qwen2 Action Expert architecture
-into FlashVLA's configuration system.
-"""
 
 from __future__ import annotations
 

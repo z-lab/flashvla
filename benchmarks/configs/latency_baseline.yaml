@@ -1,15 +1,3 @@
-# Latency Benchmark: pi05 baseline (eager, no torch.compile).
-#
-# Each call: encode + prefill + N (=10) denoise iterations.
-#
-# Sweep dimension: number of camera views, controlled by ``num_views``
-# (1, 2, or 3). One frame per view. CLI override: --num_views=N.
-#
-# Usage:
-#   python benchmarks/benchmark_latency.py \
-#       --config_path=benchmarks/configs/latency_baseline.yaml \
-#       --num_views=2
-
 type: latency
 variant: baseline
 

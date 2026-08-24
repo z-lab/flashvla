@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,13 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Processor pipelines for FlashVLA PI0 policy.
-
-Mirrors the PI05 processor structure: a registered FlashVLA-specific language
-preparation step + normalize-first ordering. PI0 does not have adaRMS state
-conditioning, so the prompt is a plain task description with a trailing
-newline (matches lerobot/pi0_base training format).
-"""
 
 from dataclasses import dataclass
 from typing import Any

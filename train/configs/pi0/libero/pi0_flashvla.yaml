@@ -1,4 +1,3 @@
-# Policy configuration
 policy:
   type: pi0-flashvla
   pretrained_path: lerobot/pi0_base

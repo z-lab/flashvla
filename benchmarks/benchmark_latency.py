@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,39 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Latency benchmark — baseline VLA vs FlashVLA.
-
-Two variants with a uniform 3-stage breakdown (encode / prefill / action):
-
-  1. baseline — a vanilla flow-matching VLA. Each call does encode + prefill
-                + ``num_inference_steps`` denoise steps.
-  2. flashvla — the FlashVLA variant of the same backbone. Each call does
-                encode + prefill + 1 denoise step on a rolling N-slot buffer;
-                cold start fills the buffer over the first N-1 calls.
-
-The backbone comes from ``cfg.policy.type`` and is dispatched through the
-shared policy factory, so any registered policy works (pi05 and lingbot ship
-with the encode/prefill/action instrumentation; anything else falls back to
-total-latency-only timing).
-
-Sweep dimension: number of camera views. The image observation history is
-held at one frame per view (cfg.policy.num_frames_per_view = 1). View count
-is controlled by ``cfg.num_views`` (1, 2, or 3) — the first N image keys
-in the dataset's feature order are kept; the rest are dropped from
-``cfg.policy.input_features`` before the model is loaded.
-
-Other knobs read from the BenchmarkConfig yaml:
-
-  * cfg.batch_size       — typically 1 for latency
-  * cfg.num_samples      — episodes (flashvla) or dataset samples
-                           (baseline)
-  * cfg.warmup_steps
-
-Usage:
-    python benchmarks/benchmark_latency.py \\
-        --config_path=benchmarks/configs/latency_flashvla.yaml \\
-        --num_views=2
-"""
 
 import inspect
 import json

@@ -1,28 +1,4 @@
 #!/bin/bash
-# Start the lingbot_flashvla model server.
-#
-# Runs in the FlashVLA conda env (torch + flashvla + transformers). Listens on
-# a TCP port; eval_client.sh connects to it from the RoboTwin env.
-#
-# Usage:
-#   bash eval_server.sh [policy_path] [port] [gpu_id] [cold_start_mode] \
-#                 [inference_overlap_steps] [n_action_steps] [compile_model] \
-#                 [skip_stale_actions]
-#
-# Examples:
-#   # Sync
-#   bash eval_server.sh /path/to/lingbot_flashvla_checkpoint 9999 0
-#
-#   # Async overlap=1 with compile
-#   bash eval_server.sh /path/to/lingbot_ckpt 9999 0 current_state 1 10 true
-#
-# Env knobs:
-#   SKIP_STALE_ACTIONS=1  force RTC realignment server-wide (same effect as the
-#     8th positional arg; requires inference_overlap_steps + n_action_steps
-#     <= chunk_size). e.g. SKIP_STALE_ACTIONS=1 bash eval_server.sh ... 1 10 true
-#
-# Prerequisites (one-time setup in the flashvla env):
-#   conda activate flashvla   # the env where `pip install -e flashvla` was run
 
 set -e
 

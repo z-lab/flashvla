@@ -1,20 +1,6 @@
 # Portions derived from LingBot-VLA, Copyright Robbyant Team.
 # Source: https://github.com/Robbyant/lingbot-vla (commit 4eb34b7).
 # Modified by the FlashVLA team. Licensed under Apache-2.0.
-"""LingBot-VLA FlashVLA Policy.
-
-FlashVLA action streaming with padded cold start, adapted from PI05FlashVLAPolicy.
-Reuses the base FlowMatching model from modeling_lingbot_vla.py.
-
-Buffer layout (N=4 slots, C=20 actions per slot):
-  Step 0: [slot_0, PAD, PAD, PAD]  -> 1 real slot
-  Step 1: [slot_0, slot_1, PAD, PAD]  -> 2 real slots
-  ...
-  Step 3: [slot_0, slot_1, slot_2, slot_3]  -> full -> extract first chunk
-
-Per-config suffix layout (action expert):
-  [state(1), noisy_N*C]        H_cfg = N*C
-"""
 
 import logging
 from collections import deque

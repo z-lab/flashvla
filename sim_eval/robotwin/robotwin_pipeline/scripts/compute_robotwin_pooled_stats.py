@@ -1,23 +1,4 @@
 #!/usr/bin/env python
-"""Compute EXACT pooled normalization stats over RoboTwin sub-datasets.
-
-When MultiFlashVLADataset pools per-subset stats via lerobot's
-aggregate_stats(), min/max/mean/std are exact but quantiles (q01/q99 — the
-only stats QUANTILES normalization actually reads) are approximated by a
-count-weighted average of per-subset quantiles. This script instead computes
-the true global quantiles over the union of all frames, by reading the data
-parquets directly (action / observation.state only; VISUAL is IDENTITY).
-
-The output JSON can be passed to training via
---robotwin_multitask.stats_path so the trainer overrides the aggregated
-stats with these exact ones.
-
-Usage:
-    python scripts/compute_robotwin_pooled_stats.py \
-        --root /path/to/RoboTwin-LeRobot-v3.0 \
-        --subdirs aloha-agilex_clean_50 aloha-agilex_randomized_500 \
-        --output /path/to/RoboTwin-LeRobot-v3.0/_pooled_stats/clean+randomized_50tasks.json
-"""
 
 import argparse
 import json
@@ -52,7 +33,7 @@ def exact_stats(values: np.ndarray) -> dict:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--subdirs", nargs="+",
                         default=["aloha-agilex_clean_50", "aloha-agilex_randomized_500"])

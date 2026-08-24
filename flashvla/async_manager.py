@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,57 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Async chunk-overlap action manager for FlashVLA streaming policies.
-
-This is the single integration point for running FlashVLA policies in a
-control loop — simulation (LIBERO, RoboTwin) and real robots alike. It wraps
-a streaming (or plain chunked) policy with asynchronous chunk-overlap
-execution:
-
-  * Launch the NEXT chunk inference ``overlap_steps`` steps before the
-    current chunk ends. Under ``torch.compile`` + CUDA graphs the launch is
-    dispatch-only (sub-millisecond CPU cost); the GPU work runs in the
-    background of subsequent control steps.
-  * At the chunk transition, the ``.cpu().numpy()`` sync waits only on
-    whatever GPU work the overlap window has not already hidden.
-  * During the streaming cold start (the first ``num_buffer_slots - 1``
-    calls return ``None``), a hold-pose action is synthesized via
-    :func:`flashvla.policies.pi05.utils.compute_cold_start_action`.
-  * With ``skip_stale_actions`` (RTC realignment), a chunk promoted at the
-    transition skips its first ``overlap_steps`` actions — they target control
-    steps the outgoing chunk already executed — and the window
-    ``[overlap_steps, overlap_steps + n_action_steps)`` of the full predicted
-    chunk is consumed instead.
-
-Async-overlap timeline (chunk_size = n_action_steps = 10, overlap_steps = 2)::
-
-  chunk_index:   0   1   2   3   4   5   6   7   8   9   →   0   1
-  step:          execute current_chunk[0..7] ──┐
-                                               │ launch_next_inference(obs)
-                                               │   (non-blocking under compile)
-                                               │   GPU runs in background
-                              execute [8]  [9]┘                    │
-                                                                    │
-                                                  chunk_index wraps │
-                                                  to 0; transition: │
-                                                  next_chunk.cpu()  ┘
-                                                  (sync; GPU is done)
-
-Set ``overlap_steps = 0`` to disable async — the manager then launches the
-next chunk synchronously at the transition.
-
-Minimal real-robot integration::
-
-    from flashvla.async_manager import AsyncStreamingActionManager
-
-    mgr = AsyncStreamingActionManager(policy, overlap_steps=1)
-    mgr.reset()                                  # at episode start
-    while running:
-        processed = preprocessor(robot_obs)      # tokenize/normalize/device
-        action = mgr.act(processed)              # [B, action_dim] on CPU
-        action = postprocessor(action)           # unnormalize
-        robot.send_action(action.cpu().numpy())
-"""
 
 from __future__ import annotations
 

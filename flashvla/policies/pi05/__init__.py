@@ -1,7 +1,5 @@
 #!/usr/bin/env python
 
-"""FlashVLA PI05 policy package."""
-
 from __future__ import annotations
 
 from .configuration_pi05 import PI05Config, PI05FlashVLAConfig

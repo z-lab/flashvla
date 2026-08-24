@@ -1,24 +1,5 @@
 #!/usr/bin/env bash
-# RoboTwin 2.0 -> LeRobot v3 dataset pipeline (one-click).
-#
-# Downloads the official RoboTwin 2.0 raw dataset, converts it to the LeRobot v3
-# layout FlashVLA trains on, and computes the exact normalization statistics.
-# Runs locally in the activated `flashvla` conda env — no GPU, no RoboTwin sim
-# env, no SLURM. (~273 GB raw download; the converted tree is much smaller.)
-#
-# Usage:
-#   conda activate flashvla
-#   bash run_pipeline.sh [DATA_DIR] [PARALLELISM]
-#
-#     DATA_DIR     where raw + converted data live   (default: ./robotwin_data)
-#     PARALLELISM  concurrent task conversions        (default: half the CPU cores)
-#
-# Optional env overrides:
-#   SETTINGS="aloha-agilex_clean_50"   # space-separated; default = clean_50 + randomized_500
-#   SKIP_DOWNLOAD=1                    # raw data already extracted under $DATA_DIR/raw/dataset
-#
-# Idempotent: re-running skips already-converted task/settings (.CONVERT_DONE marker),
-# so it is safe to resume after an interruption.
+
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"

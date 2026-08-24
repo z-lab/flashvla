@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,11 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Processor pipelines for FlashVLA PI05 policies.
-
-Creates external pre/post-processor pipelines that handle normalization,
-state discretization, tokenization, and device transfer.
-"""
 
 from dataclasses import dataclass
 from typing import Any

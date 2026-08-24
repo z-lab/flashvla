@@ -1,26 +1,4 @@
 #!/usr/bin/env python
-"""Augment RoboTwin-LeRobot-v3.0 sub-datasets with quantile stats (q01..q99).
-
-The HF release of hxma/RoboTwin-LeRobot-v3.0 ships meta/stats.json with only
-min/max/mean/std/count. Our pi05 configs use QUANTILES normalization for
-STATE and ACTION, and lerobot's NormalizerProcessorStep hard-fails when
-q01/q99 are missing.
-
-lerobot's own scripts/augment_dataset_quantile_stats.py is unsuitable here:
-it decodes every video frame (hours over 77 GB) and ends with
-dataset.push_to_hub(). VISUAL normalization is IDENTITY in our configs, so
-image quantiles are never read — we only need quantiles for the
-parquet-backed float features (action, observation.state), which we can
-compute directly from the data parquets in seconds per subset.
-
-Quantiles are computed globally over all frames of a subset (exact), rather
-than lerobot's per-episode-then-count-weighted-average (approximate). Both
-are compatible with aggregate_stats() pooling at multitask training time.
-
-Usage:
-    python scripts/augment_robotwin_quantile_stats.py \
-        --root /path/to/RoboTwin-LeRobot-v3.0
-"""
 
 import argparse
 import json
@@ -59,7 +37,7 @@ def augment_subset(subset_root: Path, overwrite: bool) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True,
                         help="RoboTwin-LeRobot-v3.0 root: <root>/<task>/<config_subdir>/")
     parser.add_argument("--overwrite", action="store_true",

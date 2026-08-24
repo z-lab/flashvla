@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,21 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PI0.5 FlashVLA: Padded Cold Start with Shared Observation Training.
 
-Uses a fixed chunk_size=10, buffer of N=5 slots, and padding-based warmup
-instead of full ODE cold start. During cold start the buffer gradually fills
-with real slots while padded slots are masked. Training uses shared observation
-(all N buffer configs trained simultaneously per observation).
-
-Buffer states during cold start (0=cleanest, 4=noisiest, P=padding):
-  Step 0: [4, P, P, P, P]  -> 1 real slot
-  Step 1: [3, 4, P, P, P]  -> 2 real slots
-  Step 2: [2, 3, 4, P, P]  -> 3 real slots
-  Step 3: [1, 2, 3, 4, P]  -> 4 real slots
-  Step 4: [0, 1, 2, 3, 4]  -> full buffer -> extract first chunk
-  Step 5+: steady state streaming (single denoise step per call)
-"""
 import builtins
 import logging
 import math

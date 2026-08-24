@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,15 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashVLA Training Module.
-
-Trains baseline and FlashVLA policies (PI0.5 / PI0 / SmolVLA / LingBot).
-Streaming policies use shared-observation, padded-buffer datasets; baseline
-policies use ordinary LeRobot action-chunk datasets.
-
-Usage:
-    python -m flashvla.train --config_path=train/configs/pi05/libero/pi05_flashvla.yaml
-"""
 
 import gc
 import logging

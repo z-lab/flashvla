@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
@@ -14,11 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashVLA Training Configuration.
-
-This module defines configuration classes for FlashVLA training:
-- FlashVLATrainConfig: FlashVLA action-streaming training config extending LeRobot's TrainPipelineConfig
-"""
 
 from dataclasses import dataclass, field
 from typing import List

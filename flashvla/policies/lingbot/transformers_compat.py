@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,15 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Transformers-version shims for the vendored Qwen2.5-VL / Qwen2 modules.
-
-``qwenvl_in_vla.py`` and ``modeling_lingbot_vla.py`` are vendored copies of
-upstream LingBot-VLA, which were written against Transformers 4.x. LeRobot
-0.5.1 pins ``transformers==5.3.0``, where a handful of the imported symbols
-moved or disappeared and the Qwen2.5-VL config gained a nested ``text_config``.
-This module isolates every one of those differences so the vendored files stay
-byte-comparable with upstream apart from their import lines.
-"""
 
 from __future__ import annotations
 

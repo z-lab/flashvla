@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,44 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""
-SmolVLA:
-
-[Paper](https://huggingface.co/papers/2506.01844)
-
-Designed by Hugging Face.
-
-Install smolvla extra dependencies:
-```bash
-pip install -e ".[smolvla]"
-```
-
-Example of finetuning the smolvla pretrained model (`smolvla_base`):
-```bash
-lerobot-train \
---policy.path=lerobot/smolvla_base \
---dataset.repo_id=<USER>/svla_so100_task1_v3 \
---batch_size=64 \
---steps=200000
-```
-
-Example of finetuning a smolVLA. SmolVLA is composed of a pretrained VLM,
-and an action expert.
-```bash
-lerobot-train \
---policy.type=smolvla \
---dataset.repo_id=<USER>/svla_so100_task1_v3 \
---batch_size=64 \
---steps=200000
-```
-
-Example of using the smolvla pretrained model outside LeRobot training framework:
-```python
-policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
-```
-
-"""
 
 import math
 from collections import deque

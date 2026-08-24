@@ -1,18 +1,3 @@
-# Latency Benchmark: LingBot-VLA baseline (eager, no torch.compile).
-#
-# Each call: encode (VLM image+language embed) + prefill (prefix KV-cache
-# fill) + N (=num_steps=10) Euler denoise iterations. Compare against
-# latency_lingbot_flashvla.yaml, which runs a single denoise step on a rolling
-# 4-slot buffer — the FlashVLA win is the action segment.
-#
-# LingBot RoboTwin uses exactly 3 real cameras (cam_high / cam_left_wrist /
-# cam_right_wrist), so run with num_views=3 and NO empty-camera padding (the
-# harness only injects empty_cameras for the pi0 family).
-#
-# Usage:
-#   python benchmarks/benchmark_latency.py \
-#       --config_path=benchmarks/configs/latency_lingbot_baseline.yaml
-
 type: latency
 variant: baseline
 

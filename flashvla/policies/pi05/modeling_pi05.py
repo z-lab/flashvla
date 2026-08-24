@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,22 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PI0.5 Model Implementation.
-
-This module implements the PI0.5 (π0.5) Vision-Language-Action model for
-robot control. PI0.5 uses flow matching to generate action sequences
-conditioned on images and language instructions.
-
-Architecture:
-    PI05Policy (wrapper)
-    └── PI05Model (core model)
-        ├── PaliGemma (vision-language backbone)
-        ├── GemmaActionExpert (action generation)
-        ├── PI05PrefixEmbedder (image + language embeddings)
-        ├── PI05SuffixEmbedder (action + time embeddings)
-        └── PI05ModelLayer[] (shared transformer layers)
-
-"""
 
 import builtins
 import logging

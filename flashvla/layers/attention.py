@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Attention layer with KV cache.
-
-Scaled dot-product attention with optional KV caching:
-- First call with use_cache=True: initialize cache with K/V (prefix prefill)
-- Subsequent calls: concatenate cached prefix K/V with new suffix K/V
-"""
 
 from typing import Optional
 

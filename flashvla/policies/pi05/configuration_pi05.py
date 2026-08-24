@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 #
@@ -14,11 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PI0.5 Policy Configuration.
-
-This module defines the configuration for the PI0.5 (π0.5) Vision-Language-Action
-model.
-"""
 
 from __future__ import annotations
 

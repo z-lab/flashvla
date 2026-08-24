@@ -1,20 +1,3 @@
-# Latency Benchmark: FlashVLA (PI0.5 FlashVLA variant).
-#
-# Each call does encode + prefill + 1 denoise step on a rolling 5-slot
-# buffer (cold-start fills the first N-1=4 calls). Compare against
-# latency_baseline.yaml which runs N=10 denoise steps per call.
-#
-# Sweep dimension: number of camera views (single frame each).
-#   num_views: 1, 2, or 3   →  filters cfg.policy.input_features to the
-#                              first N ``observation.images.*`` keys
-#                              (in dataset feature order).
-# num_frames_per_view stays at 1 — only the camera count varies.
-#
-# Usage:
-#   python benchmarks/benchmark_latency.py \
-#       --config_path=benchmarks/configs/latency_flashvla.yaml \
-#       --num_views=2
-
 type: latency
 variant: flashvla
 

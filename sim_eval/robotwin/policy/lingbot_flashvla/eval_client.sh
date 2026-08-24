@@ -1,22 +1,4 @@
 #!/bin/bash
-# Run a single-task RoboTwin eval against a running lingbot_flashvla server.
-#
-# Runs in the ROBOTWIN venv (torch 2.4 + sapien + mplib + gymnasium 0.29); set
-# ROBOTWIN_VENV to point at it. Assumes eval_server.sh has already been
-# started — by default targets localhost:<port>.
-#
-# Usage:
-#   bash eval_client.sh [task_name] [task_config] [port] [seed] [gpu_id]
-#
-# Example:
-#   # Terminal 1 (flashvla conda env):
-#   bash eval_server.sh /path/to/lingbot_flashvla_checkpoint 9999 0
-#
-#   # Terminal 2 (anywhere — script picks the venv explicitly):
-#   bash eval_client.sh beat_block_hammer demo_clean 9999 0 1
-#
-# task_config options: demo_clean (no augmentation) / demo_randomized (with
-# background/light/etc. randomization). Both come from task_config/<name>.yml.
 
 set -e
 

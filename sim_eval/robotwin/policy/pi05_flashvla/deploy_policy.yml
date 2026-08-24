@@ -1,9 +1,3 @@
-# Shared config for both server and client sides of the pi05_flashvla
-# eval pipeline. Unused fields are simply ignored by the side that doesn't
-# need them (server ignores task_name/task_config/seed; client ignores
-# policy_path/cold_start_mode/device).
-
-# Fields read by both sides
 policy_name: pi05_flashvla
 
 # ── Server-side fields (policy_model_server.py) ──

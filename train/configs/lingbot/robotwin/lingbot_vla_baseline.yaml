@@ -1,5 +1,3 @@
-# LingBot-VLA baseline fine-tuning on a RoboTwin LeRobot-v3 dataset.
-
 policy:
   type: lingbot
   pretrained_path: robbyant/lingbot-vla-4b

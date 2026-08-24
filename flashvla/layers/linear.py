@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,14 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fused Linear Layers for Transformer Optimization.
-
-This module provides fused linear projections that combine multiple
-operations into a single matrix multiplication for efficiency:
-
-- QKVLinear: Fused Q/K/V projection for attention
-- MergedColumnLinear: Fused gate/up projection for MLP
-"""
 
 import torch
 import torch.nn.functional as F

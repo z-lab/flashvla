@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Copyright 2025 The HuggingFace Inc. team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,15 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PI0.5 Utility Functions.
-
-This module provides utility functions for the PI0.5 model:
-- Dtype handling for device compatibility
-- Sinusoidal positional embeddings for flow matching
-- Vector padding for variable-length inputs
-- Attention mask construction
-- Image resizing with aspect-ratio-preserving padding
-"""
 
 import json
 import logging

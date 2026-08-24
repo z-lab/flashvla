@@ -1,14 +1,3 @@
-# FlashVLA fine-tuning from LingBot-VLA's official RoboTwin post-trained
-# checkpoint on the unified clean+random dataset (2,500 clean + 25,000
-# randomized episodes, 6,075,103 frames). This reproduces the successful 100K
-# L2/FM run: N=4, C=20, with n_action_steps=10 in its saved training config.
-# The reported d=0 evaluation (87.78% clean / 88.02% randomized) overrides
-# n_action_steps to 20 at deployment; training still supervises all 80 actions.
-#
-# N=4 slots x C=20 actions gives an 80-action denoising buffer, matching the
-# RoboTwin PI0.5 FlashVLA recipe. The validated production shape is 16
-# samples/rank x 8 ranks x 2 accumulation microsteps = global batch 256.
-
 policy:
   type: lingbot-flashvla
   # Validated source revision: fb71a2c9749ccfedbb7290c2c3f0e5e7c7305c9e.

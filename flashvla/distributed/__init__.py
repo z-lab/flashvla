@@ -1,5 +1,3 @@
-"""Distributed training helpers for FlashVLA."""
-
 from .fsdp import (
     FSDP_PROCESS_GROUP_BACKEND,
     FSDPModulePlan,

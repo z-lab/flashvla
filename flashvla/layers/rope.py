@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Rotary Position Embedding (RoPE).
-
-This module implements RoPE for encoding position information in attention.
-RoPE applies a rotation to query and key vectors based on their position,
-enabling the model to learn relative positional relationships.
-
-The rotation is defined as:
-    x' = x * cos(θ) + rotate(x) * sin(θ)
-    
-where θ depends on position and dimension index.
-
-Reference: https://arxiv.org/abs/2104.09864
-"""
-
 
 import torch
 from torch import nn

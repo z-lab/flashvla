@@ -1,7 +1,6 @@
 # Portions derived from LingBot-VLA, Copyright Robbyant Team.
 # Source: https://github.com/Robbyant/lingbot-vla (commit 4eb34b7).
 # Modified by the FlashVLA team. Licensed under Apache-2.0.
-"""Checkpoint loading helpers shared by LingBot baseline and FlashVLA policies."""
 
 from __future__ import annotations
 

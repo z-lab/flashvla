@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""LeRobot v2.1/v3.0 Compatibility Layer.
-
-This module patches lerobot 0.4.1+ to support v2.1 format datasets.
-Import this module before importing lerobot to apply patches.
-
-"""
 
 import json
 import logging

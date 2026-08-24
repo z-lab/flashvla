@@ -1,31 +1,4 @@
 #!/usr/bin/env python
-"""Convert RoboTwin 2.0 raw hdf5 to LeRobot v3 — one task×setting per dataset.
-
-Reverse-engineered from hxma/RoboTwin-LeRobot-v3.0 (verified frame-exact):
-  observation.state[t] = joint_action/vector[t]      (current 14-dim qpos)
-  action[t]            = joint_action/vector[t+1]     (next-state-as-action;
-                          RoboTwin uses absolute joint position control)
-  → drop the final frame (no t+1 action), so T_out = T_raw - 1.
-
-Cameras: head→cam_high, left→cam_left_wrist, right→cam_right_wrist (front
-dropped, matching hxma + pi05 configs). RGB stored at the sim's native
-240×320 (hxma upscaled to 480×640, which adds no information). JPEG bytes in
-the hdf5 are cv2-decoded BGR→RGB.
-
-Instruction: one per episode, deterministically sampled from the 100 `seen`
-prompts (episode-index-seeded). `unseen` prompts are left for eval-time
-language-generalization tests.
-
-Stats: lerobot's create→save_episode does NOT compute quantiles. q01/q99 must
-be added afterward (scripts/augment_robotwin_quantile_stats.py for per-task;
-scripts/compute_robotwin_pooled_stats.py for the merged global stats).
-
-Usage (single task×setting):
-    python scripts/convert_robotwin_to_lerobot.py \
-        --task beat_block_hammer --setting aloha-agilex_clean_50 \
-        --raw-root /path/to/RoboTwin2.0-raw/dataset \
-        --out-root /path/to/RoboTwin-LeRobot-v3.0
-"""
 
 import argparse
 import json
@@ -143,7 +116,7 @@ def convert(task: str, setting: str, raw_root: Path, out_root: Path,
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser()
     ap.add_argument("--task", required=True)
     ap.add_argument("--setting", required=True,
                     choices=["aloha-agilex_clean_50", "aloha-agilex_randomized_500"])

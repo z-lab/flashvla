@@ -1,20 +1,4 @@
 # Copyright 2025 FlashVLA team. All rights reserved.
-"""RoboTwin deploy_policy entrypoint for lingbot_flashvla (server/client mode).
-
-This module is imported by BOTH sides of the RoboTwin eval pipeline:
-
-  1. RoboTwin/script/policy_model_server.py (runs in the flashvla env):
-       calls ``get_model(usr_args)`` → ``LingBotFlashVLAModel`` instance.
-
-  2. RoboTwin/script/eval_policy_client.py (runs in the RoboTwin conda env):
-       loads ``eval(TASK_ENV, model, observation)`` from here. ``model`` is a
-       ``ModelClient`` that forwards everything to the server.
-
-The flashvla env and the RoboTwin SAPIEN env have hard conflicts on
-torch / numpy / gymnasium versions, so we NEVER import flashvla at module top
-level: ``get_model`` does a lazy import, keeping this file importable in the
-client env where flashvla is absent.
-"""
 
 from __future__ import annotations
 

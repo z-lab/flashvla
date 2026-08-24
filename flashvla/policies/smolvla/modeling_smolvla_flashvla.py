@@ -1,35 +1,9 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-"""SmolVLA FlashVLA.
 
-Port of pi0/pi05 streaming buffer + shared-observation training to smolvla.
-
-Architecture adaptations vs pi0 streaming:
-  * State stays in the prefix (smolvla's native layout). One prefix encoding
-    is shared across all N buffer configs in training — no per-config state
-    token duplication like pi0/lingbot streaming.
-  * Suffix uses pi05/pi0-style block-causal across slots: only the first
-    token of each slot is a boundary (``att_masks=[1]+[0]*(C-1)`` per slot).
-    Within a slot (C action tokens): full attention. Across slots: causal
-    at the block level. Diverges from baseline smolvla's per-token AR within
-    the action chunk (see ``modeling_smolvla.embed_suffix``) — empirical results on
-    pi05 ([[project_flashvla_outlier_amplification]]) recommend
-    this pattern for streaming.
-  * Cross-attention mode (default in smolvla): the action expert cross-attends
-    to VLM KV. Cross-config blocking only meaningfully constrains self-attn
-    layers (every ``self_attn_every_n_layers``). The same full attention mask
-    works for both since cross-attn layers slice only suffix→prefix entries
-    which are unaffected by cross-config blocking.
-
-Buffer layout (N=5 slots, C=10 actions per slot, no action prefix):
-  cold-start step 0: [4, P, P, P, P]
-  cold-start step 4: [0, 1, 2, 3, 4]  → buffer full, first chunk extracted
-  steady streaming:  one denoise step per call, slot 0 popped, slots shifted left.
-"""
 from __future__ import annotations
 
 import builtins

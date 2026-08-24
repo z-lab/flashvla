@@ -1,36 +1,9 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-"""PI0 FlashVLA: Padded Cold Start with Shared Observation Training.
 
-Port of pi05's FlashVLA
-(``flashvla/policies/pi05/modeling_pi05_flashvla.py``) to pi0's
-non-adaRMS architecture. Buffer of N=5 slots × C=10 actions per slot,
-one-step inference in steady state, padded cold start, shared-observation
-training with PerSeg time sampling.
-
-Differences from pi05 streaming:
-  * Per-slot time is injected via pi0's existing concat path
-    (``cat([action_emb, time_emb]) -> action_time_mlp_in/out``) instead of
-    pi05's adaRMS FiLM. ``FlashVLAPI0ModelLayer.forward(..., conds=[None, None])``
-    works unchanged — no patches, no per-token cond reshape gymnastics.
-  * The state token sits at suffix index 0 of every buffer config (pi0
-    keeps state-as-token; pi05 bakes state into the prompt via
-    ``state_cond=False`` discretization). The action buffer therefore
-    contains only action slots; state is freshly fed as an argument
-    every call.
-
-Buffer states during cold start (0=cleanest, 4=noisiest, P=padding):
-  Step 0: [4, P, P, P, P]  -> 1 real slot
-  Step 1: [3, 4, P, P, P]  -> 2 real slots
-  Step 2: [2, 3, 4, P, P]  -> 3 real slots
-  Step 3: [1, 2, 3, 4, P]  -> 4 real slots
-  Step 4: [0, 1, 2, 3, 4]  -> full buffer -> extract first chunk
-  Step 5+: steady state streaming (single denoise step per call)
-"""
 import builtins
 import logging
 import os

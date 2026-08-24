@@ -1,32 +1,4 @@
 #!/bin/bash
-# Start the pi05_flashvla model server.
-#
-# Runs in the FlashVLA conda env (torch 2.7 + flashvla + transformers).
-# Listens on a TCP port; eval_client.sh connects to it from the RoboTwin env.
-#
-# Usage:
-#   bash eval_server.sh [policy_path] [port] [gpu_id] [cold_start_mode] \
-#                 [inference_overlap_steps] [n_action_steps] [compile_model] \
-#                 [skip_stale_actions]
-#
-# Examples:
-#   # Sync (default)
-#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0
-#
-#   # Async overlap=1 with compile + n_action_steps=5
-#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 5 true
-#
-#   # Async overlap=1 with RTC realignment (skip stale actions at promotion)
-#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 5 true true
-#
-# Env knobs:
-#   SKIP_STALE_ACTIONS=1  force RTC realignment server-wide (same effect as the
-#     8th positional arg; requires inference_overlap_steps + n_action_steps
-#     <= chunk_size). e.g. SKIP_STALE_ACTIONS=1 bash eval_server.sh ... 1 5 true
-#
-# Prerequisites (one-time setup in the flashvla env):
-#   conda activate flashvla   # the env where `pip install -e flashvla` was run
-#   pip install -e /path/to/flashvla
 
 set -e
 

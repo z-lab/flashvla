@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,11 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PI0 Policy Configuration.
-
-This module defines the configuration for the PI0 (π0) Vision-Language-Action
-model. PI0 is the base VLA model without adaRMS state conditioning.
-"""
 
 from __future__ import annotations
 

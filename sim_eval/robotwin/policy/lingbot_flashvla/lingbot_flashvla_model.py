@@ -1,27 +1,4 @@
 # Copyright 2025 FlashVLA team. All rights reserved.
-"""Server-side lingbot_flashvla model wrapper for RoboTwin eval.
-
-This module is loaded ONLY in the flashvla conda env (where flashvla is
-pip-installed). The RoboTwin client env never imports it — it just holds a
-``ModelClient`` that talks to an instance of ``LingBotFlashVLAModel`` running
-here over a TCP socket.
-
-Protocol exposed to ``RoboTwin/script/policy_model_server.py``:
-
-    LingBotFlashVLAModel.call(func_name, obs) -> result
-    LingBotFlashVLAModel.get_action(obs_dict) -> np.ndarray (14,) float32
-        obs_dict keys: instruction, head_rgb, left_rgb, right_rgb, state.
-    LingBotFlashVLAModel.reset_model() -> None
-
-Two LingBot-specific details this wrapper is responsible for:
-
-  1. RGB stays fp32 all the way through the saved preprocessor. LingBot's
-     resize/normalization runs before the Qwen patch embedding does its own
-     cast, and PyTorch's antialiased bilinear resize does not support bf16.
-  2. ``config.tokenizer_path`` must point at a *full* Qwen2.5-VL-3B-Instruct
-     repo (not a tokenizer-only export): the policy reads the backbone
-     architecture config from it as well as the tokenizer.
-"""
 
 from __future__ import annotations
 

@@ -1,10 +1,3 @@
-# Shared config for both server and client sides of the lingbot_flashvla eval
-# pipeline. Unused fields are ignored by the side that doesn't need them
-# (server ignores task_name/task_config/seed; client ignores
-# policy_path/cold_start_mode/device).
-
-# Fields read by both sides. RoboTwin imports Python modules by this
-# underscore name; docs and results use the display name "lingbot-flashvla".
 policy_name: lingbot_flashvla
 
 # ── Server-side fields (policy_model_server.py) ──

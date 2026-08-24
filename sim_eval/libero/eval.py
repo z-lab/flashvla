@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2024 The HuggingFace Inc. team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,41 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Evaluate an FlashVLA policy with async chunk-overlap inference.
-
-Async variant of the synchronous FlashVLA eval loop. The control loop
-launches the NEXT inference ``inference_overlap_steps`` steps before the
-current chunk ends; under torch.compile + CUDA graphs that launch is
-non-blocking and the GPU work runs in parallel with the remaining
-control steps. At the chunk transition the ``.cpu().numpy()`` sync waits
-only on whatever GPU work hasn't finished by then.
-
-Set ``--inference_overlap_steps 0`` to recover sync behavior (transitions
-block on a fresh launch).
-
-Compared to the sync version this script:
-  - Replaces ``policy.select_action`` with ``AsyncStreamingActionManager.act``.
-  - Adds a one-shot CUDA-graph warmup phase before the first task
-    rollout, so episode-1 latency isn't dominated by torch.compile
-    autotune + graph capture (10-30+ seconds).
-  - Adds the ``inference_overlap_steps`` CLI flag (default 0).
-  - Does NOT touch the underlying policy class or
-    ``predict_action_chunk``; everything is wrapped at the eval-script
-    level via ``AsyncStreamingActionManager``.
-
-Usage:
-
-python sim_eval/libero/eval.py \
-    --policy.path=./pi05_libero_finetuned \
-    --env.type=libero \
-    --env.task=libero_spatial,libero_object,libero_goal,libero_10 \
-    --eval.batch_size=1 \
-    --eval.n_episodes=10 \
-    --policy.n_action_steps=10 \
-    --inference_overlap_steps=2 \
-    --output_dir=./eval_logs/ \
-    --env.max_parallel_tasks=1
-"""
 
 import concurrent.futures as cf
 import json

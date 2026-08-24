@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,20 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Policy Factory Module.
-
-This module provides factory functions for creating policy instances.
-It supports both creating fresh policies and loading pretrained ones.
-
-Usage:
-    from flashvla.policies.factory import make_policy, get_policy_class
-    
-    # Get policy class by name
-    policy_cls = get_policy_class("pi05-flashvla")
-    
-    # Create policy instance
-    policy = make_policy(cfg.policy, dataset.meta)
-"""
 
 from __future__ import annotations
 

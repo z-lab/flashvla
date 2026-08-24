@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,33 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Checkpoint-loading helpers shared by the PI0 / PI0.5 policies.
-
-These policies build their VLM and action expert from ``lerobot.policies.pi_gemma``.
-``PiGemmaForCausalLM`` and ``PaliGemmaForConditionalGenerationWithPiGemma`` call
-``super().__init__(config)`` -- which ties ``lm_head.weight`` to the input
-embedding -- and only then replace ``self.model``. The replacement orphans
-``lm_head``, so the head and the embedding are two *independent* tensors here
-even though upstream transformers keeps them tied.
-
-That matters when loading the openpi-derived base checkpoints. ``lerobot/pi05_base``
-was serialized with the tie in place, so ``safetensors`` dropped the duplicate and
-recorded the relationship in ``__metadata__`` only::
-
-    embed_tokens keys: []
-    lm_head keys: ['paligemma_with_expert.paligemma.lm_head.weight', ...]
-    __metadata__: {"...language_model.embed_tokens.weight": "...paligemma.lm_head.weight"}
-
-``safetensors.torch.load_file`` does not read ``__metadata__`` back, so a plain
-``load_state_dict(..., strict=False)`` fills ``lm_head`` and silently leaves the
-526M-parameter token embedding at its random initialization -- while the embedding
-*is* on the forward hot path via the prefix embedder. Upstream lerobot patches this
-in ``lerobot/policies/pi05/modeling_pi05.py`` by cloning the head into the embedding;
-:func:`restore_untied_lm_head_embeddings` does the same thing generically.
-
-:func:`assert_checkpoint_covers_parameters` is the backstop: it turns any remaining
-never-written parameter into a hard error instead of a silent accuracy loss.
-"""
 
 from __future__ import annotations
 

@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,20 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashVLA Dataset.
-
-Returns all N buffer configurations per observation for shared observation
-training. Each config k (k=1..N) has k real slots of ground truth actions
-and (N-k) padded slots.
-
-Buffer configs (N=5, C=10):
-  Config 1: [real_slot_0, pad, pad, pad, pad]   -> 10 real + 40 padded actions
-  Config 2: [real_slot_0, real_slot_1, pad, pad, pad] -> 20 real + 30 padded
-  ...
-  Config 5: [real_slot_0, ..., real_slot_4]       -> 50 real actions
-
-State is the same for all configs (no async delay in v2).
-"""
 
 from pathlib import Path
 from typing import Callable

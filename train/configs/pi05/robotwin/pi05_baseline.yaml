@@ -1,9 +1,3 @@
-# PI0.5 baseline training on the complete RoboTwin 2.0 LeRobot v3 dataset.
-#
-# The multi-task builder discovers every task that contains both requested
-# variants, concatenates the 100 leaves, and samples frames proportionally.
-# Per-leaf metadata statistics are pooled over the clean + randomized union.
-
 policy:
   type: pi05
   pretrained_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/lerobot/pi05_base

@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,12 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""FlashVLA PI0 policy package.
-
-PI0 (π0) is the base Vision-Language-Action model that uses flow matching
-to generate action sequences. Unlike PI0.5, PI0 does not use adaRMS
-conditioning - state is passed as a separate token in the sequence.
-"""
 
 from __future__ import annotations
 

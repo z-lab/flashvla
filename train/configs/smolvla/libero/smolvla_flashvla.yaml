@@ -1,4 +1,3 @@
-# Policy configuration
 policy:
   type: smolvla-flashvla
   pretrained_path: lerobot/smolvla_base

@@ -1,24 +1,4 @@
 # Copyright 2025 FlashVLA team. All rights reserved.
-"""RoboTwin deploy_policy entrypoint for pi05_flashvla (server/client mode).
-
-This module is imported by BOTH sides of the RoboTwin eval pipeline:
-
-  1. RoboTwin/script/policy_model_server.py (runs in the flashvla env):
-       calls ``get_model(usr_args)`` → ``PI05FlashVLAModel`` instance.
-       The server exposes every callable method on that instance over a
-       TCP socket as ``{cmd: <method_name>, obs: <payload>}`` requests.
-
-  2. RoboTwin/script/eval_policy_client.py (runs in the RoboTwin conda env):
-       loads ``eval(TASK_ENV, model, observation)`` from here. ``model`` is a
-       ``ModelClient`` that forwards everything to the server via
-       ``model.call(func_name=..., obs=...)``.
-
-The flashvla training env and the RoboTwin SAPIEN env have hard conflicts on
-torch / numpy / gymnasium versions — see README.md for the full matrix.
-Because of this we NEVER import flashvla at module top level: ``get_model``
-does a lazy import so the client env (which doesn't have flashvla) can still
-import this file without errors.
-"""
 
 from __future__ import annotations
 

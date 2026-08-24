@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-
 # Copyright 2025 FlashVLA team. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,21 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PI0 Model Implementation.
-
-This module implements the PI0 (π0) Vision-Language-Action model for
-robot control. PI0 uses flow matching to generate action sequences
-conditioned on images and language instructions.
-
-Architecture:
-    PI0Policy (wrapper)
-    └── PI0Model (core model)
-        ├── PaliGemma (vision-language backbone)
-        ├── GemmaActionExpert (action generation, no adaRMS)
-        ├── PI0PrefixEmbedder (image + language embeddings)
-        ├── PI0SuffixEmbedder (state + action + time embeddings)
-        └── PI0ModelLayer[] (shared transformer layers)
-"""
 
 import builtins
 import logging

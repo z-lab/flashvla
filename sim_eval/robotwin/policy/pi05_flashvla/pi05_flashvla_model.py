@@ -1,32 +1,4 @@
 # Copyright 2025 FlashVLA team. All rights reserved.
-"""Server-side pi05_flashvla model wrapper for RoboTwin eval.
-
-This module is loaded ONLY in the flashvla conda env (where flashvla is
-pip-installed). The RoboTwin client env never imports it — it just holds a
-``ModelClient`` that talks to an instance of ``PI05FlashVLAModel`` running here
-over a TCP socket.
-
-Async overlap (server-side):
-    Wraps the streaming policy in an ``AsyncStreamingActionManager`` so that
-    when ``inference_overlap_steps > 0`` and the policy is compiled, the next
-    chunk inference is dispatched ``overlap_steps`` calls before the current
-    chunk runs out. The TCP client still sees one ``get_action`` call per env
-    step — the async hiding all happens inside this process while SAPIEN is
-    stepping the simulator.
-
-Protocol exposed to ``RoboTwin/script/policy_model_server.py``:
-
-    PI05FlashVLAModel.call(func_name, obs) -> result
-        Dispatcher — the server invokes ``getattr(model, cmd)(obs)`` directly,
-        but we also expose ``call`` so local-mode callers get the same API.
-
-    PI05FlashVLAModel.get_action(obs_dict) -> np.ndarray (14,) float32
-        obs_dict keys: instruction, head_rgb, left_rgb, right_rgb, state.
-
-    PI05FlashVLAModel.reset_model() -> None
-        Called between episodes by the client via
-        ``model.call(func_name='reset_model')``.
-"""
 
 from __future__ import annotations
 

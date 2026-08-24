@@ -1,15 +1,6 @@
 # Portions derived from LingBot-VLA, Copyright Robbyant Team.
 # Source: https://github.com/Robbyant/lingbot-vla (commit 4eb34b7).
 # Modified by the FlashVLA team. Licensed under Apache-2.0.
-"""Processor pipelines for LingBot-VLA policies.
-
-Creates external pre/post-processor pipelines that handle normalization,
-language prompt formatting, tokenization, and device transfer.
-
-LingBot-VLA uses the Qwen2.5-VL tokenizer and formats prompts as:
-    <bos>{task}\n
-(following lingbot-vla's prepare_language convention for weight compatibility)
-"""
 
 from dataclasses import dataclass
 from typing import Any

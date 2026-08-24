@@ -1,12 +1,3 @@
-"""Policy-owned FSDP2 preparation.
-
-FlashVLA keeps fp32 master parameters for every training mode. In bf16 mode,
-the large transformer units all-gather and compute in bf16, while numerically
-sensitive modules are still normal FSDP units with fp32 compute. No trainable
-parameter is excluded from FSDP, so gradients and optimizer state remain under
-the standard PyTorch/Accelerate APIs.
-"""
-
 from __future__ import annotations
 
 import importlib

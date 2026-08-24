@@ -1,7 +1,3 @@
-"""
-flashvla: Real-time VLA inference with FlashVLA.
-"""
-
 __version__ = "0.1.0"
 
 from flashvla import configs, datasets
