@@ -17,7 +17,8 @@ device: cuda
 # the current chunk ends. 0 = sync (transition triggers blocking inference).
 # Requires the ckpt to have compile_model=true for real GPU hiding;
 # otherwise the launch is just synchronous Python dispatch and you get no
-# benefit. Should be <= n_action_steps; typically 1–2 on chunk10 ckpts.
+# benefit. Should be <= n_action_steps; we use 1–2 with the chunk-20
+# RoboTwin checkpoint.
 inference_overlap_steps: 0
 
 # RTC realignment: when promoting a chunk launched inference_overlap_steps
@@ -27,9 +28,9 @@ inference_overlap_steps: 0
 # inference_overlap_steps + n_action_steps <= chunk_size.
 skip_stale_actions: false
 
-# Optional: override the ckpt's n_action_steps without retraining.
-# Leave as null to keep what's saved in config.json.
-n_action_steps: null
+# Match the 20-action execution horizon used for both pi0.5 and FlashVLA in
+# the reported RoboTwin 2.0 50-task evaluation.
+n_action_steps: 20
 
 # Optional: override compile_model. Recommended for async runs because
 # torch.compile + CUDA graphs are what make predict_action_chunk non-blocking.

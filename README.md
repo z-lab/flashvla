@@ -41,8 +41,9 @@ for setup and full options (single run, multi-seed sweeps, and the RoboTwin serv
 
 ## Performance
 
-π0.5 vs. **+ FlashVLA** (**bold** = the better result). `d` is the async step delay:
-`d=0` is synchronous, `d≥1` overlaps the next chunk's inference with robot execution.
+π0.5 vs. **+ FlashVLA** (**bold** = the better result). `d` denotes how many
+steps before the current chunk ends the next inference is launched: `d=0` is
+synchronous, while `d≥1` overlaps inference with robot execution.
 
 ### LIBERO
 
@@ -52,18 +53,35 @@ Success rate (%) + per-step latency (averaged over 2,000 episodes):
 |:--|:--:|:--:|:--:|:--:|:--:|:--:|
 | π0.5 | **98.8** | 98.2 | **98.0** | 92.4 | 96.9 | 53.8 |
 | **+ FlashVLA** (`d=0`) | 98.6 | 99.0 | 97.8 | **96.2** | **97.9** (↑1.0) | – |
-| **+ FlashVLA** (`d=1`) | 96.0 | **99.6** | 96.4 | 96.0 | 97.0 (↑0.1) | **29.4** (1.83×) |
+| **+ FlashVLA** (`d=1`) | **98.8** | **99.6** | 97.6 | **95.4** | **97.8** (↑0.9) | **22.1** (2.43×) |
 
 ### RoboTwin 2.0
 
-50-task multitask success rate (%) — `d=0` synchronous, `d=1`/`d=2` asynchronous:
+50-task multitask success rate (%):
 
 | Method | Clean | Random | Avg |
 |:--|:--:|:--:|:--:|
-| π0.5 | 86.58 | 86.06 | 86.32 |
-| **+ FlashVLA** (`d=0`) | 90.64 (↑4.06) | 90.06 (↑4.00) | 90.35 (↑4.03) |
-| **+ FlashVLA** (`d=1`) | **91.14** (↑4.56) | **90.60** (↑4.54) | **90.87** (↑4.55) |
-| **+ FlashVLA** (`d=2`) | 90.20 (↑3.62) | 89.66 (↑3.60) | 89.93 (↑3.61) |
+| π0.5 | 86.1 | 85.8 | 86.0 |
+| **+ FlashVLA** (`d=0`) | **90.8** | **90.2** | **90.5** (↑4.5) |
+
+The 50-task models are jointly trained on the union of clean and randomized
+data from all tasks. Both π0.5 and FlashVLA use a global batch size of
+256, a learning rate of `5e-5` with cosine decay, and 100K optimization steps
+(about 4.5 epochs). Evaluation uses a matched 20-action execution horizon:
+π0.5 replans after executing the first 20 actions of its 50-action output.
+
+### Cross-Architecture Generalization
+
+| Backbone | Method | Avg SR (%) | Time/Step (ms) | Inference Latency (ms) |
+|:--|:--|:--:|:--:|:--:|
+| SmolVLA | Baseline | 80.1 | 44.2 | 19.7 |
+| SmolVLA | **+ FlashVLA** (`d=0`) | **80.4** (↑0.3) | **27.2** (1.63×) | **10.1** (1.95×) |
+| SmolVLA | **+ FlashVLA** (`d=1`) | 79.5 (↓0.6) | **24.7** (1.79×) | – |
+| LingBot-VLA | Baseline | 85.8 | 46.7 | 70.6 |
+| LingBot-VLA | **+ FlashVLA** (`d=0`) | **88.6** (↑2.8) | **43.5** (1.07×) | **25.1** (2.81×) |
+| LingBot-VLA | **+ FlashVLA** (`d=1`) | **89.3** (↑3.5) | **40.5** (1.15×) | – |
+
+Inference latency is independent of `d` and is reported once at `d=0`.
 
 ## Latency Benchmark
 
@@ -75,11 +93,14 @@ python benchmarks/benchmark_latency.py --config_path=benchmarks/configs/latency_
 
 Use `--num_views=1`, `--num_views=2`, or `--num_views=3` to sweep camera views.
 
-Per-action latency (ms) on RTX 4090 / 5090 with 2 and 3 camera views (π0.5 uses PyTorch max-autotune):
+Inference latency (ms) on RTX 4090 / 5090 with two and three camera views,
+averaged over 100 samples after 10 warm-up iterations. π0.5 and FlashVLA use
+the same CUDA Graph and kernel-fusion optimizations.
 
 | Method | RTX 4090 (2 views) | RTX 4090 (3 views) | RTX 5090 (2 views) | RTX 5090 (3 views) |
 |:--|:--:|:--:|:--:|:--:|
-| π0.5 | 46.1 | 56.1 | 37.5 | 45.4 |
+| π0.5 | 45.8 | 55.4 | 37.0 | 44.8 |
+| + Realtime-VLA | 29.2 | 38.9 | 26.6 | 34.2 |
 | **+ FlashVLA** | **26.7** | **36.8** | **20.3** | **27.1** |
 
 ## Training

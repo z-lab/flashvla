@@ -39,7 +39,8 @@ robotwin_multitask:
 
    `overlay/` holds small patches over upstream RoboTwin (async client metrics, a
    server dispatch fix, and an `EVAL_STEP_LIM_OFFSET` env var that extends each
-   task's step limit by the flashvla cold-start length, e.g. 40).
+   task's step limit by the FlashVLA cold-start length; the reported 4-slot,
+   chunk-20 setting uses an offset of 60).
 3. `pip install -e /path/to/flashvla` in the flashvla env.
 
 ## Run
@@ -48,16 +49,16 @@ Two terminals in two envs, from `$ROBOTWIN/policy/pi05_flashvla/`:
 
 ```bash
 # terminal 1 — flashvla env (policy server)
-bash eval_server.sh
+bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 20 true
 
 # terminal 2 — RoboTwin env (SAPIEN sim)
-EVAL_STEP_LIM_OFFSET=40 ROBOTWIN_VENV=/path/to/robotwin_venv \
+EVAL_STEP_LIM_OFFSET=60 ROBOTWIN_VENV=/path/to/robotwin_venv \
   bash eval_client.sh beat_block_hammer demo_clean
 ```
 
 `eval_server.sh` defaults to the released `z-lab/flashvla-pi05-robotwin` and sync
 inference; for the async overlap used in the paper, pass overlap + compile
-(`bash eval_server.sh <ckpt> 9999 0 current_state 1 5 true`). `cold_start_mode=current_state`
+(`bash eval_server.sh <ckpt> 9999 0 current_state 1 20 true`). `cold_start_mode=current_state`
 is required (RoboTwin is absolute-qpos — a zero action would crash the arm).
 Results land in `$ROBOTWIN/eval_result/<task>/pi05_flashvla/...`.
 
