@@ -86,12 +86,6 @@ class FlashVLATrainConfig(TrainPipelineConfig):
     checkpoint_keep_every_n_steps: int = 0
 
     def validate(self) -> None:
-        if getattr(self.policy, "gradient_checkpointing", False):
-            raise ValueError(
-                "gradient_checkpointing is not supported by the current FlashVLA "
-                "trainer because the previous implementation produced incorrect "
-                "gradients. Set it to false for training."
-            )
         if self.flashvla_init.mode not in {"default", "ae-norm-zero"}:
             raise ValueError(
                 "flashvla_init.mode must be 'default' or 'ae-norm-zero', got "

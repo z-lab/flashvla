@@ -95,8 +95,9 @@ class LingBotConfig(PreTrainedConfig):
     train_expert_only: bool = False
     train_state_proj: bool = True
     loss_type: str = "L1_fm"              # "fm" (MSE) or "L1_fm" (L1)
-    # Compatibility field for configs written by the earlier LingBot branch.
-    # The current trainer deliberately has no activation-checkpointing path.
+    # Legacy compatibility field. Earlier checkpoints may serialize this as True.
+    # It is accepted and ignored; the current model does not enable activation
+    # checkpointing from this flag.
     gradient_checkpointing: bool = False
     compile_model: bool = False
     compile_mode: str = "max-autotune"

@@ -109,9 +109,9 @@ class PI0Config(PreTrainedConfig):
         }
     )
 
-    # Removed feature, kept only so that configs written by earlier versions still
-    # parse (draccus rejects unknown keys). PI0 never had an implementation behind
-    # it -- setting it True was always a silent no-op. See __post_init__.
+    # Legacy compatibility field. Earlier checkpoints may serialize this as True.
+    # It is accepted and ignored; the current model does not enable activation
+    # checkpointing from this flag.
     gradient_checkpointing: bool = False
     compile_model: bool = False
     compile_mode: str = "max-autotune"
@@ -152,12 +152,6 @@ class PI0Config(PreTrainedConfig):
 
         if self.dtype not in ["bfloat16", "float32"]:
             raise ValueError(f"Invalid dtype: {self.dtype}")
-        if self.gradient_checkpointing:
-            raise ValueError(
-                "gradient_checkpointing was removed; PI0 never had an "
-                "implementation behind it, so setting it was a silent no-op."
-            )
-
     def validate_features(self) -> None:
         """Validate and set up input/output features."""
         for i in range(self.empty_cameras):
