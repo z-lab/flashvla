@@ -388,7 +388,6 @@ def main(usr_args):
 
     print(f"Data has been saved to {file_path}")
     print(f"Metrics saved to {metrics_path}")
-    # return task_reward
 
 
 def eval_policy(task_name,

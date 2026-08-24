@@ -29,6 +29,11 @@ execution:
   * During the streaming cold start (the first ``num_buffer_slots - 1``
     calls return ``None``), a hold-pose action is synthesized via
     :func:`flashvla.policies.pi05.utils.compute_cold_start_action`.
+  * With ``skip_stale_actions`` (RTC realignment), a chunk promoted at the
+    transition skips its first ``overlap_steps`` actions — they target control
+    steps the outgoing chunk already executed — and the window
+    ``[overlap_steps, overlap_steps + n_action_steps)`` of the full predicted
+    chunk is consumed instead.
 
 Async-overlap timeline (chunk_size = n_action_steps = 10, overlap_steps = 2)::
 
@@ -101,6 +106,11 @@ class AsyncStreamingActionManager:
                 the current chunk ends. ``0`` = sync (transition triggers a
                 blocking launch). Must satisfy
                 ``0 <= overlap_steps <= n_action_steps``.
+            skip_stale_actions: RTC realignment. On promotion, skip the
+                ``overlap_steps`` actions the outgoing chunk already executed
+                and consume ``[overlap_steps, overlap_steps + n_action_steps)``
+                of the full predicted chunk. Requires
+                ``overlap_steps + n_action_steps <= chunk_size``.
         """
         self.policy = policy
         self.n_action_steps = policy.config.n_action_steps
