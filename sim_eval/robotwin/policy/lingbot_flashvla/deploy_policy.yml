@@ -19,10 +19,8 @@ device: cuda
 # predict_action_chunk non-blocking. Should be <= n_action_steps.
 inference_overlap_steps: 0
 
-# Optional: override the checkpoint's n_action_steps without retraining.
-# Leave null to keep what's saved in config.json (10 for the released
-# RoboTwin checkpoint).
-n_action_steps: null
+# Match the 16-action execution horizon used for RoboTwin evaluation.
+n_action_steps: 16
 
 # Optional: override compile_model / compile_mode from config.json.
 compile_model: null

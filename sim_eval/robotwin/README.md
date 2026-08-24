@@ -40,7 +40,7 @@ robotwin_multitask:
    `overlay/` holds small patches over upstream RoboTwin (async client metrics, a
    server dispatch fix, and an `EVAL_STEP_LIM_OFFSET` env var that extends each
    task's step limit by the FlashVLA cold-start length; the reported 4-slot,
-   chunk-20 setting uses an offset of 60).
+   16-action execution setting uses an offset of 48).
 3. `pip install -e /path/to/flashvla` in the flashvla env.
 
 ## Run
@@ -49,16 +49,16 @@ Two terminals in two envs, from `$ROBOTWIN/policy/pi05_flashvla/`:
 
 ```bash
 # terminal 1 — flashvla env (policy server)
-bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 20 true
+bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 16 true
 
 # terminal 2 — RoboTwin env (SAPIEN sim)
-EVAL_STEP_LIM_OFFSET=60 ROBOTWIN_VENV=/path/to/robotwin_venv \
+EVAL_STEP_LIM_OFFSET=48 ROBOTWIN_VENV=/path/to/robotwin_venv \
   bash eval_client.sh beat_block_hammer demo_clean
 ```
 
 `eval_server.sh` defaults to the released `z-lab/flashvla-pi05-robotwin` and sync
 inference; for the async overlap used in the paper, pass overlap + compile
-(`bash eval_server.sh <ckpt> 9999 0 current_state 1 20 true`). `cold_start_mode=current_state`
+(`bash eval_server.sh <ckpt> 9999 0 current_state 1 16 true`). `cold_start_mode=current_state`
 is required (RoboTwin is absolute-qpos — a zero action would crash the arm).
 Results land in `$ROBOTWIN/eval_result/<task>/pi05_flashvla/...`.
 
@@ -71,7 +71,7 @@ Use the same two-terminal flow from `$ROBOTWIN/policy/lingbot_flashvla/`:
 bash eval_server.sh /path/to/lingbot_flashvla_checkpoint
 
 # terminal 2 — RoboTwin env
-EVAL_STEP_LIM_OFFSET=30 ROBOTWIN_VENV=/path/to/robotwin_venv \
+EVAL_STEP_LIM_OFFSET=48 ROBOTWIN_VENV=/path/to/robotwin_venv \
   bash eval_client.sh beat_block_hammer demo_clean
 ```
 
@@ -80,9 +80,9 @@ local exported checkpoint or an accessible Hugging Face model repo. Set
 `TOKENIZER_PATH` when the checkpoint's saved Qwen repository path needs to be
 overridden.
 
-The default LingBot streaming recipe uses four buffer slots and executes ten
+The default LingBot streaming recipe uses four buffer slots and executes 16
 actions per call, so its padded cold start holds the current qpos for
-`(4 - 1) × 10 = 30` simulator steps. Its `tokenizer_path` must point to a full
+`(4 - 1) × 16 = 48` simulator steps. Its `tokenizer_path` must point to a full
 Qwen2.5-VL-3B-Instruct repository because the policy reads both tokenizer and
 backbone configuration there. The adapter accepts raw 14-dimensional ALOHA
 qpos and performs LingBot's sparse 75-dimensional typed-joint mapping inside

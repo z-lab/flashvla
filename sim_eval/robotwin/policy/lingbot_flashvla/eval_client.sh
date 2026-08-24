@@ -29,12 +29,12 @@ export CUDA_VISIBLE_DEVICES=${gpu_id}
 export MUJOCO_GL=${MUJOCO_GL:-egl}
 export __EGL_VENDOR_LIBRARY_FILENAMES=${__EGL_VENDOR_LIBRARY_FILENAMES:-/usr/share/glvnd/egl_vendor.d/10_nvidia.json}
 # FlashVLA holds the current qpos for the first (num_buffer_slots - 1)
-# observations while the denoising buffer fills. The released LingBot RoboTwin
-# checkpoint uses num_buffer_slots=4 and n_action_steps=10, so 3 x 10 = 30
+# observations while the denoising buffer fills. RoboTwin evaluation uses
+# num_buffer_slots=4 and n_action_steps=16, so 3 x 16 = 48
 # stationary steps; extend each task's step budget by that much so the cold
 # start does not eat into the task horizon.
 buffer_slots=${BUFFER_SLOTS:-4}
-executed_steps=${N_ACTION_STEPS:-10}
+executed_steps=${N_ACTION_STEPS:-16}
 export EVAL_STEP_LIM_OFFSET=${EVAL_STEP_LIM_OFFSET:-$(((buffer_slots - 1) * executed_steps))}
 
 echo -e "\033[33mgpu id: ${gpu_id}, port: ${port}, seed: ${seed}\033[0m"

@@ -28,9 +28,9 @@ inference_overlap_steps: 0
 # inference_overlap_steps + n_action_steps <= chunk_size.
 skip_stale_actions: false
 
-# Match the 20-action execution horizon used for both pi0.5 and FlashVLA in
+# Match the 16-action execution horizon used for both pi0.5 and FlashVLA in
 # the reported RoboTwin 2.0 50-task evaluation.
-n_action_steps: 20
+n_action_steps: 16
 
 # Optional: override compile_model. Recommended for async runs because
 # torch.compile + CUDA graphs are what make predict_action_chunk non-blocking.

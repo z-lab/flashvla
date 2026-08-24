@@ -13,8 +13,8 @@
 #   # Sync (default)
 #   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0
 #
-#   # Async overlap=1 with compile + n_action_steps=20
-#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 20 true
+#   # Async overlap=1 with compile + n_action_steps=16
+#   bash eval_server.sh /path/to/flashvla_robotwin_ckpt 9999 0 current_state 1 16 true
 #
 # Prerequisites (one-time setup in the flashvla env):
 #   conda activate flashvla   # the env where `pip install -e flashvla` was run
@@ -36,7 +36,7 @@ echo -e "\033[33mgpu id: ${gpu_id}, port: ${port}\033[0m"
 echo -e "\033[33mpolicy_path: ${policy_path}\033[0m"
 echo -e "\033[33mcold_start_mode: ${cold_start_mode}\033[0m"
 echo -e "\033[33minference_overlap_steps: ${inference_overlap_steps}\033[0m"
-echo -e "\033[33mn_action_steps: ${n_action_steps:-(use deploy config: 20)}\033[0m"
+echo -e "\033[33mn_action_steps: ${n_action_steps:-(use deploy config: 16)}\033[0m"
 echo -e "\033[33mcompile_model: ${compile_model:-(use ckpt default)}\033[0m"
 echo -e "\033[33mskip_stale_actions: ${skip_stale_actions:-false}\033[0m"
 

@@ -6,7 +6,7 @@ policy:
   device: cuda
   state_cond: false
   chunk_size: 50
-  n_action_steps: 50
+  n_action_steps: 16
   freeze_vision_encoder: false
   normalization_mapping:
     VISUAL: IDENTITY

@@ -70,8 +70,8 @@ Success rate (%) + per-step latency (averaged over 2,000 episodes):
 The 50-task models are jointly trained on the union of clean and randomized
 data from all tasks. Both π0.5 and FlashVLA use a global batch size of
 256, a learning rate of `5e-5` with cosine decay, and 100K optimization steps
-(about 4.5 epochs). Evaluation uses a matched 20-action execution horizon:
-π0.5 replans after executing the first 20 actions of its 50-action output.
+(about 4.5 epochs). Evaluation uses a matched 16-action execution horizon:
+π0.5 replans after executing the first 16 actions of its 50-action output.
 
 ### Cross-Architecture Generalization
 

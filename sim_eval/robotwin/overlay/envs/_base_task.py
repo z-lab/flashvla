@@ -150,8 +150,9 @@ class Base_Task(gym.Env):
                     self.step_lim = 1000
             # Optional offset to compensate for policies that waste initial
             # steps on cold-start padding (e.g. FlashVLA: N-1 chunks
-            # x chunk_size stationary actions). The reported 4-slot, chunk-20
-            # setting uses EVAL_STEP_LIM_OFFSET=60. Baseline pi05 doesn't need it.
+            # x n_action_steps stationary actions). The reported 4-slot,
+            # 16-action setting uses EVAL_STEP_LIM_OFFSET=48. Baseline pi05
+            # doesn't need it.
             try:
                 offset = int(os.environ.get("EVAL_STEP_LIM_OFFSET", "0"))
             except ValueError:

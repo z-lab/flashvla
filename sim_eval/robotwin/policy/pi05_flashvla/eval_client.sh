@@ -11,7 +11,7 @@
 #
 # Example:
 #   # Terminal 1 (flashvla conda env):
-#   bash eval_server.sh /path/to/<robotwin_ckpt> 9999 0 current_state 1 20 true
+#   bash eval_server.sh /path/to/<robotwin_ckpt> 9999 0 current_state 1 16 true
 #
 #   # Terminal 2 (anywhere — script picks the venv explicitly):
 #   bash eval_client.sh beat_block_hammer demo_clean 9999 0 1

@@ -10,7 +10,7 @@ policy:
 
   num_buffer_slots: 4
   chunk_size: 20
-  n_action_steps: 10
+  n_action_steps: 16
   # Sample one flow time per buffer slot, matching the RoboTwin PI0.5 recipe.
   timestep_sample_mode: per-chunk
   cold_start_mode: current_state
