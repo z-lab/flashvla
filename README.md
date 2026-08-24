@@ -57,12 +57,16 @@ Success rate (%) + per-step latency (averaged over 2,000 episodes):
 
 ### RoboTwin 2.0
 
-50-task multitask success rate (%):
+50-task multitask success rate (%) and end-to-end time per step:
 
-| Method | Clean | Random | Avg |
-|:--|:--:|:--:|:--:|
-| π0.5 | 86.1 | 85.8 | 86.0 |
-| **+ FlashVLA** (`d=0`) | **90.8** | **90.2** | **90.5** (↑4.5) |
+| Method | Clean | Random | Avg | Time/Step (ms) |
+|:--|:--:|:--:|:--:|:--:|
+| π0.5 | 86.1 | 85.8 | 86.0 | 47.4 |
+| **+ FlashVLA** (`d=0`) | **90.8** | **90.2** | **90.5** (↑4.5) | – |
+| **+ FlashVLA** (`d=1`) | **91.2** | **89.9** | **90.6** (↑4.6) | **43.8** (1.08×) |
+| **+ FlashVLA** (`d=2`) | **91.0** | **90.2** | **90.6** (↑4.6) | **43.5** (1.09×) |
+| **+ FlashVLA** (`d=3`) | **90.8** | **90.0** | **90.4** (↑4.4) | **43.3** (1.09×) |
+| **+ FlashVLA** (`d=4`) | **90.1** | **89.6** | **89.8** (↑3.8) | **42.9** (1.10×) |
 
 The 50-task models are jointly trained on the union of clean and randomized
 data from all tasks. Both π0.5 and FlashVLA use a global batch size of
