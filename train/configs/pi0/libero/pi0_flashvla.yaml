@@ -13,12 +13,10 @@ policy:
     ACTION: MEAN_STD
 
 
-# Dataset configuration
 dataset:
   repo_id: HuggingfaceVLA/libero
   video_backend: torchcodec
 
-# Training parameters
 output_dir: pi0_flashvla_libero
 job_name: pi0_flashvla_libero
 batch_size: 16
@@ -27,11 +25,9 @@ steps: 50000
 num_workers: 4
 seed: 1000
 
-# Use DistributedDataParallel for multi-GPU training.
 fsdp:
   enable: false
 
-# Optimizer configuration
 use_policy_training_preset: false
 optimizer:
   type: adamw
@@ -39,7 +35,6 @@ optimizer:
   betas: [0.9, 0.95]
   weight_decay: 1.0e-10
 
-# Learning rate scheduler
 scheduler:
   type: cosine_decay_with_warmup
   num_warmup_steps: 1000
@@ -47,11 +42,9 @@ scheduler:
   decay_lr: 2.5e-6
   num_decay_steps: 50000
 
-# Checkpointing
 save_checkpoint: true
 save_freq: 10000
 
-# Logging
 log_freq: 50
 wandb:
   enable: true

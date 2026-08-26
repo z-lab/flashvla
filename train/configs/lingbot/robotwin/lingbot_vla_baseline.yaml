@@ -1,7 +1,6 @@
 policy:
   type: lingbot
   pretrained_path: robbyant/lingbot-vla-4b
-  # LingBot reads both the Qwen architecture and tokenizer from this repo.
   tokenizer_path: Qwen/Qwen2.5-VL-3B-Instruct
   push_to_hub: false
   dtype: bfloat16

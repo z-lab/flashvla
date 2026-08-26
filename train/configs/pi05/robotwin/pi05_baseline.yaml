@@ -1,6 +1,6 @@
 policy:
   type: pi05
-  pretrained_path: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/models/lerobot/pi05_base
+  pretrained_path: lerobot/pi05_base
   push_to_hub: false
   dtype: bfloat16
   device: cuda
@@ -13,32 +13,26 @@ policy:
     STATE: QUANTILES
     ACTION: QUANTILES
 
-robotwin_multitask:
-  enable: true
-  root: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/data/RoboTwin2.0-lerobotv3.0
-  config_subdirs:
-    - aloha-agilex_clean_50
-    - aloha-agilex_randomized_500
-  tasks: []
-  stats_path: ""
-
 dataset:
-  repo_id: robotwin/multitask_clean_random
-  video_backend: torchcodec
+  repo_id: lerobot/robotwin_unified
+  video_backend: pyav
 
-output_dir: /lustre/fsw/portfolios/nvr/projects/nvr_elm_llm/users/zekail/runs/flashvla_robotwin/pi05_baseline_full_100k/output
-job_name: pi05_baseline_robotwin_full_fsdp2
-batch_size: 16
-grad_accum_steps: 2
+robotwin_multitask:
+  enable: false
+
+output_dir: outputs/train/pi05_baseline_unified_clean_random_fsdp_bf16_100k
+job_name: pi05-baseline-unified-clean-random-fsdp-bf16-100k
+batch_size: 8
+grad_accum_steps: 4
 steps: 100000
-num_workers: 8
+num_workers: 2
 seed: 1000
 
 fsdp:
   enable: true
   mixed_precision: bf16
   reduce_dtype: float32
-  reshard_after_forward: true
+  reshard_after_forward: false
   cpu_offload: false
   state_dict_type: SHARDED_STATE_DICT
   save_pretrained_max_shard_size: 50GB
@@ -48,19 +42,19 @@ optimizer:
   type: adamw
   lr: 5.0e-5
   betas: [0.9, 0.95]
-  weight_decay: 1.0e-2
+  weight_decay: 1.0e-10
   grad_clip_norm: 1.0
 
 scheduler:
   type: cosine_decay_with_warmup
   num_warmup_steps: 5000
   peak_lr: 5.0e-5
-  decay_lr: 2.5e-6
+  decay_lr: 2.5e-7
   num_decay_steps: 100000
 
 save_checkpoint: true
-save_freq: 500
-checkpoint_keep_last: 1
+save_freq: 1000
+checkpoint_keep_last: 5
 checkpoint_keep_every_n_steps: 0
 
 log_freq: 50
