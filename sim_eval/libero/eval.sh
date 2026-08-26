@@ -42,6 +42,14 @@ fi
 # FUSE=true/false.
 : "${FUSE:=$COMPILE_MODEL}"
 
+# Small-tensor CPU ops (observation preprocessing) pay a heavy OpenMP sync tax
+# when torch spawns one thread per core on many-core hosts (+8 ms/step measured
+# on a 48-thread box). Pinning 16 threads reproduces low-core-count latency.
+# Override with OMP_THREADS=<n>, or OMP_THREADS= to keep torch's default.
+: "${OMP_THREADS:=16}"
+if [ -n "$OMP_THREADS" ]; then
+  export OMP_NUM_THREADS="$OMP_THREADS" MKL_NUM_THREADS="$OMP_THREADS"
+fi
 
 RUN_ROOT="$OUTPUT_ROOT/ov${OVERLAP_STEPS}"
 mkdir -p "$RUN_ROOT"
