@@ -59,15 +59,6 @@ from lerobot.utils.utils import (
 
 from flashvla.async_manager import AsyncStreamingActionManager
 
-import libero_render_skip as _render_skip
-
-# LIBERO_LAZY_OBS=1: on open-loop steps (the manager replays a cached action)
-# skip both the camera sim.render inside env.step and the observation
-# preprocessing chain. Physics and success checks are untouched.
-_LAZY_OBS = os.environ.get("LIBERO_LAZY_OBS") == "1"
-if _LAZY_OBS:
-    _render_skip.enable_patch()
-
 
 @dataclass
 class AsyncEvalPipelineConfig(EvalPipelineConfig):
@@ -146,10 +137,6 @@ def rollout(
         skip_stale_actions=(os.environ.get("SKIP_STALE_ACTIONS") == "1"),
     )
     action_manager.reset()
-    # Lazy obs only when nothing else consumes per-step frames (videos need
-    # real renders; return_observations records the full preprocessed stream).
-    lazy_obs = _LAZY_OBS and render_callback is None and not return_observations
-    _render_skip.set_skip_render(False)
     observation, info = env.reset(seed=seeds)
     if render_callback is not None:
         render_callback(env)
@@ -174,30 +161,22 @@ def rollout(
     check_env_attributes_and_types(env)
     loop_start_t = time.perf_counter()
     while not np.all(done) and step < max_steps:
-        needs_obs = action_manager.needs_observation()
+        observation = preprocess_observation(observation)
+        if return_observations:
+            all_observations.append(deepcopy(observation))
+
+        observation = add_envs_task(env, observation)
+
+        observation = env_preprocessor(observation)
+
+        observation = preprocessor(observation)
+
         will_trigger_inference = (
             action_manager.chunk_index == 0 or action_manager._should_launch_next()
         )
-        if lazy_obs and not needs_obs:
-            # Open-loop step: replay a cached action; the (render-skipped, hence
-            # stale) observation is neither preprocessed nor consumed.
-            _t0 = time.perf_counter()
-            action = action_manager.pop_cached_action()
-            step_latencies_ms.append((time.perf_counter() - _t0) * 1000.0)
-        else:
-            observation = preprocess_observation(observation)
-            if return_observations:
-                all_observations.append(deepcopy(observation))
-
-            observation = add_envs_task(env, observation)
-
-            observation = env_preprocessor(observation)
-
-            observation = preprocessor(observation)
-
-            _t0 = time.perf_counter()
-            action = action_manager.act(observation)
-            step_latencies_ms.append((time.perf_counter() - _t0) * 1000.0)
+        _t0 = time.perf_counter()
+        action = action_manager.act(observation)
+        step_latencies_ms.append((time.perf_counter() - _t0) * 1000.0)
         step_is_transition.append(will_trigger_inference)
 
         action = postprocessor(action)
@@ -209,10 +188,6 @@ def rollout(
         action_numpy: np.ndarray = action.to("cpu").numpy()
         assert action_numpy.ndim == 2, "Action dimensions should be (batch, action_dim)"
 
-        if lazy_obs:
-            # Queried after act/pop advanced the manager: skip the camera render
-            # in the upcoming env.step iff the next step replays a cached action.
-            _render_skip.set_skip_render(not action_manager.needs_observation())
         observation, reward, terminated, truncated, info = env.step(action_numpy)
         if render_callback is not None:
             render_callback(env)
