@@ -77,9 +77,9 @@ data from all tasks. Both π0.5 and FlashVLA use a global batch size of
 
 | Backbone | Method | Avg SR (%) | Time/Step (ms) | Inference Latency (ms) |
 |:--|:--|:--:|:--:|:--:|
-| SmolVLA | Baseline | 80.1 | 44.2 | 19.7 |
-| SmolVLA | **+ FlashVLA** (`d=0`) | **80.4** (↑0.3) | **27.2** (1.63×) | **10.1** (1.95×) |
-| SmolVLA | **+ FlashVLA** (`d=1`) | 79.5 (↓0.6) | **24.7** (1.79×) | – |
+| SmolVLA | Baseline | 80.1 | 41.2 | 19.7 |
+| SmolVLA | **+ FlashVLA** (`d=0`) | **80.1** (↑0.0) | **29.7** (1.39×) | **10.1** (1.95×) |
+| SmolVLA | **+ FlashVLA** (`d=1`) | 79.5 (↓0.6) | **28.7** (1.44×) | – |
 | LingBot-VLA | Baseline | 85.8 | 46.7 | 70.6 |
 | LingBot-VLA | **+ FlashVLA** (`d=0`) | **88.6** (↑2.8) | **43.5** (1.07×) | **25.1** (2.81×) |
 | LingBot-VLA | **+ FlashVLA** (`d=1`) | **89.3** (↑3.5) | **40.5** (1.15×) | – |
