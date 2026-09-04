@@ -7,8 +7,12 @@ FlashVLA-specific pieces live here — RoboTwin itself is not vendored.
 
 ## Building the training dataset
 
-Downloads RoboTwin 2.0 and converts it into the LeRobot v3 layout FlashVLA trains
-on. Runs in the `flashvla` env (no GPU, no sim), idempotent and resumable:
+For full 50-task training, the provided configs use
+[`lerobot/robotwin_unified`](https://huggingface.co/datasets/lerobot/robotwin_unified)
+directly, so no local dataset build is required. To train on a specific task or
+configuration subset, use the pipeline below to download RoboTwin 2.0 and
+convert the selected data into the LeRobot v3 layout. It runs in the `flashvla`
+env (no GPU or simulator required) and is idempotent and resumable:
 
 ```bash
 bash robotwin_pipeline/run_pipeline.sh /path/to/data_dir

@@ -108,9 +108,7 @@ the same CUDA Graph and kernel-fusion optimizations.
 bash train/train.sh train/configs/pi05/libero/pi05_flashvla.yaml
 ```
 
-**RoboTwin** — first build the LeRobot-format training dataset
-(see [Building the training dataset](sim_eval/robotwin/README.md#building-the-training-dataset)),
-then:
+**RoboTwin:**
 
 ```bash
 bash train/train.sh train/configs/pi05/robotwin/pi05_flashvla.yaml
