@@ -29,6 +29,15 @@ def _module_name_by_id(root: nn.Module) -> dict[int, str]:
     return names
 
 
+def _parameter_aliases(model: nn.Module) -> dict[int, list[str]]:
+    """Map ``id(parameter)`` to every state_dict name it is registered under, in
+    registration order."""
+    aliases: dict[int, list[str]] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        aliases.setdefault(id(parameter), []).append(name)
+    return aliases
+
+
 def restore_untied_lm_head_embeddings(
     instance: nn.Module,
     mapped_sd: dict[str, Tensor],
@@ -41,9 +50,10 @@ def restore_untied_lm_head_embeddings(
     tensor object, copies the head weight into the embedding entry when the
     checkpoint supplied the head but not the embedding.
 
-    The ``embedding_key not in mapped_sd`` guard makes this a no-op for
-    checkpoints that already carry the embedding explicitly -- in particular
-    FlashVLA's own exports, so resume is unaffected.
+    The guard checks every name the embedding is registered under (e.g. the
+    prefix embedder's ``lang_embedder`` view, which safetensors' storage dedup
+    may have kept instead of ``embed_tokens``), so a checkpoint that already
+    carries the embedding under any alias is left alone.
 
     Args:
         instance: The freshly constructed policy, before ``load_state_dict``.
@@ -54,6 +64,7 @@ def restore_untied_lm_head_embeddings(
         The embedding keys that were filled in, for logging.
     """
     module_names = _module_name_by_id(instance)
+    aliases = _parameter_aliases(instance)
     restored: list[str] = []
 
     for name, module in instance.named_modules():
@@ -85,7 +96,10 @@ def restore_untied_lm_head_embeddings(
         head_key = f"{head_name}.weight"
         embedding_key = f"{embedding_name}.weight"
 
-        if head_key not in mapped_sd or embedding_key in mapped_sd:
+        embedding_present = any(
+            alias in mapped_sd for alias in aliases.get(id(embedding_weight), [embedding_key])
+        )
+        if head_key not in mapped_sd or embedding_present:
             continue
         if embedding_key not in target_sd:
             continue
@@ -179,6 +193,31 @@ def assert_checkpoint_covers_parameters(
     )
 
 
+def collapse_shared_parameter_aliases(
+    model: nn.Module, state: dict[str, Tensor]
+) -> list[str]:
+    """Keep one checkpoint entry per shared parameter and return the dropped names.
+
+    A parameter registered under several names (tied lm_head/embed_tokens, the
+    prefix embedder's view of the VLM embedding, joint layers aliasing backbone
+    layers) is one tensor in the model. A non-FSDP save writes it once, but an
+    FSDP2 full-state export gathers every name separately, so all aliases reach
+    the file, and a dormant alias may hold a stale value. Loading several names
+    onto one parameter would let module order pick the winner; keeping a single
+    name makes exactly one ``copy_`` decide. Preference: the first-registered
+    non-``lm_head`` name (the embedding the FSDP plan wraps and trains), with a
+    dormant ``lm_head`` used only when it is the sole name the file carries.
+    """
+    dropped: list[str] = []
+    for names in _parameter_aliases(model).values():
+        present = [name for name in names if name in state]
+        present.sort(key=lambda name: name.endswith("lm_head.weight"))
+        for name in present[1:]:
+            del state[name]
+            dropped.append(name)
+    return dropped
+
+
 # Prefix rewrites turning a raw lerobot/openpi pi0.5 checkpoint (paligemma_with_expert.*
 # namespace, bare openpi suffix-net keys) into this repo's model.* namespace. Shared by
 # the eager (PI05Policy) and streaming (PI05FlashVLAPolicy) loaders.
@@ -211,40 +250,23 @@ def load_remapped_checkpoint(
     *,
     allow_fresh: Iterable[str] = (),
     expected_unexpected: Iterable[str] = (),
-    native_load_model: bool = False,
-    raw_marker: str = "paligemma_with_expert.",
     device: str = "cpu",
     source: str | None = None,
 ) -> None:
     """Fill ``model`` from a single-file safetensors checkpoint.
 
-    Two layouts are handled, selected by a header sniff for ``raw_marker``:
-
-    * NATIVE — keys already in this policy's ``model.*`` namespace. When
-      ``native_load_model`` is set, delegate to ``safetensors.torch.load_model``,
-      whose storage-based ``_remove_duplicate_names(preferred_names=file_keys)``
-      reconcile IS an identity coverage check: a weight saved under EITHER of its
-      alias names is accepted, and any genuinely missing/unexpected tensor raises.
-      It requires the model's alias tree and tied embeddings to be LIVE, so callers
-      must invoke this BEFORE any weight fusion / alias detach.
-    * RAW — a foreign openpi base whose keys need prefix-remapping. Apply
-      ``rename_rules`` (first match wins, identity fall-through), drop
-      shape-mismatched targets, restore tied embeddings the file dropped, load
-      non-strict, treat unexpected keys (minus ``expected_unexpected``) as fatal,
-      then assert full coverage (``allow_fresh`` names may stay at init).
-
-    The check is always strict regardless of any caller ``strict`` flag: a native
-    load_model raises on gaps, and the raw branch asserts full coverage.
+    One path serves every layout. Keys are prefix-remapped with ``rename_rules``
+    (first match wins, identity fall-through), so a raw openpi base lands in
+    this policy's ``model.*`` namespace and a native export passes through
+    unchanged. Shape-mismatched targets are dropped, tied embeddings the file
+    omitted are restored from their lm_head, and alias names of one shared
+    parameter are collapsed to a single entry. The load is then non-strict,
+    unexpected keys (minus ``expected_unexpected``) are fatal, and every
+    parameter must be covered by identity (``allow_fresh`` names may stay at
+    init). Callers must invoke this while the model's alias tree and tied
+    embeddings are still LIVE, i.e. before any weight fusion / alias detach.
     """
-    from safetensors import safe_open
-    from safetensors.torch import load_file, load_model
-
-    with safe_open(model_file, framework="pt") as f:
-        is_raw = any(k.startswith(raw_marker) for k in f.keys())
-
-    if native_load_model and not is_raw:
-        load_model(model, model_file, strict=True, device=device)
-        return
+    from safetensors.torch import load_file
 
     rules = list(rename_rules)
 
@@ -257,11 +279,22 @@ def load_remapped_checkpoint(
     original_sd = load_file(model_file, device=device)
     target_sd = model.state_dict()
     mapped_sd: dict[str, Tensor] = {}
+    shape_mismatched: list[str] = []
     for old_key, value in original_sd.items():
         new_key = map_key(old_key)
         if new_key in target_sd and target_sd[new_key].shape != value.shape:
+            shape_mismatched.append(
+                f"{new_key} file{tuple(value.shape)} vs model{tuple(target_sd[new_key].shape)}"
+            )
             continue
         mapped_sd[new_key] = value
+    if shape_mismatched:
+        logging.warning(
+            "Dropped %d shape-mismatched tensor(s); the coverage check below reports "
+            "them if nothing else fills those parameters: %s",
+            len(shape_mismatched),
+            ", ".join(shape_mismatched),
+        )
 
     restored = restore_untied_lm_head_embeddings(model, mapped_sd, target_sd)
     if restored:
@@ -269,6 +302,14 @@ def load_remapped_checkpoint(
             "Restored %d tied input embedding(s) from their lm_head: %s",
             len(restored),
             ", ".join(restored),
+        )
+
+    dropped = collapse_shared_parameter_aliases(model, mapped_sd)
+    if dropped:
+        logging.info(
+            "Dropped %d alias tensor(s) of shared parameters: %s",
+            len(dropped),
+            ", ".join(dropped),
         )
 
     incompatible = model.load_state_dict(mapped_sd, strict=False)
@@ -288,4 +329,5 @@ __all__ = [
     "assert_checkpoint_covers_parameters",
     "find_unfilled_parameters",
     "restore_untied_lm_head_embeddings",
+    "collapse_shared_parameter_aliases",
 ]

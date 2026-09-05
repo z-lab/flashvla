@@ -1178,9 +1178,7 @@ class PI05Policy(PreTrainedPolicy):
         full coverage; native ``model.*`` keys pass through the same path with an
         identity remap. qkv/mlp fusion runs here; the base does ``.to`` / ``.eval``.
         """
-        load_remapped_checkpoint(
-            model, model_file, PI05_RENAME_RULES, native_load_model=False
-        )
+        load_remapped_checkpoint(model, model_file, PI05_RENAME_RULES)
 
         if getattr(model.config, "fuse_qkv", True):
             model.model.init_qkv_fusion_from_existing()
