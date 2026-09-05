@@ -1188,15 +1188,13 @@ class PI05FlashVLAPolicy(PreTrainedPolicy):
 
         Overrides lerobot's supported hook (called by the base ``from_pretrained``
         after it resolves the config + downloads/locates the file and builds the
-        instance). The shared loader handles both a native flashvla checkpoint
-        (safetensors.load_model) and a raw openpi base (prefix-remap). Weight-
+        instance). The shared loader remaps a raw openpi base, collapses alias
+        names of shared parameters, and asserts full coverage. Weight-
         dependent post-load — RMSNorm swap, qkv/mlp fusion, backbone-alias detach,
         cold-start stats — runs here while the aliases are still live; the base
         does ``.to(device)`` / ``.eval()`` afterwards.
         """
-        load_remapped_checkpoint(
-            model, model_file, PI05_RENAME_RULES, native_load_model=True
-        )
+        load_remapped_checkpoint(model, model_file, PI05_RENAME_RULES)
 
         from flashvla.policies.pi05.patches import FlashVLARMSNorm as PatchedGemmaRMSNorm
         from lerobot.policies.pi_gemma import PiGemmaRMSNorm as OriginalGemmaRMSNorm
