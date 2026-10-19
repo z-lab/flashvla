@@ -32,8 +32,8 @@ uses a server (flashvla env) / client (RoboTwin env) split. After the one-time s
 [`sim_eval/robotwin/`](sim_eval/robotwin/), from `$ROBOTWIN/policy/pi05_flashvla/`:
 
 ```bash
-bash eval_server.sh                 # terminal 1 — flashvla env (starts the policy server)
-ROBOTWIN_VENV=... bash eval_client.sh   # terminal 2 — RoboTwin env (runs the SAPIEN sim)
+bash eval_server.sh z-lab/flashvla-pi05-robotwin 9999 0 current_state 1 16 true  # terminal 1
+EVAL_STEP_LIM_OFFSET=48 ROBOTWIN_VENV=... bash eval_client.sh beat_block_hammer demo_clean  # terminal 2
 ```
 
 See [`sim_eval/libero/`](sim_eval/libero/) and [`sim_eval/robotwin/`](sim_eval/robotwin/)
@@ -43,11 +43,18 @@ for setup and full options (single run, multi-seed sweeps, and the RoboTwin serv
 
 π0.5 vs. **+ FlashVLA** (**bold** = the better result). `d` denotes how many
 steps before the current chunk ends the next inference is launched: `d=0` is
-synchronous, while `d≥1` overlaps inference with robot execution.
+synchronous, while `d≥1` overlaps inference with robot execution. The reported
+π0.5 evaluations execute 5 actions per segment on LIBERO and 16 on RoboTwin.
+
+`Time/Step` is mean episode wall time divided by mean executed low-level
+steps, including rendering and (for RoboTwin) client-server communication.
+Inference latency measures one policy invocation after warm-up; it is not
+Time/Step. The reported up-to-20× gain applies only to the action-decoding
+stage in the profiling experiment.
 
 ### LIBERO
 
-Success rate (%) + per-step latency (averaged over 2,000 episodes):
+Success rate (%) and Time/Step (2,000 episodes per run, averaged over five runs):
 
 | Method | Spatial | Object | Goal | Long | Avg | Time/Step (ms) |
 |:--|:--:|:--:|:--:|:--:|:--:|:--:|
@@ -74,15 +81,17 @@ Success rate (%) + per-step latency (averaged over 2,000 episodes):
 | SmolVLA | Baseline | 80.1 | 41.2 | 19.7 |
 | SmolVLA | **+ FlashVLA** (`d=0`) | **80.1** (↑0.0) | **29.7** (1.39×) | **10.1** (1.95×) |
 | SmolVLA | **+ FlashVLA** (`d=1`) | 79.5 (↓0.6) | **28.7** (1.44×) | – |
-| LingBot-VLA | Baseline | 85.8 | 46.7 | 70.6 |
-| LingBot-VLA | **+ FlashVLA** (`d=0`) | **88.6** (↑2.8) | **43.5** (1.07×) | **25.1** (2.81×) |
-| LingBot-VLA | **+ FlashVLA** (`d=1`) | **89.3** (↑3.5) | **40.5** (1.15×) | – |
+| LingBot-VLA | Baseline | 85.2 | 56.7 | 70.6 |
+| LingBot-VLA | **+ FlashVLA** (`d=0`) | **88.6** (↑3.4) | **49.5** (1.15×) | **25.1** (2.81×) |
+| LingBot-VLA | **+ FlashVLA** (`d=1`) | **89.3** (↑4.1) | **46.6** (1.22×) | – |
 
-Inference latency is independent of `d` and is reported once at `d=0`.
+Inference latency is measured separately from the overlap schedule and is reported
+once at `d=0`. SmolVLA preserves synchronous success and loses 0.6 points at
+`d=1`; LingBot-VLA improves success in both modes.
 
 ## Latency Benchmark
 
-Per-action inference latency is measured with `benchmarks/benchmark_latency.py`:
+Per-policy-invocation inference latency is measured with `benchmarks/benchmark_latency.py`:
 
 ```bash
 python benchmarks/benchmark_latency.py --config_path=benchmarks/configs/latency_flashvla.yaml
