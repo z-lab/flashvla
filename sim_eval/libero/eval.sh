@@ -18,7 +18,7 @@ fi
 : "${OUTPUT_ROOT:=/tmp/libero_eval}"
 : "${SUITES:=libero_spatial libero_object libero_goal libero_10}"
 : "${N_EPISODES:=50}"
-: "${N_ACTION_STEPS:=10}"
+: "${N_ACTION_STEPS:=5}"
 : "${GPUS:=1}"
 # EPISODE_LENGTH: optional override for env.episode_length. Default unset
 # → uses lerobot's TASK_SUITE_MAX_STEPS (280/280/300/520 for spatial/object/

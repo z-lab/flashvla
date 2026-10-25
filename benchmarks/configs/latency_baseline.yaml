@@ -12,7 +12,7 @@ policy:
 
   pretrained_path: lerobot/pi05_base
 
-  compile_model: false
+  compile_model: true
 
   fuse_qkv: true
   fuse_gate_up: true
