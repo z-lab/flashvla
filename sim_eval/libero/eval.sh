@@ -20,6 +20,8 @@ fi
 : "${N_EPISODES:=50}"
 : "${N_ACTION_STEPS:=5}"
 : "${GPUS:=1}"
+# DEVICE: torch device for the policy (cuda or xpu).
+: "${DEVICE:=cuda}"
 # EPISODE_LENGTH: optional override for env.episode_length. Default unset
 # → uses lerobot's TASK_SUITE_MAX_STEPS (280/280/300/520 for spatial/object/
 # goal/10). Set e.g. EPISODE_LENGTH=500 to give every suite the same cap.
@@ -78,6 +80,7 @@ echo "   suites:         $SUITES"
 echo "   seeds:          ${SEEDS[*]}"
 echo "   policy:         $POLICY_PATH"
 echo "   output:         $RUN_ROOT"
+echo "   device:         $DEVICE"
 echo "   GPUs:           ${GPU_ARR[*]}  (parallel = $N_GPUS)"
 echo "   started:        $(date)"
 echo "============================================================"
@@ -150,7 +153,7 @@ worker() {
       --policy.fuse_qkv="$FUSE" \
       --policy.fuse_gate_up="$FUSE" \
       --policy.n_action_steps="$N_ACTION_STEPS" \
-      --policy.device=cuda \
+      --policy.device="$DEVICE" \
       --env.type=libero \
       --env.task="$suite" \
       "${episode_length_arg[@]}" \

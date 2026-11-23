@@ -17,6 +17,31 @@ This installs the core FlashVLA env for training, benchmarking, and real-robot
 deployment. LIBERO and RoboTwin evaluation each need extra, simulator-specific
 setup — see their READMEs under [`sim_eval/`](sim_eval/).
 
+### Run on Intel GPU (XPU)
+
+Inference and the LIBERO evaluation also run on Intel GPUs through PyTorch's XPU
+backend. Use Python 3.12, as in `environment.yml`:
+
+```bash
+python3.12 -m venv .venv-xpu && source .venv-xpu/bin/activate
+pip install torch torchvision --index-url https://download.pytorch.org/whl/xpu
+pip install lerobot==0.5.1 --no-deps
+pip install -r requirements-xpu.txt
+pip install -e . --no-deps
+```
+
+LIBERO evaluation on XPU (synchronous, `d=0`):
+
+```bash
+pip install "hf-libero>=0.1.3,<0.2.0"
+export MUJOCO_GL=egl
+DEVICE=xpu bash sim_eval/libero/eval.sh 0
+```
+
+`DEVICE=xpu` passes `--policy.device=xpu` to `sim_eval/libero/eval.py`. For `d>=1`,
+`eval.sh` turns on `torch.compile` with CUDA graphs (`compile_model=true`), which is
+only tested on CUDA; on XPU set `COMPILE_MODEL=false`.
+
 ## Evaluation
 
 Evaluate the released FlashVLA pi0.5 checkpoints with async chunk-overlap inference.

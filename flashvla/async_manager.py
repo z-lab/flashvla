@@ -285,8 +285,8 @@ class AsyncStreamingActionManager:
         for _ in range(num_steps):
             with torch.inference_mode():
                 _ = self.policy.predict_action_chunk(processed_obs)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if self.device.type != "cpu":
+            torch.accelerator.synchronize(self.device)
         elapsed = time.perf_counter() - t0
 
         self.reset()

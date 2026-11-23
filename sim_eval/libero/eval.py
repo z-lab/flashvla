@@ -77,6 +77,8 @@ def get_safe_torch_device(device):
     """Get torch device, falling back to CPU if requested device unavailable."""
     if device in ("cuda", None) and torch.cuda.is_available():
         return torch.device("cuda")
+    if device in ("xpu", None) and hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.device("xpu")
     return torch.device("cpu")
 
 
