@@ -98,8 +98,8 @@ def _ev_elapsed_ms(start, end):
 
 
 @torch._dynamo.disable
-def _cuda_sync():
-    torch.cuda.synchronize()
+def _device_sync():
+    torch.accelerator.synchronize()
 
 
 def robotwin_raw_to_lingbot_layout(values: Tensor, config) -> Tensor:
@@ -2349,7 +2349,7 @@ class FlowMatching(nn.Module):
         dtype = state.dtype
 
         _evs = (
-            [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            [torch.Event(device=device, enable_timing=True) for _ in range(4)]
             if profile
             else None
         )
@@ -2417,7 +2417,7 @@ class FlowMatching(nn.Module):
             time += dt
         if profile:
             _ev_record(_evs[3])
-            _cuda_sync()
+            _device_sync()
             profile_results = {
                 "encode": _ev_elapsed_ms(_evs[0], _evs[1]),
                 "prefill": _ev_elapsed_ms(_evs[1], _evs[2]),

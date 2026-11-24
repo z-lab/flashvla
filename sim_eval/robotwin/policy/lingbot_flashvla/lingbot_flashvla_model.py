@@ -34,8 +34,12 @@ class LingBotFlashVLAModel:
         tokenizer_path: str | None = None,
     ) -> None:
         if device.startswith("cuda") and not torch.cuda.is_available():
-            print("[lingbot_flashvla] CUDA not available, falling back to CPU")
-            device = "cpu"
+            if hasattr(torch, "xpu") and torch.xpu.is_available():
+                print("[lingbot_flashvla] CUDA not available, using XPU")
+                device = "xpu"
+            else:
+                print("[lingbot_flashvla] CUDA not available, falling back to CPU")
+                device = "cpu"
         self.device = torch.device(device)
 
         cfg = PreTrainedConfig.from_pretrained(policy_path)

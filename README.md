@@ -30,17 +30,27 @@ pip install -r requirements-xpu.txt
 pip install -e . --no-deps
 ```
 
-LIBERO evaluation on XPU (synchronous, `d=0`):
+LIBERO evaluation on XPU:
 
 ```bash
 pip install "hf-libero>=0.1.3,<0.2.0"
 export MUJOCO_GL=egl
-DEVICE=xpu bash sim_eval/libero/eval.sh 0
+DEVICE=xpu bash sim_eval/libero/eval.sh 0   # d=0, synchronous
+DEVICE=xpu bash sim_eval/libero/eval.sh 1   # d=1, with torch.compile
 ```
 
-`DEVICE=xpu` passes `--policy.device=xpu` to `sim_eval/libero/eval.py`. For `d>=1`,
-`eval.sh` turns on `torch.compile` with CUDA graphs (`compile_model=true`), which is
-only tested on CUDA; on XPU set `COMPILE_MODEL=false`.
+`torch.compile` (`compile_model=true`, the `eval.sh` default for `d>=1`) builds Triton
+kernels for the Intel GPU, which needs the Level Zero development files
+(`sudo apt install libze-dev`). Inductor does not use CUDA graphs on XPU and says so in
+a warning. Set `COMPILE_MODEL=false` to run eager.
+
+The other entry points take the device the same way:
+
+```bash
+python benchmarks/benchmark_latency.py \
+    --config_path=benchmarks/configs/latency_flashvla.yaml --policy.device=xpu
+DEVICE=xpu bash eval_server.sh z-lab/flashvla-pi05-robotwin 9999 0   # RoboTwin model server
+```
 
 ## Evaluation
 
