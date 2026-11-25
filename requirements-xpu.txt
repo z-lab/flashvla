@@ -1,0 +1,26 @@
+# FlashVLA inference dependencies for Intel GPUs (XPU).
+# environment.yml pins CUDA builds, so this list leaves out torch, torchvision and
+# torchcodec (install torch and torchvision from the PyTorch XPU index instead) and
+# wandb (training only). lerobot pins torch<2.11 and is installed with --no-deps,
+# see "Run on Intel GPU (XPU)" in README.md.
+transformers==5.3.0
+accelerate>=1.13.0,<2.0.0
+huggingface-hub>=1.0,<2.0
+datasets>=4.0.0,<5.0.0
+diffusers>=0.27.2,<0.36.0
+draccus==0.10.0
+einops>=0.8.0,<0.9.0
+safetensors>=0.4.3,<1.0.0
+num2words>=0.5.14,<0.6.0
+scipy>=1.14.0,<2.0.0
+numpy>=2.0.0,<2.3.0
+packaging>=24.2,<26.0
+opencv-python-headless>=4.9.0,<4.14.0
+av>=15.0.0,<16.0.0
+imageio[ffmpeg]>=2.34.0,<3.0.0
+gymnasium>=1.1.1,<2.0.0
+jsonlines>=4.0.0,<5.0.0
+deepdiff>=7.0.1,<9.0.0
+termcolor>=2.4.0,<4.0.0
+pyserial>=3.5,<4.0
+h5py

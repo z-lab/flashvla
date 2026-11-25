@@ -298,8 +298,8 @@ def warmup_non_streaming(
             batch = prepare_batch_dataloader(batch, device, preprocessor=preprocessor)
             _ = policy.predict_action_chunk(batch)
 
-    if device.type == "cuda":
-        torch.cuda.synchronize()
+    if device.type in ("cuda", "xpu"):
+        torch.accelerator.synchronize(device)
     logger.info("Warmup complete")
 
 
@@ -348,8 +348,8 @@ def benchmark_non_streaming(
 
             batch = prepare_batch_dataloader(batch, device, preprocessor=preprocessor)
 
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            if device.type in ("cuda", "xpu"):
+                torch.accelerator.synchronize(device)
             start_time = perf_counter()
 
             if use_internal_breakdown:
@@ -358,8 +358,8 @@ def benchmark_non_streaming(
                 actions = policy.predict_action_chunk(batch)
                 profile_results = None
 
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            if device.type in ("cuda", "xpu"):
+                torch.accelerator.synchronize(device)
             latency = (perf_counter() - start_time) * 1000
 
             if actions is None:

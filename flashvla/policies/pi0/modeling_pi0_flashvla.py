@@ -56,8 +56,8 @@ def _ev_elapsed_ms(start, end):
 
 
 @torch._dynamo.disable
-def _cuda_sync():
-    torch.cuda.synchronize()
+def _device_sync():
+    torch.accelerator.synchronize()
 
 
 logger = logging.getLogger(__name__)
@@ -585,7 +585,7 @@ class PI0FlashVLAModel(nn.Module):
         device = tokens.device
 
         _evs = (
-            [torch.cuda.Event(enable_timing=True) for _ in range(4)]
+            [torch.Event(device=device, enable_timing=True) for _ in range(4)]
             if profile else None
         )
 
@@ -646,7 +646,7 @@ class PI0FlashVLAModel(nn.Module):
 
         if profile:
             _ev_record(_evs[3])
-            _cuda_sync()
+            _device_sync()
             breakdown = {
                 "encode": _ev_elapsed_ms(_evs[0], _evs[1]),
                 "prefill": _ev_elapsed_ms(_evs[1], _evs[2]),
@@ -718,7 +718,7 @@ class PI0FlashVLAModel(nn.Module):
             buffer = self.sample_noise((bsz, buf_len, self.config.max_action_dim), device)
 
         _evs_total = (
-            [torch.cuda.Event(enable_timing=True) for _ in range(2)]
+            [torch.Event(device=device, enable_timing=True) for _ in range(2)]
             if profile else None
         )
         if profile:
@@ -739,7 +739,7 @@ class PI0FlashVLAModel(nn.Module):
 
         if profile:
             _ev_record(_evs_total[1])
-            _cuda_sync()
+            _device_sync()
             wall_total = _ev_elapsed_ms(_evs_total[0], _evs_total[1])
             if breakdown is not None:
                 profile_results = breakdown

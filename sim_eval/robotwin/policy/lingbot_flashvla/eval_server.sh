@@ -37,7 +37,7 @@ overrides=(
     --policy_name lingbot_flashvla
     --policy_path "${policy_path}"
     --cold_start_mode "${cold_start_mode}"
-    --device cuda
+    --device "${DEVICE:-cuda}"
     --inference_overlap_steps "${inference_overlap_steps}"
 )
 if [[ -n "${n_action_steps}" ]]; then
